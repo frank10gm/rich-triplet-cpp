@@ -18,4 +18,5 @@ target_sources(rt_core PRIVATE
   transformer2.cpp
   train.cpp
   train2.cpp
+  transformer3.cpp
 )
