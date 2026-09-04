@@ -14,4 +14,6 @@ target_sources(rt_core PRIVATE
   autograd.cpp
   nn.cpp
   dataset.cpp
+  transformer.cpp
+  transformer2.cpp
 )

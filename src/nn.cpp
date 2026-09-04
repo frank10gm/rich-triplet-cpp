@@ -133,10 +133,17 @@ std::vector<Value> LayerNorm::forward(const std::vector<Value>& xs) const {
     }
     const Value mean = sum.mul(Value(1.0f / n));
 
-    Value var_sum = xs[0].sub(mean).mul(xs[0].sub(mean));
+    // Each squared deviation reuses one `diff` node as both operands, so its
+    // gradient accumulates through a single subtraction. Building two separate
+    // sub nodes would give the same value but a different graph, and the
+    // gradients would round differently.
+    const auto squared_deviation = [&mean](const Value& x) {
+        const Value diff = x.sub(mean);
+        return diff.mul(diff);
+    };
+    Value var_sum = squared_deviation(xs[0]);
     for (std::size_t i = 1; i < xs.size(); ++i) {
-        const Value diff = xs[i].sub(mean);
-        var_sum = var_sum.add(diff.mul(diff));
+        var_sum = var_sum.add(squared_deviation(xs[i]));
     }
     const Value variance = var_sum.mul(Value(1.0f / n));
 
