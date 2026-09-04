@@ -1,8 +1,803 @@
+// =============================================================================
+// rich-triplet -- CLI
+// =============================================================================
+//
+// One binary over every model in the project:
+//
+//   --benchmark            scalar autograd vs tensor autodiff, side by side
+//   --prompt TEXT          train the small GPT on the built-in corpus, generate
+//   --prompt + --weights   load real weights (GPT-OSS, Gemma 3 or Qwen 3.5)
+//   --pretokenize SRC DST  tokenize a text file into a binary corpus
+
+#include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "rt/dataset.hpp"
+#include "rt/init_rng.hpp"
+#include "rt/tensor_node.hpp"
+#include "rt/tokenizer.hpp"
+#include "rt/train.hpp"
+#include "rt/train2.hpp"
+#include "rt/transformer.hpp"
+#include "rt/transformer2.hpp"
+#include "rt/transformer3.hpp"
+#include "rt/transformer4.hpp"
+#include "rt/transformer_qwen35.hpp"
+
+using namespace rt;
+
+namespace {
+
+// =============================================================================
+// Bilingual training corpus -- Italian and English
+// =============================================================================
+
+constexpr const char* kCorpus = R"RT_CORPUS(
+Il cielo sopra Milano era grigio come sempre. Giovanni guardava dalla finestra
+del suo appartamento al quinto piano, pensando alla riunione del mattino.
+La sua collega Chiara gli aveva detto che il progetto era in ritardo di due
+settimane. Bisognava trovare una soluzione prima di venerdì.
+
+The sky above London was the same color as a television tuned to a dead channel.
+Thomas looked out from his office on the fifth floor, thinking about the morning
+meeting. His colleague Sarah had told him the project was two weeks behind
+schedule. They needed to find a solution before Friday.
+
+La lingua è il vestito del pensiero. Ogni parola porta con sé il peso della
+storia, la memoria di chi l'ha usata prima di noi. Imparare una lingua straniera
+significa aprire una finestra su un altro mondo, un altro modo di vedere le cose.
+
+Language is the dress of thought. Every word carries with it the weight of
+history, the memory of those who used it before us. Learning a foreign language
+means opening a window onto another world, another way of seeing things.
+
+Il modello linguistico non capisce davvero le parole. Calcola le probabilità
+delle sequenze di caratteri basandosi sui pattern nel testo di addestramento.
+Eppure, da questi semplici calcoli, emerge qualcosa che assomiglia alla comprensione.
+
+The language model does not truly understand words. It calculates probabilities
+of character sequences based on patterns in the training text. Yet from these
+simple calculations something emerges that resembles understanding.
+
+Buongiorno, come stai? Sto bene, grazie. E tu? Anch'io sto bene.
+Hello, how are you? I am well, thank you. And you? I am well too.
+
+Milano, Roma, Firenze, Venezia, Napoli, Torino, Bologna, Palermo.
+London, Paris, Berlin, Madrid, Rome, Amsterdam, Vienna, Prague.
+
+uno due tre quattro cinque sei sette otto nove dieci
+one two three four five six seven eight nine ten
+
+il lo la i gli le un una dello della degli delle
+the a an of in on at to for with from by
+
+essere avere fare dire andare venire sapere potere volere
+to be to have to do to say to go to come to know to can to want
+
+bello brutto grande piccolo vecchio nuovo buono cattivo
+beautiful ugly big small old new good bad
+
+oggi ieri domani adesso sempre mai spesso raramente
+today yesterday tomorrow now always never often rarely
+)RT_CORPUS";
+
+// =============================================================================
+// CLI argument parsing
+// =============================================================================
+
+struct CliArgs {
+    /// --prompt TEXT     : text to complete (triggers generation mode)
+    std::optional<std::string> prompt;
+    /// --weights DIR     : directory with .safetensors shards, or a .gguf file
+    std::optional<std::string> weights;
+    /// --vocab PATH      : BPE vocab.json (required with --weights for GPT-OSS)
+    std::optional<std::string> vocab;
+    /// --merges PATH     : BPE merges.txt (required with --weights for GPT-OSS)
+    std::optional<std::string> merges;
+    /// --tokenizer-model PATH : SentencePiece .model (Gemma 3 with --weights)
+    std::optional<std::string> tokenizer_model;
+    /// --tokenizer-dir DIR : directory holding tokenizer.json, for GGUF files
+    /// where the tokenizer is not bundled
+    std::optional<std::string> tokenizer_dir;
+    /// --model NAME      : architecture (gpt-oss | gemma3-1b | gemma3-4b | ...)
+    std::optional<std::string> model;
+    /// --max-new N       : tokens to generate
+    std::size_t max_new = 200;
+    /// --temp T          : sampling temperature
+    float temperature = 0.8f;
+    /// --top-k K         : top-k cutoff, 0 disables
+    std::size_t top_k = 40;
+    /// --top-p P         : nucleus probability
+    float top_p = 0.95f;
+    /// --rep-penalty R   : repetition penalty, 1.0 disables
+    float rep_penalty = 1.1f;
+    /// --seed S          : RNG seed
+    std::uint64_t seed = 42;
+    /// --train-steps N   : steps for on-the-fly training
+    std::size_t train_steps = 200;
+    /// --checkpoint PATH : load a saved .ckpt instead of training
+    std::optional<std::string> checkpoint;
+    /// --pretokenize SRC DST : tokenize SRC into DST, then exit
+    std::optional<std::pair<std::string, std::string>> pretokenize;
+    /// --benchmark : run the scalar-vs-tensor autograd benchmark
+    bool benchmark = false;
+    /// --quantize : quantize weights to Q4 after loading
+    bool quantize = false;
+    /// --debug : per-step diagnostics (h_rms, logit gaps, top-5 tokens)
+    bool debug = false;
+    /// --draft-len N : max speculative draft tokens per step, 0 disables
+    std::size_t draft_len = 0;
+};
+
+void print_help();
+
+/// Parse `text`, falling back to `fallback` on anything unparseable.
+template <typename T>
+[[nodiscard]] T parse_or(const std::string& text, T fallback) {
+    try {
+        if constexpr (std::is_floating_point_v<T>) {
+            return static_cast<T>(std::stof(text));
+        } else {
+            return static_cast<T>(std::stoull(text));
+        }
+    } catch (const std::exception&) {
+        return fallback;
+    }
+}
+
+[[nodiscard]] CliArgs parse_args(int argc, char** argv) {
+    const std::vector<std::string> args(argv + 1, argv + argc);
+    CliArgs a;
+
+    // Every value-taking flag consumes the next argument; a flag at the end of
+    // the line with nothing after it is simply ignored.
+    const auto take = [&args](std::size_t& i) -> std::optional<std::string> {
+        ++i;
+        if (i < args.size()) {
+            return args[i];
+        }
+        return std::nullopt;
+    };
+
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string& arg = args[i];
+        if (arg == "--prompt") {
+            a.prompt = take(i);
+        } else if (arg == "--weights") {
+            a.weights = take(i);
+        } else if (arg == "--vocab") {
+            a.vocab = take(i);
+        } else if (arg == "--merges") {
+            a.merges = take(i);
+        } else if (arg == "--tokenizer-model") {
+            a.tokenizer_model = take(i);
+        } else if (arg == "--tokenizer-dir") {
+            a.tokenizer_dir = take(i);
+        } else if (arg == "--model") {
+            a.model = take(i);
+        } else if (arg == "--max-new") {
+            if (const auto v = take(i)) a.max_new = parse_or<std::size_t>(*v, 200);
+        } else if (arg == "--temp") {
+            if (const auto v = take(i)) a.temperature = parse_or<float>(*v, 0.8f);
+        } else if (arg == "--top-k") {
+            if (const auto v = take(i)) a.top_k = parse_or<std::size_t>(*v, 40);
+        } else if (arg == "--top-p") {
+            if (const auto v = take(i)) a.top_p = parse_or<float>(*v, 0.95f);
+        } else if (arg == "--rep-penalty") {
+            if (const auto v = take(i)) a.rep_penalty = parse_or<float>(*v, 1.1f);
+        } else if (arg == "--seed") {
+            if (const auto v = take(i)) a.seed = parse_or<std::uint64_t>(*v, 42);
+        } else if (arg == "--train-steps") {
+            if (const auto v = take(i)) a.train_steps = parse_or<std::size_t>(*v, 200);
+        } else if (arg == "--checkpoint") {
+            a.checkpoint = take(i);
+        } else if (arg == "--pretokenize") {
+            const std::string src = take(i).value_or(std::string{});
+            const std::string dst = take(i).value_or(std::string{});
+            a.pretokenize = std::pair{src, dst};
+        } else if (arg == "--benchmark") {
+            a.benchmark = true;
+        } else if (arg == "--quantize") {
+            a.quantize = true;
+        } else if (arg == "--debug") {
+            a.debug = true;
+        } else if (arg == "--draft-len") {
+            if (const auto v = take(i)) a.draft_len = parse_or<std::size_t>(*v, 4);
+        } else if (arg == "--help" || arg == "-h") {
+            print_help();
+            std::exit(0);
+        } else {
+            std::fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
+            print_help();
+            std::exit(1);
+        }
+    }
+    return a;
+}
+
+void print_help() {
+    std::printf("rich-triplet — LLM from scratch in C++\n");
+    std::printf("\n");
+    std::printf("USAGE:\n");
+    std::printf("  rich-triplet --benchmark              Run scalar-vs-tensor autograd benchmark\n");
+    std::printf("  rich-triplet --prompt TEXT            Train on corpus, then generate\n");
+    std::printf("  rich-triplet --prompt TEXT \\\n");
+    std::printf("               --weights DIR \\\n");
+    std::printf("               --vocab vocab.json \\\n");
+    std::printf("               --merges merges.txt      Load GPT-OSS weights, generate\n");
+    std::printf("  rich-triplet --prompt TEXT \\\n");
+    std::printf("               --weights DIR \\\n");
+    std::printf("               --tokenizer-model tokenizer.model \\\n");
+    std::printf("               --model gemma3-1b           Load Gemma 3 weights, generate\n");
+    std::printf("  rich-triplet --pretokenize SRC DST    Tokenize SRC text file → DST .bin\n");
+    std::printf("\n");
+    std::printf("OPTIONS:\n");
+    std::printf("  --prompt TEXT            Prompt text to complete\n");
+    std::printf("  --weights DIR            Directory with .safetensors shards\n");
+    std::printf("  --vocab PATH             BPE vocab.json      (GPT-OSS)\n");
+    std::printf("  --merges PATH            BPE merges.txt      (GPT-OSS)\n");
+    std::printf("  --tokenizer-model PATH   SentencePiece .model (Gemma 3)\n");
+    std::printf(
+        "  --tokenizer-dir DIR      Dir with tokenizer.json (for GGUF, where tokenizer is "
+        "separate)\n");
+    std::printf(
+        "  --model NAME             Architecture: gpt-oss | gemma3-1b | gemma3-4b | qwen35-4b | "
+        "qwen35-9b\n");
+    std::printf("  --max-new N              Tokens to generate          [default: 200]\n");
+    std::printf("  --temp T                 Sampling temperature        [default: 0.8]\n");
+    std::printf("  --top-k K                Top-K cutoff (0=disabled)   [default: 40]\n");
+    std::printf("  --top-p P                Nucleus probability         [default: 0.95]\n");
+    std::printf("  --rep-penalty R          Repetition penalty          [default: 1.1]\n");
+    std::printf("  --seed S                 RNG seed                    [default: 42]\n");
+    std::printf("  --train-steps N          Training steps (no-weights) [default: 200]\n");
+    std::printf("  --checkpoint PATH        Load saved .ckpt instead of training\n");
+    std::printf("  --benchmark              Run scalar-vs-tensor autograd benchmark\n");
+    std::printf("  --debug                  Enable per-step diagnostic logging\n");
+    std::printf("  --pretokenize S D        Tokenize text file S, write binary D.bin\n");
+    std::printf("                           Uses char tokenizer built from S.\n");
+    std::printf("                           For BPE: also pass --vocab and --merges.\n");
+}
+
+// =============================================================================
+// Shared helpers
+// =============================================================================
+
+/// Write `text` to stdout immediately, so streamed tokens appear as they land.
+void emit(const std::string& text) {
+    std::fputs(text.c_str(), stdout);
+    std::fflush(stdout);
+}
+
+[[noreturn]] void die(const std::string& message) {
+    std::fprintf(stderr, "%s\n", message.c_str());
+    std::exit(1);
+}
+
+/// Whether `path` names a GGUF file.
+///
+/// The extension is the usual signal, but Ollama stores blobs under
+/// extensionless names, so a regular file is also sniffed for the magic.
+[[nodiscard]] bool looks_like_gguf(const std::string& path) {
+    if (path.ends_with(".gguf")) {
+        return true;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec)) {
+        return false;
+    }
+    std::ifstream f(path, std::ios::binary);
+    char magic[4] = {};
+    return f.read(magic, 4) && std::memcmp(magic, "GGUF", 4) == 0;
+}
+
+/// Where the tokenizer and weight cache live, given `--weights`.
+///
+/// For a GGUF file that is its parent directory; for safetensors it is the
+/// directory itself, with any trailing slash removed.
+[[nodiscard]] std::string weights_dir_of(const std::string& weights_path, bool is_gguf) {
+    if (is_gguf) {
+        const std::filesystem::path parent = std::filesystem::path(weights_path).parent_path();
+        return parent.empty() ? "." : parent.string();
+    }
+    std::string dir = weights_path;
+    while (!dir.empty() && dir.back() == '/') {
+        dir.pop_back();
+    }
+    return dir;
+}
+
+/// Load tokenizer.json from `--tokenizer-dir`, else from the weights directory.
+[[nodiscard]] HfBpeTokenizer load_hf_tokenizer(const CliArgs& args, const std::string& weights_dir,
+                                               bool is_gguf, const char* tag) {
+    std::string tok_dir = args.tokenizer_dir.value_or(weights_dir);
+    while (!tok_dir.empty() && tok_dir.back() == '/') {
+        tok_dir.pop_back();
+    }
+    const std::string tok_json_path = tok_dir + "/tokenizer.json";
+    std::fprintf(stderr, "[ %s ] Loading tokenizer from %s...\n", tag, tok_json_path.c_str());
+
+    Result<HfBpeTokenizer> tok = HfBpeTokenizer::from_json_file(tok_json_path);
+    if (!tok) {
+        std::fprintf(stderr, "Error: failed to load tokenizer from %s: %s\n",
+                     tok_json_path.c_str(), tok.error().c_str());
+        if (is_gguf && !args.tokenizer_dir) {
+            std::fprintf(stderr, "Hint: GGUF files do not include a tokenizer.\n");
+            std::fprintf(stderr,
+                         "      Pass --tokenizer-dir pointing to your safetensors directory,\n");
+            std::fprintf(stderr, "      e.g.: --tokenizer-dir /path/to/gemma-3-4b-it/\n");
+        }
+        std::exit(1);
+    }
+    std::fprintf(stderr, "[ %s ] Vocab size: %zu\n", tag, tok->vocab_size());
+    return std::move(*tok);
+}
+
+/// Log every prompt token with its decoded text -- the fastest way to spot a
+/// chat template that tokenized into subword pieces instead of special ids.
+void dump_prompt_tokens(const Tokenizer& tok, const std::vector<std::size_t>& token_ids) {
+    for (std::size_t i = 0; i < token_ids.size(); ++i) {
+        const std::string text = tok.decode({static_cast<std::uint32_t>(token_ids[i])});
+        std::fprintf(stderr, "  [%zu] id=%zu text=\"%s\"\n", i, token_ids[i], text.c_str());
+    }
+}
+
+/// Append `text`'s token ids to `out`.
+void extend_encoded(std::vector<std::size_t>& out, const Tokenizer& tok, std::string_view text) {
+    for (std::uint32_t id : tok.encode(text)) {
+        out.push_back(static_cast<std::size_t>(id));
+    }
+}
+
+// =============================================================================
+// Generation mode -- GPT-OSS with loaded weights
+// =============================================================================
+
+void run_gpt_oss(const CliArgs& args, const std::string& prompt) {
+    const std::string& weights_dir = *args.weights;
+    if (!args.vocab) {
+        die("--vocab required with --weights (path to vocab.json)");
+    }
+    if (!args.merges) {
+        die("--merges required with --weights (path to merges.txt)");
+    }
+
+    std::fprintf(stderr, "[ GPT-OSS ] Loading tokenizer...\n");
+    Result<BpeTokenizer> tok = BpeTokenizer::from_files(*args.vocab, *args.merges);
+    if (!tok) {
+        die("failed to load BPE tokenizer: " + tok.error());
+    }
+
+    std::fprintf(stderr, "[ GPT-OSS ] Building model (gpt-oss-20b config)...\n");
+    InitRng rng(0);
+    GptOssModel model(Config3::gpt_oss_20b(), rng);
+
+    std::fprintf(stderr, "[ GPT-OSS ] Loading weights from %s...\n", weights_dir.c_str());
+    if (const Result<void> loaded = model.load_weights_from_dir(weights_dir); !loaded) {
+        die("failed to load weights: " + loaded.error());
+    }
+
+    std::vector<std::size_t> token_ids;
+    extend_encoded(token_ids, *tok, prompt);
+    if (token_ids.empty()) {
+        die("Error: prompt encodes to zero tokens");
+    }
+
+    SamplingParams params = SamplingParams::creative(args.seed);
+    params.temperature = args.temperature;
+    params.top_k = args.top_k;
+    params.top_p = args.top_p;
+    params.seed = args.seed;
+
+    // Echo the prompt first, then stream the continuation.
+    emit(prompt);
+    model.generate_with_params_streaming(token_ids, args.max_new, params, [&](std::size_t tok_id) {
+        emit(tok->decode({static_cast<std::uint32_t>(tok_id)}));
+    });
+    std::printf("\n");
+}
+
+// =============================================================================
+// Generation mode -- Gemma 3 with loaded weights
+// =============================================================================
+
+void run_gemma3(const CliArgs& args, const std::string& prompt) {
+    const std::string& weights_path = *args.weights;
+    const std::string model_name = args.model.value_or("gemma3-1b");
+
+    const bool is_gguf = looks_like_gguf(weights_path);
+    const std::string weights_dir = weights_dir_of(weights_path, is_gguf);
+    const HfBpeTokenizer tok = load_hf_tokenizer(args, weights_dir, is_gguf, "Gemma3");
+
+    const Config4 config = model_name == "gemma3-4b" ? Config4::gemma3_4b() : Config4::gemma3_1b();
+    std::fprintf(stderr, "[ Gemma3 ] Building %s model (%zu layers, hidden=%zu)...\n",
+                 model_name.c_str(), config.num_hidden_layers, config.hidden_size);
+
+    Gemma3Model model = Gemma3Model::new_for_inference(config);
+
+    if (is_gguf) {
+        std::fprintf(stderr, "[ Gemma3 ] Loading weights from GGUF: %s...\n",
+                     weights_path.c_str());
+        if (const Result<void> ok = model.load_weights_from_gguf(weights_path); !ok) {
+            die("failed to load GGUF weights: " + ok.error());
+        }
+    } else {
+        // Safetensors: try the binary cache first, and write one if it is
+        // missing, so later runs skip the JSON parse and BF16 conversion.
+        const std::string cache_path = weights_dir + "/gemma3-" + model_name + ".cache";
+        const Result<bool> cached = model.load_cache(cache_path);
+        if (cached && *cached) {
+            std::fprintf(stderr, "[ Gemma3 ] Loaded weights from cache (%s).\n",
+                         cache_path.c_str());
+        } else {
+            std::fprintf(stderr, "[ Gemma3 ] Loading weights from %s...\n", weights_dir.c_str());
+            if (const Result<void> ok = model.load_weights_from_dir(weights_dir); !ok) {
+                die("failed to load weights: " + ok.error());
+            }
+            std::fprintf(stderr, "[ Gemma3 ] Saving weight cache to %s...\n", cache_path.c_str());
+            if (const Result<void> ok = model.save_cache(cache_path); !ok) {
+                die("failed to save cache: " + ok.error());
+            }
+            std::fprintf(stderr, "[ Gemma3 ] Cache saved.\n");
+        }
+    }
+    release_memory_to_os();
+    print_rss("after weight load");
+
+    if (args.quantize) {
+        std::fprintf(stderr, "[ Gemma3 ] Quantizing weights to Q4...\n");
+        model.quantize_all_weights();
+        std::fprintf(stderr, "[ Gemma3 ] Quantization complete.\n");
+    }
+
+    // Gemma 3-IT needs its chat template:
+    //   <bos><start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n
+    // The special ids are injected directly -- encoding the literal text
+    // "<start_of_turn>" would split it into ordinary subword pieces.
+    // ids: bos=2, start_of_turn=105, end_of_turn=106, \n=107, user=2364,
+    //      model=4368
+    std::vector<std::size_t> token_ids{2, 105, 2364, 107};
+    extend_encoded(token_ids, tok, prompt);
+    token_ids.insert(token_ids.end(), {106, 107, 105, 4368, 107});
+
+    dump_prompt_tokens(tok, token_ids);
+
+    emit(prompt);
+    model.generate_cached_streaming(token_ids, args.max_new, args.temperature, args.top_k,
+                                    args.top_p, args.rep_penalty, args.seed, args.debug,
+                                    args.draft_len, [&](std::size_t tok_id) {
+                                        emit(tok.decode({static_cast<std::uint32_t>(tok_id)}));
+                                    });
+    std::printf("\n");
+}
+
+// =============================================================================
+// Generation mode -- Qwen 3.5 with loaded weights
+// =============================================================================
+
+void run_qwen35(const CliArgs& args, const std::string& prompt) {
+    const std::string& weights_path = *args.weights;
+    const std::string model_name = args.model.value_or("qwen35-4b");
+
+    const bool is_gguf = looks_like_gguf(weights_path);
+    const std::string weights_dir = weights_dir_of(weights_path, is_gguf);
+    const HfBpeTokenizer tok = load_hf_tokenizer(args, weights_dir, is_gguf, "Qwen3.5");
+
+    ConfigQwen35 config = ConfigQwen35::qwen35_4b();
+    if (model_name == "qwen35-9b") {
+        config = ConfigQwen35::qwen35_9b();
+    } else if (model_name == "qwen35-0.8b" || model_name == "qwen35-0_8b") {
+        config = ConfigQwen35::qwen35_0_8b();
+    }
+    std::fprintf(stderr, "[ Qwen3.5 ] Building %s model (%zu layers, hidden=%zu)...\n",
+                 model_name.c_str(), config.num_hidden_layers, config.hidden_size);
+
+    Qwen35Model model = Qwen35Model::new_for_inference(config);
+
+    if (is_gguf) {
+        std::fprintf(stderr, "[ Qwen3.5 ] Loading weights from GGUF: %s...\n",
+                     weights_path.c_str());
+        if (const Result<void> ok = model.load_weights_from_gguf(weights_path); !ok) {
+            die("failed to load GGUF weights: " + ok.error());
+        }
+    } else {
+        std::fprintf(stderr, "[ Qwen3.5 ] Loading weights from %s...\n", weights_path.c_str());
+        if (const Result<void> ok = model.load_weights_from_dir(weights_path); !ok) {
+            die("failed to load safetensors weights: " + ok.error());
+        }
+    }
+    release_memory_to_os();
+    print_rss("after weight load");
+
+    // Qwen 3.5 uses the ChatML template:
+    //   <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
+    // ids: <|im_start|> = 248045, <|im_end|> = 248046, \n = 198
+    constexpr std::size_t kImStart = 248045;
+    constexpr std::size_t kImEnd = 248046;
+    constexpr std::size_t kNewline = 198;
+    std::vector<std::size_t> token_ids{kImStart};
+    extend_encoded(token_ids, tok, "user");
+    token_ids.push_back(kNewline);
+    extend_encoded(token_ids, tok, prompt);
+    token_ids.push_back(kImEnd);
+    token_ids.push_back(kNewline);
+    token_ids.push_back(kImStart);
+    extend_encoded(token_ids, tok, "assistant");
+    token_ids.push_back(kNewline);
+
+    dump_prompt_tokens(tok, token_ids);
+
+    emit(prompt);
+    model.generate_cached_streaming(token_ids, args.max_new, args.temperature, args.top_k,
+                                    args.top_p, args.rep_penalty, args.seed, args.debug,
+                                    [&](std::size_t tok_id) {
+                                        emit(tok.decode({static_cast<std::uint32_t>(tok_id)}));
+                                    });
+    std::printf("\n");
+}
+
+// =============================================================================
+// Generation mode -- Gpt2 trained on the built-in corpus
+// =============================================================================
+
+void run_gpt2_generate(const CliArgs& args, const std::string& prompt) {
+    const CharTokenizer tokenizer = CharTokenizer::from_text(kCorpus);
+    const std::size_t vocab_size = tokenizer.vocab_size();
+    constexpr std::size_t context_length = 64;
+
+    const auto [train_data, val_data] =
+        TextDataset::train_val_split(kCorpus, tokenizer, context_length);
+
+    Config model_config;
+    model_config.vocab_size = vocab_size;
+    model_config.context_length = context_length;
+    model_config.d_model = 64;
+    model_config.n_layers = 4;
+    model_config.n_heads = 4;
+
+    InitRng rng(42);
+    const Gpt2 model(model_config, rng);
+
+    if (args.checkpoint) {
+        std::fprintf(stderr, "[ Load ] Restoring from checkpoint: %s\n", args.checkpoint->c_str());
+        if (const Result<void> ok = restore_checkpoint(*args.checkpoint, model.parameters()); !ok) {
+            die("failed to restore checkpoint: " + ok.error());
+        }
+    } else {
+        std::fprintf(stderr, "[ Train ] vocab=%zu context=%zu steps=%zu\n", vocab_size,
+                     context_length, args.train_steps);
+        TrainConfig2 cfg;
+        cfg.max_steps = args.train_steps;
+        cfg.eval_interval = args.train_steps / 5;
+        cfg.learning_rate = 3e-3f;
+        cfg.grad_clip = 1.0f;
+        (void)train2(model, train_data, val_data, cfg);
+    }
+
+    // Stream through the KV cache: O(T) per step instead of O(T^2).
+    std::vector<std::size_t> token_ids;
+    extend_encoded(token_ids, tokenizer, prompt);
+    if (token_ids.empty()) {
+        token_ids.push_back(0);
+    }
+
+    emit(prompt);
+    model.generate_cached_streaming(token_ids, args.max_new, args.temperature, args.top_k,
+                                    [&](std::size_t tok_id) {
+                                        emit(tokenizer.decode(
+                                            {static_cast<std::uint32_t>(tok_id)}));
+                                    });
+    std::printf("\n");
+}
+
+// =============================================================================
+// Benchmark mode -- scalar autograd vs tensor autodiff
+// =============================================================================
+
+void run_benchmark(std::size_t train_steps) {
+    using Clock = std::chrono::steady_clock;
+
+    std::printf("╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║        Rich Triplet — LLM from scratch in C++              ║\n");
+    std::printf("║        Scalar autograd  vs  Tensor autodiff benchmark       ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+    std::printf("\n");
+
+    const CharTokenizer tokenizer = CharTokenizer::from_text(kCorpus);
+    const std::size_t vocab_size = tokenizer.vocab_size();
+    constexpr std::size_t context_length = 16;
+
+    const auto [train_data, val_data] =
+        TextDataset::train_val_split(kCorpus, tokenizer, context_length);
+
+    std::printf("[ Setup ] Building tokenizer and dataset...\n");
+    std::printf("         Vocabulary:     %zu unique characters\n", vocab_size);
+    std::printf("         Context window: %zu tokens\n", context_length);
+    std::printf("         Random loss:    %.4f  (= ln(%zu))\n",
+                std::log(static_cast<double>(vocab_size)), vocab_size);
+
+    Config model_config;
+    model_config.vocab_size = vocab_size;
+    model_config.context_length = context_length;
+    model_config.d_model = 32;
+    model_config.n_layers = 2;
+    model_config.n_heads = 2;
+
+    const std::size_t eval_interval = std::max<std::size_t>(train_steps / 5, 1);
+
+    // -------------------------------------------------------------------------
+    // Phase A -- scalar autograd
+    // -------------------------------------------------------------------------
+    std::printf("\n═══════════════════════════════════════════════════════════════\n");
+    std::printf(" PHASE A: Scalar autograd  (one Value node per weight element)\n");
+    std::printf("═══════════════════════════════════════════════════════════════\n");
+
+    InitRng rng_a(42);
+    const Gpt scalar_model(model_config, rng_a);
+    {
+        const std::size_t n = scalar_model.parameters().size();
+        std::printf(" Model:  %.1fK scalar nodes  (%d param matrices × ~%zu elements avg)\n",
+                    static_cast<double>(n) / 1000.0, 0, n);
+    }
+
+    TrainConfig scalar_cfg;
+    scalar_cfg.max_steps = train_steps;
+    scalar_cfg.eval_interval = eval_interval;
+    scalar_cfg.learning_rate = 1e-3f;
+    scalar_cfg.grad_clip = 1.0f;
+
+    const Clock::time_point t_scalar_start = Clock::now();
+    (void)train(scalar_model, tokenizer, train_data, val_data, scalar_cfg);
+    const double t_scalar = std::chrono::duration<double>(Clock::now() - t_scalar_start).count();
+
+    std::printf("\n[ Generation — scalar model ]\n");
+    (void)generate(scalar_model, tokenizer, "Il ", 80, 0.8f, 5);
+    (void)generate(scalar_model, tokenizer, "The ", 80, 0.8f, 5);
+
+    // -------------------------------------------------------------------------
+    // Phase B -- tensor autodiff
+    // -------------------------------------------------------------------------
+    std::printf("\n═══════════════════════════════════════════════════════════════\n");
+    std::printf(" PHASE B: Tensor autodiff  (one TensorNode per weight matrix)\n");
+    std::printf("═══════════════════════════════════════════════════════════════\n");
+
+    InitRng rng_b(42);
+    const Gpt2 tensor_model(model_config, rng_b);
+    {
+        const std::vector<TensorNode> params = tensor_model.parameters();
+        std::size_t total_elems = 0;
+        for (const TensorNode& p : params) {
+            total_elems += p.data().rows * p.data().cols;
+        }
+        std::printf(" Model:  %zu tensor nodes  (%zu elements total)\n", params.size(),
+                    total_elems);
+    }
+
+    TrainConfig2 tensor_cfg;
+    tensor_cfg.max_steps = train_steps;
+    tensor_cfg.eval_interval = eval_interval;
+    tensor_cfg.learning_rate = 1e-3f;
+    tensor_cfg.grad_clip = 1.0f;
+
+    const Clock::time_point t_tensor_start = Clock::now();
+    (void)train2(tensor_model, train_data, val_data, tensor_cfg);
+    const double t_tensor = std::chrono::duration<double>(Clock::now() - t_tensor_start).count();
+
+    std::printf("\n[ Generation — tensor model ]\n");
+    for (const char* prompt_str : {"Il ", "The "}) {
+        std::vector<std::size_t> ids;
+        extend_encoded(ids, tokenizer, prompt_str);
+        emit(prompt_str);
+        tensor_model.generate_cached_streaming(ids, 80, 0.8f, 5, [&](std::size_t tok_id) {
+            emit(tokenizer.decode({static_cast<std::uint32_t>(tok_id)}));
+        });
+        std::printf("\n");
+    }
+
+    // -------------------------------------------------------------------------
+    // Summary
+    // -------------------------------------------------------------------------
+    std::printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    std::printf("║                   Benchmark Summary                         ║\n");
+    std::printf("╠══════════════════════════════════════════════════════════════╣\n");
+    std::printf("║  Steps: %4zu                                                ║\n", train_steps);
+    std::printf("║                                                              ║\n");
+    std::printf("║  Scalar autograd:   %8.2fs   (%5.0f ms/step)           ║\n", t_scalar,
+                t_scalar * 1000.0 / static_cast<double>(train_steps));
+    std::printf("║  Tensor autodiff:   %8.2fs   (%5.0f ms/step)           ║\n", t_tensor,
+                t_tensor * 1000.0 / static_cast<double>(train_steps));
+    std::printf("║                                                              ║\n");
+    std::printf("║  Speedup:           %7.1fx                                ║\n",
+                t_scalar / t_tensor);
+    std::printf("║                                                              ║\n");
+    std::printf("║  Why faster?                                                 ║\n");
+    std::printf("║  • Scalar: ~400K nodes in graph → 400K backward visits      ║\n");
+    std::printf("║  • Tensor:    ~60 nodes in graph →   60 backward visits     ║\n");
+    std::printf("║  • Each tensor backward does a SIMD-able matmul instead     ║\n");
+    std::printf("║    of millions of individual scalar multiply-accumulate ops  ║\n");
+    std::printf("╚══════════════════════════════════════════════════════════════╝\n");
+
+    std::printf("\nDone.\n");
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
-    std::printf("rich-triplet-cpp: port in progress\n");
+    const CliArgs args = parse_args(argc, argv);
+
+    // -------------------------------------------------------------------------
+    // Pretokenize mode: a text file -> a binary corpus
+    // -------------------------------------------------------------------------
+    if (args.pretokenize) {
+        const auto& [src, dst] = *args.pretokenize;
+        std::fprintf(stderr, "[pretokenize] Reading: %s\n", src.c_str());
+        std::fprintf(stderr, "[pretokenize] Output:  %s\n", dst.c_str());
+
+        Result<std::size_t> n_tokens = err(std::string{});
+        if (args.vocab && args.merges) {
+            Result<BpeTokenizer> tok = BpeTokenizer::from_files(*args.vocab, *args.merges);
+            if (!tok) {
+                die("failed to load BPE tokenizer: " + tok.error());
+            }
+            n_tokens = TokenizedDataset::write_bin_from_file(dst, src, *tok);
+        } else {
+            // The char vocabulary has to come from the whole file, so this path
+            // reads it all rather than streaming.
+            std::ifstream in(src);
+            if (!in) {
+                die("cannot read source file");
+            }
+            const std::string text((std::istreambuf_iterator<char>(in)),
+                                   std::istreambuf_iterator<char>());
+            const CharTokenizer tok = CharTokenizer::from_text(text);
+            std::fprintf(stderr, "[pretokenize] Char vocab size: %zu\n", tok.vocab_size());
+            n_tokens = TokenizedDataset::write_bin(dst, text, tok);
+        }
+        if (!n_tokens) {
+            die("pretokenize failed: " + n_tokens.error());
+        }
+        std::fprintf(stderr, "[pretokenize] Done: %zu tokens → %s\n", *n_tokens, dst.c_str());
+        return 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // Generation mode
+    // -------------------------------------------------------------------------
+    if (args.prompt) {
+        const bool is_qwen35 = args.model && args.model->starts_with("qwen35");
+        // A .gguf file with no --model is assumed to be Gemma 3, which is the
+        // only architecture this CLI ever loaded from GGUF first.
+        const bool is_gemma3 = args.tokenizer_model.has_value() ||
+                               (args.model && args.model->starts_with("gemma3")) ||
+                               (!is_qwen35 && args.weights && args.weights->ends_with(".gguf"));
+        if (is_qwen35) {
+            run_qwen35(args, *args.prompt);
+        } else if (is_gemma3) {
+            run_gemma3(args, *args.prompt);
+        } else if (args.weights) {
+            run_gpt_oss(args, *args.prompt);
+        } else {
+            run_gpt2_generate(args, *args.prompt);
+        }
+        return 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // Benchmark mode
+    // -------------------------------------------------------------------------
+    if (args.benchmark) {
+        run_benchmark(args.train_steps);
+        return 0;
+    }
+
+    print_help();
     return 0;
 }

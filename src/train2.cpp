@@ -5,10 +5,31 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <numbers>
 
 namespace rt {
+
+namespace {
+
+/// Format like Rust's `{:.2e}`: two mantissa decimals and a bare exponent.
+/// printf's `%.2e` would zero-pad and sign it -- `1.00e-03` where the
+/// reference prints `1.00e-3`.
+[[nodiscard]] std::string format_exp2(double v) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.2e", v);
+    std::string s(buf);
+    const std::size_t e = s.find('e');
+    if (e == std::string::npos) {
+        return s;
+    }
+    const int exponent = std::atoi(s.c_str() + e + 1);
+    return s.substr(0, e + 1) + std::to_string(exponent);
+}
+
+}  // namespace
+
 
 // =============================================================================
 // AdamW2
@@ -258,11 +279,17 @@ float train2(const Trainable& model, const DataSource& train_data, const DataSou
         }
 
         const std::vector<TensorNode> params_now = model.parameters();
+        // Each parameter's squared gradients are summed on their own before the
+        // per-parameter totals are added up. Flattening that into one running
+        // sum would reassociate the float additions and drift from the
+        // reference in the last couple of digits.
         float sum_sq = 0.0f;
         for (const TensorNode& p : params_now) {
+            float param_sum = 0.0f;
             for (float x : p.grad().data) {
-                sum_sq += x * x;
+                param_sum += x * x;
             }
+            sum_sq += param_sum;
         }
         const float grad_norm = std::sqrt(sum_sq);
 
@@ -289,9 +316,10 @@ float train2(const Trainable& model, const DataSource& train_data, const DataSou
             step == cfg.max_steps - 1) {
             const float val_loss = estimate_loss2(model, val_data, 5);
             std::printf(
-                "step %4zu/%zu | lr: %.2e | train_loss: %.4f | val_loss: %.4f | acc: %.3f | "
+                "step %4zu/%zu | lr: %s | train_loss: %.4f | val_loss: %.4f | acc: %.3f | "
                 "grad_norm: %.4f\n",
-                display_step, display_total, static_cast<double>(optimizer.lr),
+                display_step, display_total,
+                format_exp2(static_cast<double>(optimizer.lr)).c_str(),
                 static_cast<double>(last_loss), static_cast<double>(val_loss),
                 static_cast<double>(last_acc), static_cast<double>(grad_norm));
 

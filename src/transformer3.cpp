@@ -758,6 +758,36 @@ std::vector<std::size_t> GptOssModel::generate_with_params(
     return generated;
 }
 
+void GptOssModel::generate_with_params_streaming(
+    const std::vector<std::size_t>& token_ids, std::size_t max_new, const SamplingParams& params,
+    const std::function<void(std::size_t)>& callback) const {
+    KvCache cache(config);
+    LcgRng53 rng(params.seed);
+
+    // The penalty window opens with the prompt in it, so the model is nudged
+    // away from parroting what it was given.
+    std::vector<std::size_t> seen = token_ids;
+
+    Mat logits = run_cached(*this, token_ids, cache);
+    std::size_t first = sample_token_full(logits, token_ids.size() - 1, params, seen, rng);
+    callback(first);
+    seen.push_back(first);
+    if (params.eos_token_id && first == *params.eos_token_id) {
+        return;
+    }
+
+    std::size_t prev = first;
+    for (std::size_t i = 1; i < max_new; ++i) {
+        logits = run_cached(*this, {prev}, cache);
+        prev = sample_token_full(logits, 0, params, seen, rng);
+        callback(prev);
+        seen.push_back(prev);
+        if (params.eos_token_id && prev == *params.eos_token_id) {
+            break;
+        }
+    }
+}
+
 void GptOssModel::tie_weights() {
     assert(lm_head.weight.data().rows == embed_tokens.data().rows &&
            lm_head.weight.data().cols == embed_tokens.data().cols &&

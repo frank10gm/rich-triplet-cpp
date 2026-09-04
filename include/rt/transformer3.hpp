@@ -256,6 +256,14 @@ class GptOssModel : public Trainable {
         const std::vector<std::size_t>& token_ids, std::size_t max_new,
         const SamplingParams& params) const;
 
+    /// Same, calling `callback` per token instead of buffering.
+    ///
+    /// Unlike `generate_with_params`, the penalty window starts out holding the
+    /// prompt, so prompt tokens are discouraged from being repeated.
+    void generate_with_params_streaming(const std::vector<std::size_t>& token_ids,
+                                        std::size_t max_new, const SamplingParams& params,
+                                        const std::function<void(std::size_t)>& callback) const;
+
     /// Point `lm_head.weight` at `embed_tokens`.
     ///
     /// The embedding maps a token to a hidden vector and the head maps a hidden
