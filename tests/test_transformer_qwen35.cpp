@@ -1,7 +1,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
 
+#include "gguf_writer.hpp"
 #include "rt/transformer_qwen35.hpp"
 
 using namespace rt;
@@ -282,7 +286,7 @@ TEST_CASE("deltanet conv1d shifts its history", "[qwen35]") {
     REQUIRE(state.conv_state[hist - 1] == 1.0f);
     REQUIRE(state.conv_state[0] == 0.0f);
 
-    dn.apply_conv1d(input, state);
+    (void)dn.apply_conv1d(input, state);
     REQUIRE(state.conv_state[hist - 2] == 1.0f);
 }
 
@@ -352,4 +356,171 @@ TEST_CASE("qwen35 token-by-token decode tracks batched prefill", "[qwen35]") {
         INFO("logit " << c);
         REQUIRE(std::fabs(from_decode.at(0, c) - from_prefill.at(0, c)) < 1e-3f);
     }
+}
+
+// -----------------------------------------------------------------------------
+// Generation
+// -----------------------------------------------------------------------------
+
+TEST_CASE("qwen35 generate_cached_streaming produces tokens", "[qwen35]") {
+    Qwen35Model model = Qwen35Model::new_for_inference(tiny_cfg());
+    fill_weights(model, 21);
+
+    std::vector<std::size_t> generated;
+    model.generate_cached_streaming({0, 1, 2}, 5, 1.0f, 0, 1.0f, 1.0f, 42, false,
+                                    [&](std::size_t tok) { generated.push_back(tok); });
+    REQUIRE_FALSE(generated.empty());
+    REQUIRE(generated.size() <= 5);
+    for (std::size_t tok : generated) {
+        REQUIRE(tok < model.config.vocab_size);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// GGUF weight loading
+// -----------------------------------------------------------------------------
+
+namespace {
+
+std::vector<float> qramp(std::size_t n, float step) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        v[i] = static_cast<float>(i % 13) * step - 6.0f * step;
+    }
+    return v;
+}
+
+std::vector<std::uint8_t> qf32_bytes(const std::vector<float>& values) {
+    std::vector<std::uint8_t> bytes(values.size() * 4);
+    std::memcpy(bytes.data(), values.data(), bytes.size());
+    return bytes;
+}
+
+/// Write a GGUF holding one DeltaNet layer and one full-attention layer, using
+/// llama.cpp's tensor names.
+void write_qwen35_gguf(const std::string& path, const ConfigQwen35& cfg) {
+    using rt::testing::GgufWriter;
+    const std::size_t h = cfg.hidden_size;
+    const std::size_t inter = cfg.intermediate_size;
+    const std::size_t d = cfg.head_dim;
+    const std::size_t nq = cfg.num_attention_heads;
+    const std::size_t nkv = cfg.num_key_value_heads;
+    const std::size_t qkv = cfg.deltanet_qkv_dim();
+    const std::size_t nv = cfg.linear_num_value_heads;
+    const std::size_t vdim = nv * cfg.linear_value_head_dim;
+
+    GgufWriter w;
+    w.add_meta_str("general.architecture", "qwen3next");
+    // GGUF shapes are [in, out].
+    w.add_tensor("token_embd.weight", {h, cfg.vocab_size}, GgufType::F32,
+                 qf32_bytes(qramp(cfg.vocab_size * h, 0.01f)));
+    w.add_tensor("output_norm.weight", {h}, GgufType::F32,
+                 qf32_bytes(std::vector<float>(h, 1.0f)));
+
+    for (std::size_t i = 0; i < cfg.num_hidden_layers; ++i) {
+        const std::string p = "blk." + std::to_string(i) + ".";
+        w.add_tensor(p + "attn_norm.weight", {h}, GgufType::F32,
+                     qf32_bytes(std::vector<float>(h, 1.0f)));
+        w.add_tensor(p + "post_attention_norm.weight", {h}, GgufType::F32,
+                     qf32_bytes(std::vector<float>(h, 1.0f)));
+        w.add_tensor(p + "ffn_gate.weight", {h, inter}, GgufType::F32,
+                     qf32_bytes(qramp(inter * h, 0.002f)));
+        w.add_tensor(p + "ffn_up.weight", {h, inter}, GgufType::F32,
+                     qf32_bytes(qramp(inter * h, 0.003f)));
+        w.add_tensor(p + "ffn_down.weight", {inter, h}, GgufType::F32,
+                     qf32_bytes(qramp(inter * h, 0.004f)));
+
+        if (cfg.is_full_attention_layer(i)) {
+            w.add_tensor(p + "attn_q.weight", {h, nq * d * 2}, GgufType::F32,
+                         qf32_bytes(qramp(nq * d * 2 * h, 0.005f)));
+            w.add_tensor(p + "attn_k.weight", {h, nkv * d}, GgufType::F32,
+                         qf32_bytes(qramp(nkv * d * h, 0.006f)));
+            w.add_tensor(p + "attn_v.weight", {h, nkv * d}, GgufType::F32,
+                         qf32_bytes(qramp(nkv * d * h, 0.007f)));
+            w.add_tensor(p + "attn_output.weight", {nq * d, h}, GgufType::F32,
+                         qf32_bytes(qramp(nq * d * h, 0.008f)));
+            w.add_tensor(p + "attn_q_norm.weight", {d}, GgufType::F32,
+                         qf32_bytes(std::vector<float>(d, 1.0f)));
+            w.add_tensor(p + "attn_k_norm.weight", {d}, GgufType::F32,
+                         qf32_bytes(std::vector<float>(d, 1.0f)));
+        } else {
+            w.add_tensor(p + "attn_qkv.weight", {h, qkv}, GgufType::F32,
+                         qf32_bytes(qramp(qkv * h, 0.005f)));
+            w.add_tensor(p + "attn_gate.weight", {h, vdim}, GgufType::F32,
+                         qf32_bytes(qramp(vdim * h, 0.006f)));
+            w.add_tensor(p + "ssm_alpha.weight", {h, nv}, GgufType::F32,
+                         qf32_bytes(qramp(nv * h, 0.007f)));
+            w.add_tensor(p + "ssm_beta.weight", {h, nv}, GgufType::F32,
+                         qf32_bytes(qramp(nv * h, 0.008f)));
+            w.add_tensor(p + "ssm_out.weight", {vdim, h}, GgufType::F32,
+                         qf32_bytes(qramp(vdim * h, 0.009f)));
+            w.add_tensor(p + "ssm_a", {nv}, GgufType::F32,
+                         qf32_bytes(std::vector<float>(nv, 0.5f)));
+            w.add_tensor(p + "ssm_dt.bias", {nv}, GgufType::F32,
+                         qf32_bytes(std::vector<float>(nv, 0.1f)));
+            w.add_tensor(p + "ssm_norm.weight", {cfg.linear_value_head_dim}, GgufType::F32,
+                         qf32_bytes(std::vector<float>(cfg.linear_value_head_dim, 1.0f)));
+            w.add_tensor(p + "ssm_conv1d.weight", {qkv * cfg.linear_conv_kernel_dim},
+                         GgufType::F32,
+                         qf32_bytes(qramp(qkv * cfg.linear_conv_kernel_dim, 0.05f)));
+        }
+    }
+    REQUIRE(w.write(path));
+}
+
+}  // namespace
+
+TEST_CASE("qwen35 load_weights_from_gguf maps llama.cpp names", "[qwen35]") {
+    const ConfigQwen35 cfg = tiny_cfg();
+    const std::string path = "/tmp/rt_qwen35_load.gguf";
+    write_qwen35_gguf(path, cfg);
+
+    Qwen35Model model = Qwen35Model::new_for_inference(cfg);
+    REQUIRE(model.load_weights_from_gguf(path).has_value());
+
+    // The embedding loaded as BF16, and the tied head shares its bits.
+    REQUIRE(model.embed_bf16.has_value());
+    REQUIRE(model.embed_bf16->rows == cfg.vocab_size);
+    REQUIRE(model.lm_head.bf16_weight.has_value());
+    REQUIRE(model.lm_head.bf16_weight->data == model.embed_bf16->data);
+
+    // GGUF norms are 1 + weight, so a file of ones becomes zeros.
+    const Mat& gamma = model.layers[0].input_layernorm.gamma.data();
+    for (std::size_t c = 0; c < gamma.cols; ++c) {
+        REQUIRE(std::fabs(gamma.at(0, c)) < 1e-6f);
+    }
+
+    // attn_qkv is the DeltaNet fused projection, transposed into [out, in].
+    const auto& dn = std::get<Qwen35DeltaNet>(model.layers[0].token_mixer);
+    REQUIRE(dn.in_proj_qkv.weight.data().rows == cfg.deltanet_qkv_dim());
+    REQUIRE(dn.in_proj_qkv.weight.data().cols == cfg.hidden_size);
+    REQUIRE(dn.conv1d_weight.size() == cfg.deltanet_qkv_dim() * cfg.linear_conv_kernel_dim);
+    REQUIRE(dn.a_log.size() == cfg.linear_num_value_heads);
+    REQUIRE(dn.dt_bias.size() == cfg.linear_num_value_heads);
+    // The gated norm weight is stored raw, so ones stay ones.
+    REQUIRE(dn.norm_weight.size() == cfg.linear_value_head_dim);
+    REQUIRE(dn.norm_weight[0] == 1.0f);
+
+    // Layer 3 is the full-attention layer; q_proj carries query and gate.
+    const auto& fa = std::get<Qwen35FullAttention>(model.layers[3].token_mixer);
+    REQUIRE(fa.q_proj.weight.data().rows == cfg.num_attention_heads * cfg.head_dim * 2);
+    REQUIRE(fa.o_proj.weight.data().rows == cfg.hidden_size);
+
+    Qwen35Cache cache(cfg, 8);
+    require_all_finite(model.prefill({1, 2, 3}, cache), "gguf prefill logits");
+    require_all_finite(model.decode_step(4, cache), "gguf decode logits");
+
+    std::remove(path.c_str());
+}
+
+TEST_CASE("qwen35 load_weights_from_dir rejects a directory with no shards", "[qwen35]") {
+    Qwen35Model model = Qwen35Model::new_for_inference(tiny_cfg());
+    REQUIRE_FALSE(model.load_weights_from_dir("/tmp/rt_no_such_qwen_dir").has_value());
+
+    const std::string dir = "/tmp/rt_empty_qwen_dir";
+    std::filesystem::create_directories(dir);
+    const Result<void> empty = model.load_weights_from_dir(dir);
+    REQUIRE_FALSE(empty.has_value());
+    REQUIRE(empty.error().find("no .safetensors files") != std::string::npos);
+    std::filesystem::remove_all(dir);
 }

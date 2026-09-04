@@ -11,6 +11,7 @@ target_sources(rt_core PRIVATE
   transformer4.cpp
   transformer4_load.cpp
   transformer_qwen35.cpp
+  transformer_qwen35_load.cpp
   tensor.cpp
   autograd.cpp
   nn.cpp

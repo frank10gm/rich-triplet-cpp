@@ -23,11 +23,14 @@
 // | DeltaNet layers       | n/a                    | conv1d + recurrent state |
 
 #include <cstddef>
+#include <functional>
 #include <optional>
+#include <string>
 #include <variant>
 #include <vector>
 
 #include "rt/nn2.hpp"
+#include "rt/result.hpp"
 #include "rt/sampling.hpp"
 #include "rt/tensor_node.hpp"
 
@@ -292,8 +295,39 @@ class Qwen35Model {
     /// Run one token through every block, returning its logits.
     [[nodiscard]] Mat decode_step(std::size_t token_id, Qwen35Cache& cache) const;
 
+    /// Generate `max_new` tokens, calling `callback` as each one is produced.
+    ///
+    /// Prefill runs the whole prompt in batched mode; decode then runs one
+    /// token per step. With Metal built in, decode moves to the GPU once the
+    /// DeltaNet state and KV cache have been handed over.
+    void generate_cached_streaming(const std::vector<std::size_t>& token_ids, std::size_t max_new,
+                                   float temperature, std::size_t top_k, float top_p,
+                                   float repetition_penalty, std::uint64_t seed, bool debug,
+                                   const std::function<void(std::size_t)>& callback);
+
+    /// Load weights from a GGUF file.
+    ///
+    /// llama.cpp names the DeltaNet tensors differently from HuggingFace:
+    /// `attn_qkv` is the fused QKV projection, `attn_gate` the output gate,
+    /// `post_attention_norm` the post-attention layernorm, and `ssm_a` carries
+    /// no `.weight` suffix. Norm gammas arrive as `1 + weight` and have the 1
+    /// subtracted, except the DeltaNet output norm, which is stored raw.
+    [[nodiscard]] Result<void> load_weights_from_gguf(const std::string& path);
+
+    /// Load weights from a directory of HuggingFace `.safetensors` shards.
+    ///
+    /// Unlike GGUF, safetensors stores norm gammas raw, so nothing is
+    /// subtracted on the way in.
+    [[nodiscard]] Result<void> load_weights_from_dir(const std::string& dir);
+
    private:
     explicit Qwen35Model(ConfigQwen35 cfg);
+
+    /// One token's embedding row. Qwen 3.5 applies no scaling.
+    [[nodiscard]] std::vector<float> embed_token(std::size_t tok) const;
+
+    /// Route one safetensor to its model field. Returns whether it matched.
+    bool apply_safetensor(struct SafeTensor t);
 };
 
 // =============================================================================
