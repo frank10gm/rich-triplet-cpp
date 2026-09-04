@@ -16,4 +16,6 @@ target_sources(rt_core PRIVATE
   dataset.cpp
   transformer.cpp
   transformer2.cpp
+  train.cpp
+  train2.cpp
 )
