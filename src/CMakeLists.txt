@@ -1,8 +1,12 @@
 target_sources(rt_core PRIVATE
   mat.cpp
+  conv1d.cpp
   quant_q4.cpp
   quant_q4k.cpp
   gguf.cpp
+  torch_pickle.cpp
+  snac.cpp
+  wav.cpp
   ndarray.cpp
   tensor_node.cpp
   nn2.cpp
@@ -10,6 +14,9 @@ target_sources(rt_core PRIVATE
   tokenizer.cpp
   transformer4.cpp
   transformer4_load.cpp
+  transformer5.cpp
+  transformer5_load.cpp
+  orpheus.cpp
   transformer_qwen35.cpp
   transformer_qwen35_load.cpp
   tensor.cpp

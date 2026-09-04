@@ -1,8 +1,14 @@
 add_executable(rt_tests
   test_bf16.cpp
   test_mat.cpp
+  test_conv1d.cpp
   test_quant.cpp
   test_gguf.cpp
+  test_torch_pickle.cpp
+  test_snac.cpp
+  test_orpheus.cpp
+  test_transformer5.cpp
+  test_wav.cpp
   test_ndarray.cpp
   test_tensor_node.cpp
   test_nn2.cpp

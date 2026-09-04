@@ -51,6 +51,20 @@ struct SamplingParams {
     /// Typical values 0.2-1.0; encourages new vocabulary.
     float presence_penalty = 0.0f;
 
+    /// Restrict sampling to ids in `[allowed_min, allowed_max)`, plus any
+    /// listed in `allowed_extra`. Both unset means no restriction.
+    ///
+    /// Useful when a model's vocabulary is partitioned by purpose -- Orpheus
+    /// puts 28 672 audio codes alongside 128 256 text tokens and should only
+    /// emit the former once its prompt is consumed. Masking is not a
+    /// correctness requirement for a well-behaved model; it stops a drifting
+    /// one from wandering out of the range the caller can use.
+    std::optional<std::size_t> allowed_min;
+    std::optional<std::size_t> allowed_max;
+    /// Ids permitted regardless of the range -- stop markers, typically,
+    /// which must stay reachable or generation runs to `max_new`.
+    std::vector<std::size_t> allowed_extra;
+
     /// Greedy (deterministic) sampling -- always the argmax.
     [[nodiscard]] static SamplingParams greedy() {
         SamplingParams p;

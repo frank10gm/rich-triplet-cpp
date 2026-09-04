@@ -1,4 +1,13 @@
 build/
+build-metal/
 .DS_Store
 compile_commands.json
-build-metal/
+
+# Editor state -- clangd's index, machine-local.
+.cache/
+
+# Downloaded weights: 2.4 GB of GGUF plus the SNAC codec.
+models/
+
+# Synthesised audio. `--out` defaults to out.wav in the working directory.
+*.wav

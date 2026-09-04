@@ -31,7 +31,11 @@
 #include "rt/transformer2.hpp"
 #include "rt/transformer3.hpp"
 #include "rt/transformer4.hpp"
+#include "rt/orpheus.hpp"
+#include "rt/snac.hpp"
+#include "rt/transformer5.hpp"
 #include "rt/transformer_qwen35.hpp"
+#include "rt/wav.hpp"
 
 using namespace rt;
 
@@ -136,6 +140,16 @@ struct CliArgs {
     bool debug = false;
     /// --draft-len N : max speculative draft tokens per step, 0 disables
     std::size_t draft_len = 0;
+    /// --voice NAME : Orpheus speaker
+    std::optional<std::string> voice;
+    /// --snac PATH : SNAC codec checkpoint (pytorch_model.bin)
+    std::optional<std::string> snac;
+    /// --out PATH : where to write the synthesised WAV
+    std::optional<std::string> out;
+    /// --no-audio-mask : let Orpheus sample outside the audio token range
+    bool no_audio_mask = false;
+    /// --no-leading-bos : drop the BOS that vLLM's re-tokenization prepends
+    bool no_leading_bos = false;
 };
 
 void print_help();
@@ -210,6 +224,16 @@ template <typename T>
             a.quantize = true;
         } else if (arg == "--debug") {
             a.debug = true;
+        } else if (arg == "--voice") {
+            a.voice = take(i);
+        } else if (arg == "--snac") {
+            a.snac = take(i);
+        } else if (arg == "--out") {
+            a.out = take(i);
+        } else if (arg == "--no-audio-mask") {
+            a.no_audio_mask = true;
+        } else if (arg == "--no-leading-bos") {
+            a.no_leading_bos = true;
         } else if (arg == "--draft-len") {
             if (const auto v = take(i)) a.draft_len = parse_or<std::size_t>(*v, 4);
         } else if (arg == "--help" || arg == "-h") {
@@ -262,6 +286,13 @@ void print_help() {
     std::printf("  --checkpoint PATH        Load saved .ckpt instead of training\n");
     std::printf("  --benchmark              Run scalar-vs-tensor autograd benchmark\n");
     std::printf("  --debug                  Enable per-step diagnostic logging\n");
+    std::printf("\nText to speech (--model orpheus-3b):\n");
+    std::printf("  --voice NAME             tara|leah|jess|leo|dan|mia|zac|zoe [default: tara]\n");
+    std::printf("  --snac PATH              SNAC 24 kHz checkpoint (pytorch_model.bin)\n");
+    std::printf("  --out PATH               Output WAV                  [default: out.wav]\n");
+    std::printf("  --no-audio-mask          Allow sampling outside the audio token range\n");
+    std::printf("  --no-leading-bos         Drop the leading BOS token from the prompt\n");
+    std::printf("\n");
     std::printf("  --pretokenize S D        Tokenize text file S, write binary D.bin\n");
     std::printf("                           Uses char tokenizer built from S.\n");
     std::printf("                           For BPE: also pass --vocab and --merges.\n");
@@ -403,6 +434,107 @@ void run_gpt_oss(const CliArgs& args, const std::string& prompt) {
         emit(tok->decode({static_cast<std::uint32_t>(tok_id)}));
     });
     std::printf("\n");
+}
+
+// =============================================================================
+// Generation mode -- Orpheus text to speech
+// =============================================================================
+
+void run_orpheus(const CliArgs& args, const std::string& prompt) {
+    const std::string& weights_path = *args.weights;
+    const std::string snac_path = args.snac.value_or("models/snac_24khz.bin");
+    const std::string out_path = args.out.value_or("out.wav");
+    const std::string voice = args.voice.value_or("tara");
+
+    if (!std::filesystem::exists(snac_path)) {
+        die("SNAC codec weights not found at " + snac_path +
+            "\n       Fetch them with:\n         curl -L -o " + snac_path +
+            " https://huggingface.co/hubertsiuzdak/snac_24khz/resolve/main/pytorch_model.bin\n"
+            "       or point --snac at an existing copy.");
+    }
+
+    // The GGUF carries its own vocabulary and merges, so no --tokenizer-dir is
+    // needed -- which matters here, because the Orpheus repository is gated.
+    std::fprintf(stderr, "[ Orpheus ] Reading %s...\n", weights_path.c_str());
+    const Result<GgufFile> gguf = GgufFile::open(weights_path);
+    if (!gguf) {
+        die("failed to open GGUF: " + gguf.error());
+    }
+    const Result<HfBpeTokenizer> tok = load_gguf_tokenizer(*gguf);
+    if (!tok) {
+        die("failed to build the tokenizer from GGUF: " + tok.error());
+    }
+
+    LlamaModel model = LlamaModel::new_for_inference(Config5::orpheus_3b());
+    if (const Result<void> ok = model.load_weights_from_gguf(weights_path); !ok) {
+        die("failed to load weights: " + ok.error());
+    }
+
+    // Orpheus ships output.weight as Q6_K, which the loader widens to BF16 --
+    // 964 MB for a 156 940-entry vocabulary. Q4_K brings that to 271 MB, and
+    // since the lm_head GEMV is the largest read per token it speeds decode up
+    // as well.
+    std::fprintf(stderr, "[ Orpheus ] Quantizing lm_head to Q4_K...\n");
+    model.quantize_lm_head();
+    release_memory_to_os();
+    print_rss("after weight load");
+
+    std::fprintf(stderr, "[ Orpheus ] Loading SNAC codec from %s...\n", snac_path.c_str());
+    const Result<SnacDecoder> snac = SnacDecoder::load(snac_path, SnacConfig::snac_24khz());
+    if (!snac) {
+        die("failed to load the SNAC codec: " + snac.error());
+    }
+    std::fprintf(stderr, "[ Orpheus ] SNAC decoder: %zu parameters\n", snac->parameter_count());
+
+    OrpheusRequest request;
+    request.text = prompt;
+    request.voice = voice;
+    request.max_new = args.max_new;
+    request.debug = args.debug;
+    request.mask_to_audio = !args.no_audio_mask;
+    request.sampling = orpheus_default_sampling(args.seed);
+    // Explicit flags win over the reference defaults.
+    request.sampling.temperature = args.temperature;
+    request.sampling.top_p = args.top_p;
+    request.sampling.top_k = args.top_k;
+    request.sampling.repetition_penalty = args.rep_penalty;
+
+    std::fprintf(stderr, "[ Orpheus ] voice=%s max_new=%zu temp=%.2f top_p=%.2f rep=%.2f\n",
+                 voice.c_str(), request.max_new, static_cast<double>(request.sampling.temperature),
+                 static_cast<double>(request.sampling.top_p),
+                 static_cast<double>(request.sampling.repetition_penalty));
+    std::fprintf(stderr, "[ Orpheus ] Synthesising: \"%s\"\n", prompt.c_str());
+
+    OrpheusConfig cfg = OrpheusConfig::defaults();
+    cfg.leading_bos = !args.no_leading_bos;
+    const Result<OrpheusResult> result = orpheus_synthesize(model, *snac, *tok, request, cfg);
+    if (!result) {
+        die("synthesis failed: " + result.error());
+    }
+
+    const WaveStats stats = wave_stats(result->samples);
+    std::fprintf(stderr,
+                 "[ Orpheus ] %zu tokens -> %zu codes (%zu rejected) -> %zu groups -> %zu samples\n",
+                 result->tokens_generated, result->codes_accepted, result->codes_rejected,
+                 result->groups, result->samples.size());
+    std::fprintf(stderr,
+                 "[ Orpheus ] %.2f s audio in %.2f s generate + %.2f s decode (RTF %.2f)\n",
+                 result->audio_seconds(), result->generate_seconds, result->decode_seconds,
+                 result->realtime_factor());
+    std::fprintf(stderr, "[ Orpheus ] waveform: %s\n", stats.describe().c_str());
+    if (!stats.looks_like_speech()) {
+        // Not fatal -- a short or quiet clip fails this legitimately -- but a
+        // pipeline fault shows up here first, and every fault in this pipeline
+        // sounds the same.
+        std::fprintf(stderr,
+                     "[ Orpheus ] Warning: the waveform statistics do not look like speech\n");
+    }
+
+    if (const Result<void> ok = write_wav(out_path, result->samples, result->sample_rate, 1);
+        !ok) {
+        die("failed to write the WAV: " + ok.error());
+    }
+    std::fprintf(stderr, "[ Orpheus ] Wrote %s\n", out_path.c_str());
 }
 
 // =============================================================================
@@ -772,13 +904,20 @@ int main(int argc, char** argv) {
     // Generation mode
     // -------------------------------------------------------------------------
     if (args.prompt) {
+        const bool is_orpheus = args.model && args.model->starts_with("orpheus");
         const bool is_qwen35 = args.model && args.model->starts_with("qwen35");
         // A .gguf file with no --model is assumed to be Gemma 3, which is the
         // only architecture this CLI ever loaded from GGUF first.
         const bool is_gemma3 = args.tokenizer_model.has_value() ||
                                (args.model && args.model->starts_with("gemma3")) ||
-                               (!is_qwen35 && args.weights && args.weights->ends_with(".gguf"));
-        if (is_qwen35) {
+                               (!is_qwen35 && !is_orpheus && args.weights &&
+                                args.weights->ends_with(".gguf"));
+        if (is_orpheus) {
+            if (!args.weights) {
+                die("--model orpheus-3b needs --weights pointing at the GGUF file");
+            }
+            run_orpheus(args, *args.prompt);
+        } else if (is_qwen35) {
             run_qwen35(args, *args.prompt);
         } else if (is_gemma3) {
             run_gemma3(args, *args.prompt);

@@ -4,13 +4,13 @@ A complete LLM stack built from first principles in C++23, **with no ML dependen
 
 This is a port of [the Rust original](../rich-triplet), kept numerically identical: the parity work behind it is described in [Porting notes](#porting-notes).
 
-Supports **Gemma 3** and **Qwen 3.5** inference on Apple Silicon with Q4_K_M / Q4_0 GGUF weights and full-graph Metal GPU decode.
+Supports **Gemma 3** and **Qwen 3.5** text inference on Apple Silicon with Q4_K_M / Q4_0 GGUF weights and full-graph Metal GPU decode, plus **Orpheus** text-to-speech synthesis end to end — text in, WAV out, including the SNAC neural audio codec.
 
 ---
 
 ## What this project is
 
-Four transformer implementations (GPT-2 scalar, GPT-2 tensor, GPT-OSS, Gemma 3, Qwen 3.5), a tensor autodiff engine, Apple Metal GPU acceleration, Flash Attention, GGUF and safetensors weight loading, and a CLI for inference and training.
+Six transformer implementations (GPT-2 scalar, GPT-2 tensor, GPT-OSS, Gemma 3, Qwen 3.5, Llama 3.2), a neural audio codec decoder, a tensor autodiff engine, Apple Metal GPU acceleration, Flash Attention, GGUF / safetensors / torch-pickle weight loading, and a CLI for inference, training and speech synthesis.
 
 | File | What you understand after writing it |
 |---|---|
@@ -22,6 +22,12 @@ Four transformer implementations (GPT-2 scalar, GPT-2 tensor, GPT-OSS, Gemma 3, 
 | `transformer3.cpp` | GPT-OSS: RoPE, GQA, Mixture of Experts, safetensors |
 | `transformer4.cpp` | Gemma 3: NeoX RoPE, sliding window, 4-norm blocks, GGUF |
 | `transformer_qwen35.cpp` | Qwen 3.5: Gated DeltaNet + softmax attention hybrid |
+| `transformer5.cpp` | Llama 3.2: the two RoPE pair conventions, and why GGUF needs the other one |
+| `conv1d.cpp` | Dilated, grouped and transposed 1-D convolution; Snake; weight norm |
+| `snac.cpp` | Multi-scale residual vector quantization, and a codec decoder |
+| `orpheus.cpp` | Audio tokens: slot offsets, frame de-interleaving, resynchronisation |
+| `torch_pickle.cpp` | ZIP central directories, and just enough pickle to be safe |
+| `wav.cpp` | RIFF, and how to tell speech from noise without listening |
 | `gguf.cpp` | GGUF file format: Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, BF16, F16, F32 |
 | `tokenizer.cpp` | Character, BPE, SentencePiece and HuggingFace BPE tokenizers |
 | `metal_ops.mm` | Metal GPU tiled matmul, Q4_K/BF16 GEMV kernels |
@@ -111,12 +117,96 @@ Qwen 3.5 is a hybrid: three quarters of its layers use Gated DeltaNet (linear at
 
 ---
 
+## Orpheus text to speech
+
+```bash
+# The codec weights (80 MB) -- fetched once
+curl -L -o models/snac_24khz.bin \
+  https://huggingface.co/hubertsiuzdak/snac_24khz/resolve/main/pytorch_model.bin
+
+./build/rich-triplet \
+  --model orpheus-3b \
+  --weights ./models/orpheus-3b-0.1-ft-q4_k_m.gguf \
+  --snac ./models/snac_24khz.bin \
+  --prompt "Hello, my name is Tara and I am running entirely in C plus plus." \
+  --voice tara \
+  --out tara.wav
+```
+
+Voices: `tara`, `leah`, `jess`, `leo`, `dan`, `mia`, `zac`, `zoe`. Emotion tags
+like `<laugh>` and `<sigh>` are ordinary text — the tokenizer merges them like
+any other word, so they need no special handling.
+
+No `--tokenizer-dir` is needed. The GGUF carries its own 156 940-entry
+vocabulary and 280 147 merges, which matters because the Orpheus repository is
+gated on HuggingFace — the weights are freely mirrored as GGUF but
+`tokenizer.json` is not.
+
+### How it works
+
+1. **The backbone is a Llama 3.2 3B** whose vocabulary has been extended by
+   28 672 audio codes. It does not emit audio; it emits codec tokens.
+2. **Seven tokens make a frame.** `<custom_token_0>` is id 128256, and a code
+   is `id - 128266 - (slot * 4096)`, so audio ids run 128266–156937 across
+   seven codebook slots of 4096.
+3. **A frame is 2048 samples** — 85.33 ms at 24 kHz. Realtime therefore needs
+   about 82 tokens a second.
+4. **SNAC reconstructs the waveform** from three codebooks running at 1/4, 1/2
+   and 1/1 of the frame rate, then four transposed-convolution blocks upsample
+   by 8, 8, 4 and 2 for 512 samples per frame.
+
+### Measured on an M3 Pro (18 GB, CPU build)
+
+| | |
+|---|---|
+| Resident weights | ~3.5 GB (2.36 GB on disk) |
+| Decode | ~16 tokens/s |
+| Realtime factor | ~5.0 |
+| SNAC decode | ~0.1 s per second of audio |
+
+So a 4.7 s clip takes about 24 s. Decode runs on the CPU: there is no
+full-graph Metal path for Llama yet, and the Metal build measures the same,
+because per-token cost is Q4_K GEMV rather than the large matmuls
+`Mat::matmul` sends to the GPU. Two things would close most of the gap — a
+`metal_decode_llama.mm` trimmed from the Gemma engine, and speculative
+decoding, which is already implemented for Gemma.
+
+`--quantize`-style savings are applied automatically: Orpheus ships
+`output.weight` as Q6_K, which the loader widens to BF16 at 964 MB for a
+156 940-entry vocabulary, so the CLI requantizes it to Q4_K (271 MB). That is
+also the largest single read per token.
+
+### Diagnosing it
+
+Every fault in a speech pipeline sounds the same — a wrong RoPE convention, a
+wrong codebook stride and a wrong convolution padding all produce noise. Two
+things make that tractable without a reference implementation to diff against.
+
+**Exact length invariants, asserted in code.** Each upsampling block
+multiplies its input length by exactly its stride, and each residual unit
+preserves length exactly, so `n_frames * 512` has no slack. Every padding or
+`output_padding` mistake breaks the multiple and trips an assertion instead of
+degrading the audio.
+
+**Waveform statistics, printed every run.** Speech at 24 kHz sits near an RMS
+of 0.03–0.2 with negligible DC offset and a low zero-crossing rate; a decoder
+fed bad latents saturates its output `tanh` and lands near 0.5 with most
+samples at the rails. `wave_stats` reports both and the CLI warns when the
+numbers do not look like speech.
+
+`--debug` adds a per-token dump of which codebook slot each id actually falls
+in against the slot the stream expected. A healthy stream walks 0, 1, 2, 3, 4,
+5, 6 and repeats; anything else is the frame structure breaking down, which is
+invisible in the audio itself.
+
+---
+
 ## CLI options
 
 | Flag | Default | Description |
 |---|---|---|
 | `--prompt TEXT` | — | Text to complete |
-| `--model NAME` | — | `gpt-oss`, `gemma3-1b`, `gemma3-4b`, `qwen35-0.8b`, `qwen35-4b`, `qwen35-9b` |
+| `--model NAME` | — | `gpt-oss`, `gemma3-1b`, `gemma3-4b`, `qwen35-0.8b`, `qwen35-4b`, `qwen35-9b`, `orpheus-3b` |
 | `--weights PATH` | — | GGUF file or safetensors directory |
 | `--tokenizer-dir DIR` | — | Directory containing `tokenizer.json` |
 | `--vocab PATH` / `--merges PATH` | — | BPE files, for GPT-OSS |
@@ -133,17 +223,40 @@ Qwen 3.5 is a hybrid: three quarters of its layers use Gated DeltaNet (linear at
 | `--checkpoint PATH` | — | Load a saved checkpoint instead of training |
 | `--pretokenize S D` | — | Tokenize text file `S` into binary `D`, then exit |
 | `--benchmark` | off | Scalar autograd vs tensor autodiff benchmark |
+| `--voice NAME` | `tara` | Orpheus speaker |
+| `--snac PATH` | `models/snac_24khz.bin` | SNAC 24 kHz codec checkpoint |
+| `--out PATH` | `out.wav` | Where to write the synthesised audio |
+| `--no-audio-mask` | off | Let Orpheus sample outside the audio token range |
+| `--no-leading-bos` | off | Drop the leading BOS from the Orpheus prompt |
 
 ---
 
 ## Running tests
 
 ```bash
-./build/tests/rt_tests          # 292 cases
-./build-metal/tests/rt_tests    # 304 cases, including the GPU kernels
+./build/tests/rt_tests          # 401 cases
+./build-metal/tests/rt_tests    # 413 cases, including the GPU kernels
 ```
 
-Covers matrix ops, gradient correctness against finite differences, attention shapes, Flash Attention, Q4_K/BF16 quantization, GGUF and safetensors parsing, all four tokenizers, every architecture, the Metal kernels, and the weight-loading paths.
+Covers matrix ops, gradient correctness against finite differences, attention
+shapes, Flash Attention, Q4_K/BF16 quantization, GGUF, safetensors and
+torch-pickle parsing, all four tokenizers, every architecture, 1-D convolution
+against reference loops, the SNAC decoder, RIFF output, the Metal kernels, and
+the weight-loading paths.
+
+A further 12 cases are hidden by default because they need downloaded weights:
+
+```bash
+./build/tests/rt_tests '[.integration]'   # real checkpoints, seconds
+./build/tests/rt_tests '[.e2e]'           # loads 2.4 GB and generates, minutes
+```
+
+They skip cleanly when `models/` is empty. The `[.e2e]` set includes a
+consistency check worth calling out: running N tokens through prefill must rank
+its logits identically to running N-1 through prefill and the last through the
+incremental decode path. It needs no reference implementation, and it separates
+a KV-cache or RoPE-offset bug from an architecture one — which otherwise
+present the same way.
 
 ---
 
@@ -203,6 +316,14 @@ src/
 ├── transformer4_load.cpp        Gemma 3 weight loading, cache, generation
 ├── transformer_qwen35.cpp       Qwen 3.5 architecture
 ├── transformer_qwen35_load.cpp  Qwen 3.5 weight loading and generation
+├── transformer5.cpp             Llama 3.2 architecture, RoPE, large-vocab sampling
+├── transformer5_load.cpp        Llama 3.2 GGUF loading, embedded tokenizer
+│
+├── conv1d.cpp          1-D convolution: dilated, grouped, transposed; Snake
+├── snac.cpp            SNAC 24 kHz codec decoder and residual vector quantizer
+├── orpheus.cpp         Audio-token protocol, frame de-interleaving, synthesis
+├── torch_pickle.cpp    PyTorch .bin reader: ZIP container + pickle manifest
+├── wav.cpp             16-bit PCM WAV output and waveform statistics
 │
 ├── gguf.cpp            GGUF parser and every quantized tensor decoder
 ├── metal_ops.mm        Metal GPU kernels (tiled matmul, per-dispatch GEMV)
@@ -251,6 +372,54 @@ x'_{i+half} = x_{i+half} * cos(angle) + x_i * sin(angle)
 
 Local layers use theta = 10000 and freq_scale = 1.0; global layers (every sixth) use theta = 1e6 and freq_scale = 1/8. Qwen 3.5 rotates only the first quarter of each head.
 
+### Two RoPE pair conventions
+
+Rotary embeddings can pair dimension `i` with `i + head_dim/2` (half-split) or
+`2i` with `2i + 1` (interleaved). HuggingFace's Llama uses half-split;
+llama.cpp uses interleaved and reconciles the two by permuting the Q and K
+weight rows during conversion. So Gemma 3 and Llama 3.2 need *different*
+conventions off the same file format — `convert_hf_to_gguf.py` permutes for
+llama and not for Gemma.
+
+Both conventions rotate by the same angles and differ only in which pairs those
+angles apply to, so at low positions — where every rotation is near identity —
+they agree to several decimals. They separate as position grows. In a speech
+model that means the first three or four tokens come out right and everything
+after is noise.
+
+### Llama 3 RoPE scaling
+
+Llama 3.2 does not scale RoPE by one factor. It divides each frequency band by
+a different amount: high-frequency dimensions untouched so local structure
+survives, low-frequency ones divided by 32 so positions stretch, with a smooth
+ramp between. GGUF ships the resulting per-dimension values in
+`rope_freqs.weight`, running from 1.0 up to 32.0 — they are **divisors**, not
+multipliers.
+
+### Multi-scale residual vector quantization
+
+A plain codec quantizes every frame at one rate. SNAC runs three codebooks at
+1/4, 1/2 and 1/1 of the frame rate, each coding what the previous one left
+behind, so coarse structure gets cheap slow codes and detail gets fast ones —
+7 codes for 4 frames:
+
+```
+z = sum_i out_proj_i(codebook_i[code_i]) repeated by stride_i
+```
+
+The upsampling is a repeat, not a tile: stride 4 turns `[a, b]` into
+`[a, a, a, a, b, b, b, b]`.
+
+### Weight normalization, and which axis
+
+`weight_norm` stores a magnitude `g` and a direction `v`, reconstructing
+`g * v / ||v||` with the norm over every axis except axis 0 of the *stored*
+tensor. Which axis that is depends on the layer: `Conv1d` stores
+`[out, in, k]`, so the magnitude is per output channel, while
+`ConvTranspose1d` stores `[in, out, k]`, so it is per **input** channel.
+Deriving the group count from `g`'s own length gets both right with no special
+case.
+
 ### Grouped Multi-Query Attention
 
 Gemma 3 4B has 8 query heads and 4 KV heads, each KV head shared by two query heads, halving the KV cache.
@@ -275,7 +444,10 @@ so decode is O(1) in sequence length rather than O(T).
 
 ## Stats
 
-- ~22,700 lines of C++, Objective-C++ and MSL, plus ~6,900 of tests
-- 304 test cases with Metal, 292 without
+- ~27,100 lines of C++, Objective-C++ and MSL, plus ~9,700 of tests
+- 413 test cases with Metal, 401 without, plus 12 that need downloaded weights
 - Zero ML dependencies (Accelerate and Metal are system frameworks)
-- Bit-exact against the Rust reference, module by module
+- Every published weight format read from scratch: GGUF, safetensors, and
+  PyTorch's ZIP-plus-pickle `.bin`
+- The ported modules are bit-exact against the Rust reference, module by
+  module; the text-to-speech stack has no Rust counterpart and is new here

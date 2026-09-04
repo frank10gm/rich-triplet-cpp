@@ -1259,6 +1259,10 @@ std::optional<std::uint32_t> HfBpeTokenizer::token_id(const std::string& token) 
 }
 
 std::vector<std::string> HfBpeTokenizer::gpt2_pretokenize(std::string_view text) {
+    return pretokenize(text, PreTokenizer::Gpt2);
+}
+
+std::vector<std::string> HfBpeTokenizer::pretokenize(std::string_view text, PreTokenizer kind) {
     std::vector<std::string> words;
     const auto chars = utf8::decode_indices(text);
     std::size_t i = 0;
@@ -1319,10 +1323,18 @@ std::vector<std::string> HfBpeTokenizer::gpt2_pretokenize(std::string_view text)
             continue;
         }
 
-        // Case 3: a single digit.
+        // Case 3: digits. GPT-2 emits one at a time; Llama 3's regex is
+        // `\p{N}{1,3}`, so it takes runs of up to three and "2024" becomes
+        // "202" + "4" rather than four separate digits.
         if (utf8::is_ascii_digit(ch)) {
-            push(byte_start, byte_end_at(i + 1));
-            ++i;
+            const std::size_t max_run = kind == PreTokenizer::Llama3 ? 3 : 1;
+            std::size_t j = i + 1;
+            while (j < chars.size() && j - i < max_run &&
+                   utf8::is_ascii_digit(chars[j].second)) {
+                ++j;
+            }
+            push(byte_start, byte_end_at(j));
+            i = j;
             continue;
         }
 
@@ -1425,7 +1437,7 @@ std::vector<std::uint32_t> HfBpeTokenizer::bpe_encode_word(std::string_view word
 std::vector<std::uint32_t> HfBpeTokenizer::encode_byte_level(std::string_view text) const {
     static const std::array<char32_t, 256> b2u = gpt2_bytes_to_unicode();
     std::vector<std::uint32_t> ids;
-    for (const std::string& word : gpt2_pretokenize(text)) {
+    for (const std::string& word : pretokenize(text, pre_)) {
         // Map each raw byte through the GPT-2 unicode table before merging.
         std::string unicode_word;
         for (char c : word) {
@@ -1508,6 +1520,50 @@ std::string HfBpeTokenizer::decode(const std::vector<std::uint32_t>& ids) const 
         }
     }
     return utf8::replace_all(out, kLowerOneEighthBlock, " ");
+}
+
+
+Result<HfBpeTokenizer> HfBpeTokenizer::from_vocab_and_merges(
+    std::vector<std::string> tokens, const std::vector<std::string>& merges, bool byte_level,
+    PreTokenizer pre) {
+    if (tokens.empty()) {
+        return err("hf tokenizer: vocabulary is empty");
+    }
+
+    HfBpeTokenizer tok;
+    tok.byte_level_ = byte_level;
+    tok.pre_ = pre;
+    tok.id_to_token_ = std::move(tokens);
+
+    tok.token_to_id_.reserve(tok.id_to_token_.size());
+    for (std::size_t id = 0; id < tok.id_to_token_.size(); ++id) {
+        // First id wins, matching how a JSON vocabulary object would load.
+        tok.token_to_id_.emplace(tok.id_to_token_[id], static_cast<std::uint32_t>(id));
+    }
+
+    tok.merge_rank_.reserve(merges.size());
+    for (std::size_t rank = 0; rank < merges.size(); ++rank) {
+        const std::string& entry = merges[rank];
+        const std::size_t space = entry.find(' ');
+        if (space == std::string::npos || space == 0 || space + 1 >= entry.size()) {
+            return err("hf tokenizer: merge " + std::to_string(rank) + " ('" + entry +
+                       "') is not two space-separated pieces");
+        }
+        tok.merge_rank_.emplace(
+            std::pair<std::string, std::string>{entry.substr(0, space), entry.substr(space + 1)},
+            rank);
+    }
+
+    // GGUF vocabularies carry no explicit unknown token. Llama 3 never needs
+    // one -- byte-level encoding can spell any input -- so point it at id 0 and
+    // let a genuinely missing symbol be visible rather than silently dropped.
+    tok.unk_id_ = 0;
+    const auto unk = tok.token_to_id_.find("<unk>");
+    if (unk != tok.token_to_id_.end()) {
+        tok.unk_id_ = unk->second;
+    }
+
+    return tok;
 }
 
 }  // namespace rt

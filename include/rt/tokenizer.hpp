@@ -254,6 +254,18 @@ class SentencePieceTokenizer final : public Tokenizer {
 
 class HfBpeTokenizer final : public Tokenizer {
    public:
+    /// Which pre-tokenizer regex to split with before merging.
+    ///
+    /// GPT-2 and Llama 3 differ in one clause that matters: GPT-2 splits every
+    /// digit into its own token (`[0-9]`), while Llama 3 takes runs of up to
+    /// three (`\p{N}{1,3}`). So "2024" is `2|0|2|4` under one and `202|4`
+    /// under the other -- different ids, and a mispronounced number in a
+    /// text-to-speech model. GGUF records which to use in `tokenizer.ggml.pre`.
+    enum class PreTokenizer {
+        Gpt2,
+        Llama3,
+    };
+
     [[nodiscard]] static Result<HfBpeTokenizer> from_json_bytes(
         const std::vector<std::uint8_t>& bytes);
     [[nodiscard]] static Result<HfBpeTokenizer> from_json_file(const std::string& path);
@@ -278,6 +290,27 @@ class HfBpeTokenizer final : public Tokenizer {
     /// newline runs, other whitespace runs, and punctuation runs.
     [[nodiscard]] static std::vector<std::string> gpt2_pretokenize(std::string_view text);
 
+    /// The same, with Llama 3's digit clause: runs of up to three digits
+    /// rather than one at a time.
+    [[nodiscard]] static std::vector<std::string> pretokenize(std::string_view text,
+                                                              PreTokenizer kind);
+
+    /// Build directly from a vocabulary and merge list, as GGUF stores them in
+    /// `tokenizer.ggml.tokens` and `tokenizer.ggml.merges`.
+    ///
+    /// Merge entries are `"<left> <right>"`, split at the first space. Their
+    /// order is their priority, lowest first.
+    ///
+    /// This exists because a GGUF file already carries a complete tokenizer,
+    /// and some models -- Orpheus among them -- are gated on HuggingFace, so
+    /// requiring a separate `tokenizer.json` means requiring an account.
+    [[nodiscard]] static Result<HfBpeTokenizer> from_vocab_and_merges(
+        std::vector<std::string> tokens, const std::vector<std::string>& merges, bool byte_level,
+        PreTokenizer pre);
+
+    /// Which pre-tokenizer this instance splits with.
+    [[nodiscard]] PreTokenizer pre_tokenizer() const { return pre_; }
+
    private:
     struct StrPairHash {
         std::size_t operator()(const std::pair<std::string, std::string>& p) const {
@@ -300,6 +333,7 @@ class HfBpeTokenizer final : public Tokenizer {
     /// GPT-2 byte-level encoding (Qwen, GPT-2) when true; SentencePiece U+2581
     /// encoding (Gemma) when false.
     bool byte_level_ = false;
+    PreTokenizer pre_ = PreTokenizer::Gpt2;
 };
 
 // =============================================================================
