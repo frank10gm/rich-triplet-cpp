@@ -23,13 +23,16 @@
 // inference-only.
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "rt/gguf.hpp"
 #include "rt/init_rng.hpp"
 #include "rt/nn2.hpp"
+#include "rt/result.hpp"
 #include "rt/sampling.hpp"
 #include "rt/tensor_node.hpp"
 
@@ -352,6 +355,66 @@ class Gemma3Model : public Trainable {
     /// Gemma 3 scales the looked-up embeddings by sqrt(hidden_size).
     [[nodiscard]] TensorNode forward(const std::vector<std::size_t>& token_ids) const;
 
+    /// Generate without a KV cache, calling `callback` per token.
+    ///
+    /// Every step re-runs the whole prefix, so this is O(N^2) in the number of
+    /// generated tokens -- use `generate_cached_streaming` for anything long.
+    void generate_streaming(const std::vector<std::size_t>& token_ids, std::size_t max_new,
+                            float temperature, std::size_t top_k, std::uint64_t seed,
+                            const std::function<void(std::size_t)>& callback) const;
+
+    /// Generate `max_new` tokens through the KV cache, calling `callback` per
+    /// token as it is produced.
+    ///
+    /// Prefill runs the whole prompt at once; decode then runs a single token
+    /// per step, turning generation from O(N^2 * T) into O(N * T).
+    ///
+    /// With Metal built in, decode moves to the GPU after prefill: the CPU
+    /// weights and KV cache are freed, and `draft_len > 0` enables n-gram
+    /// speculative decoding, verifying several drafted tokens per batch.
+    void generate_cached_streaming(const std::vector<std::size_t>& token_ids, std::size_t max_new,
+                                   float temperature, std::size_t top_k, float top_p,
+                                   float repetition_penalty, std::uint64_t seed, bool debug,
+                                   std::size_t draft_len,
+                                   const std::function<void(std::size_t)>& callback);
+
+    // -------------------------------------------------------------------------
+    // Weight loading
+    // -------------------------------------------------------------------------
+
+    /// Load weights from a directory of HuggingFace `.safetensors` shards.
+    ///
+    /// Tensor names follow the transformers convention:
+    /// `model.embed_tokens.weight`, `model.layers.{i}.self_attn.q_proj.weight`,
+    /// and so on. Shards stream one tensor at a time, so only a single
+    /// tensor's data is resident rather than the whole ~4.6 GB file.
+    [[nodiscard]] Result<void> load_weights_from_dir(const std::string& dir);
+
+    /// Load weights from a GGUF file, e.g. `gemma-3-4b-it-qat-q4_0-gguf`.
+    ///
+    /// Q4_0 and Q4_K tensors stay packed and dequantize during the matmul;
+    /// F16, F32, Q6_K, Q8_0 and Q5_K become BF16. The `blk.{i}.*` names map
+    /// onto the HuggingFace layer fields, and the norm gammas are stored as
+    /// `1 + gamma` in GGUF, so 1 is subtracted on the way in.
+    [[nodiscard]] Result<void> load_weights_from_gguf(const std::string& path);
+
+    /// Quantize every projection to INT4, keeping the f32 weights so gradients
+    /// still flow.
+    void quantize_for_inference();
+
+    /// Quantize every projection to INT4 and drop the f32 copies. Inference
+    /// only: f32 -> INT4 is 8x smaller, and freeing the source keeps the peak
+    /// down.
+    void quantize_inference_free_f32();
+
+    /// Write every weight to a binary cache file, skipping safetensors parsing
+    /// on the next load.
+    [[nodiscard]] Result<void> save_cache(const std::string& path) const;
+
+    /// Load weights written by `save_cache`. Returns false when the file is
+    /// missing or its magic does not match, so the caller can fall back.
+    [[nodiscard]] Result<bool> load_cache(const std::string& path);
+
     /// Look up embedding rows for `token_ids`, scaled by sqrt(hidden_size).
     [[nodiscard]] Mat embed_rows(const std::vector<std::size_t>& token_ids) const;
 
@@ -370,13 +433,71 @@ class Gemma3Model : public Trainable {
     Gemma3Model(Config4 cfg, InferenceInit);
 };
 
-/// Convert f32 values to BF16 bits, releasing the f32 storage as it goes.
+// =============================================================================
+// Weight-loading helpers
+// =============================================================================
+
+/// Convert f32 values to BF16 bits, releasing the source as it goes.
+///
+/// The Rust original rewrites the BF16 values into the front half of the f32
+/// allocation, so the conversion costs no extra memory. std::vector cannot
+/// adopt foreign storage, so this allocates the result and frees the input --
+/// the peak is 1.5x the input rather than 1x, but the output bits are the same.
 [[nodiscard]] std::vector<std::uint16_t> f32s_to_bf16_and_drop(std::vector<float> f32s);
 
-/// Ask the allocator to return free pages to the OS (macOS only).
+/// Ask the allocator to hand cached free pages back to the OS.
+///
+/// Worth calling after a large drop -- the GGUF load, a Metal weight upload --
+/// since the allocator otherwise keeps those pages resident. A no-op off macOS.
 void release_memory_to_os();
 
-/// Print the process resident set size, tagged with `label`.
-void print_rss(const char* label);
+/// Print the process's resident set size, for tracking load-time peaks.
+void print_rss(const std::string& label);
+
+/// Point a model's embedding at BF16 bits, optionally tying `lm_head` to them.
+///
+/// Shared by Gemma 3 and Qwen 3.5. The f32 embedding becomes a zero-sized
+/// placeholder, since every lookup goes through the BF16 table once it is set.
+void model_set_embed_bf16_raw(TensorNode& embed_tokens, std::optional<MatBf16>& embed_bf16,
+                              Linear2& lm_head, std::vector<std::uint16_t> bits,
+                              std::size_t vocab, std::size_t hidden, bool tie_weights);
+
+/// Load one GGUF tensor into a `Linear2`.
+///
+/// Q4_0 is repacked to Q4_K -- smaller (0.56 vs 0.63 bytes/element) and the
+/// only quantized form with both a Metal GEMV and an SDOT CPU path. Q4_K loads
+/// as-is; everything else becomes BF16 or f32.
+[[nodiscard]] Result<void> load_linear_from_gguf(const GgufFile& gguf, std::size_t idx,
+                                                 Linear2& linear);
+
+// =============================================================================
+// NgramDraftEngine
+// =============================================================================
+
+/// Draft-token source for speculative decoding.
+///
+/// Looks through the generated history for the longest n-gram matching the most
+/// recent tokens and proposes what followed it last time. Cheap and surprisingly
+/// effective on repetitive text, where the model would otherwise re-derive the
+/// same continuation token by token.
+class NgramDraftEngine {
+   public:
+    NgramDraftEngine(std::size_t max_n, std::size_t max_draft)
+        : max_n_(max_n), max_draft_(max_draft) {}
+
+    void record(std::size_t token) { history_.push_back(token); }
+    void record_many(const std::vector<std::size_t>& tokens) {
+        history_.insert(history_.end(), tokens.begin(), tokens.end());
+    }
+
+    /// The continuation that followed the longest matching n-gram, capped at
+    /// `max_draft` tokens. Empty when nothing matches.
+    [[nodiscard]] std::vector<std::size_t> draft() const;
+
+   private:
+    std::vector<std::size_t> history_;
+    std::size_t max_n_;
+    std::size_t max_draft_;
+};
 
 }  // namespace rt

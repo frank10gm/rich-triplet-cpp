@@ -10,11 +10,6 @@
 #include <Accelerate/Accelerate.h>
 #endif
 
-#if defined(__APPLE__)
-#include <malloc/malloc.h>
-#include <mach/mach.h>
-#endif
-
 namespace rt {
 
 // =============================================================================
@@ -1032,41 +1027,6 @@ std::size_t sample_token(const Mat& logits, std::size_t row, const SamplingParam
         }
     }
     return v - 1;
-}
-
-// =============================================================================
-// Memory utilities
-// =============================================================================
-
-std::vector<std::uint16_t> f32s_to_bf16_and_drop(std::vector<float> f32s) {
-    std::vector<std::uint16_t> out(f32s.size());
-    for (std::size_t i = 0; i < f32s.size(); ++i) {
-        out[i] = f32_to_bf16(f32s[i]);
-    }
-    // Release the f32 storage now rather than at the caller's scope exit.
-    std::vector<float>().swap(f32s);
-    out.shrink_to_fit();
-    return out;
-}
-
-void release_memory_to_os() {
-#if defined(__APPLE__)
-    malloc_zone_pressure_relief(nullptr, 0);
-#endif
-}
-
-void print_rss(const char* label) {
-#if defined(__APPLE__)
-    mach_task_basic_info info{};
-    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
-    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info),
-                  &count) == KERN_SUCCESS) {
-        std::fprintf(stderr, "[ RSS ] %-32s %.2f GB\n", label,
-                     static_cast<double>(info.resident_size) / (1024.0 * 1024.0 * 1024.0));
-    }
-#else
-    (void)label;
-#endif
 }
 
 }  // namespace rt

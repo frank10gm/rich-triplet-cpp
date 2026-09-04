@@ -1,11 +1,17 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 
+#include "gguf_writer.hpp"
 #include "rt/transformer4.hpp"
 
 using namespace rt;
+using rt::testing::GgufWriter;
 
 namespace {
 
@@ -50,6 +56,24 @@ std::size_t argmax_row(const Mat& m, std::size_t row) {
         }
     }
     return best;
+}
+
+/// `n` values stepping by `step`, small enough to keep a forward pass tame.
+std::vector<float> ramp(std::size_t n, float step) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        v[i] = static_cast<float>(i % 17) * step - 8.0f * step;
+    }
+    return v;
+}
+
+std::vector<float> ones(std::size_t n) { return std::vector<float>(n, 1.0f); }
+
+/// f32 values as little-endian bytes, for the GGUF writer.
+std::vector<std::uint8_t> f32_bytes(const std::vector<float>& values) {
+    std::vector<std::uint8_t> bytes(values.size() * 4);
+    std::memcpy(bytes.data(), values.data(), bytes.size());
+    return bytes;
 }
 
 }  // namespace
@@ -453,4 +477,280 @@ TEST_CASE("bf16 conversion helper drops its input", "[transformer4]") {
         INFO("value " << i);
         REQUIRE(std::fabs(bf16_to_f32(bits[i]) - values[i]) < std::fabs(values[i]) * 0.01f + 1e-6f);
     }
+}
+
+// -----------------------------------------------------------------------------
+// Generation
+// -----------------------------------------------------------------------------
+
+TEST_CASE("generate_streaming produces tokens", "[transformer4]") {
+    InitRng rng(42);
+    const Gemma3Model model(tiny_cfg(), rng);
+    std::vector<std::size_t> generated;
+    model.generate_streaming({0, 1, 2}, 5, 1.0f, 0, 42,
+                             [&](std::size_t tok) { generated.push_back(tok); });
+    REQUIRE_FALSE(generated.empty());
+    REQUIRE(generated.size() <= 5);
+}
+
+TEST_CASE("generate_cached_streaming produces tokens", "[transformer4]") {
+    InitRng rng(7);
+    Gemma3Model model(tiny_cfg(), rng);
+    std::vector<std::size_t> generated;
+    model.generate_cached_streaming({0, 1, 2}, 5, 1.0f, 0, 1.0f, 1.0f, 42, false, 0,
+                                    [&](std::size_t tok) { generated.push_back(tok); });
+    REQUIRE_FALSE(generated.empty());
+    REQUIRE(generated.size() <= 5);
+}
+
+// -----------------------------------------------------------------------------
+// NgramDraftEngine
+// -----------------------------------------------------------------------------
+
+TEST_CASE("ngram draft engine finds a repeated continuation", "[transformer4]") {
+    NgramDraftEngine ng(4, 4);
+    REQUIRE(ng.draft().empty());
+
+    // History: 10 20 30 40 10 20 30 40 50 60.
+    ng.record_many({10, 20, 30, 40, 10, 20, 30, 40, 50, 60});
+    // The suffixes ending at 60 -- [30,40,50,60], [40,50,60], [50,60] -- appear
+    // only once each, so there is nothing to draft from.
+    REQUIRE(ng.draft().empty());
+
+    // [60, 10] is likewise unique.
+    ng.record(10);
+    REQUIRE(ng.draft().empty());
+
+    // Now [10, 20] matches at index 0, and what followed it was 30 40 10 20.
+    ng.record(20);
+    REQUIRE(ng.draft() == std::vector<std::size_t>{30, 40, 10, 20});
+}
+
+// -----------------------------------------------------------------------------
+// Binary weight cache
+// -----------------------------------------------------------------------------
+
+TEST_CASE("save_cache and load_cache round-trip the weights", "[transformer4]") {
+    const Config4 cfg = tiny_cfg();
+    InitRng rng(11);
+    const Gemma3Model source(cfg, rng);
+
+    // The cache only carries BF16 projections and f32 norms, so the source has
+    // to be in that form for the round trip to cover the projections.
+    Gemma3Model saved = Gemma3Model::new_for_inference(cfg);
+    saved.embed_bf16 = source.embed_tokens.data().to_bf16();
+    saved.norm.gamma.set_data(source.norm.gamma.data());
+    const auto copy_linear = [](Linear2& d, const Linear2& s) {
+        d.load_bf16(*s.weight.data().to_bf16().data, s.out_features, s.in_features);
+    };
+    for (std::size_t i = 0; i < cfg.num_hidden_layers; ++i) {
+        const Gemma3Block& s = source.layers[i];
+        Gemma3Block& d = saved.layers[i];
+        d.input_layernorm.gamma.set_data(s.input_layernorm.gamma.data());
+        d.post_attention_layernorm.gamma.set_data(s.post_attention_layernorm.gamma.data());
+        d.pre_feedforward_layernorm.gamma.set_data(s.pre_feedforward_layernorm.gamma.data());
+        d.post_feedforward_layernorm.gamma.set_data(s.post_feedforward_layernorm.gamma.data());
+        d.self_attn.q_norm.gamma.set_data(s.self_attn.q_norm.gamma.data());
+        d.self_attn.k_norm.gamma.set_data(s.self_attn.k_norm.gamma.data());
+        copy_linear(d.self_attn.q_proj, s.self_attn.q_proj);
+        copy_linear(d.self_attn.k_proj, s.self_attn.k_proj);
+        copy_linear(d.self_attn.v_proj, s.self_attn.v_proj);
+        copy_linear(d.self_attn.o_proj, s.self_attn.o_proj);
+        copy_linear(d.mlp.gate_proj, s.mlp.gate_proj);
+        copy_linear(d.mlp.up_proj, s.mlp.up_proj);
+        copy_linear(d.mlp.down_proj, s.mlp.down_proj);
+    }
+    // The head is weight-tied, exactly as the loaders leave it.
+    saved.lm_head.load_bf16_shared(saved.embed_bf16->data, cfg.vocab_size, cfg.hidden_size);
+
+    const std::string path = "/tmp/rt_g3cache_test.bin";
+    REQUIRE(saved.save_cache(path).has_value());
+
+    Gemma3Model loaded = Gemma3Model::new_for_inference(cfg);
+    const Result<bool> ok = loaded.load_cache(path);
+    REQUIRE(ok.has_value());
+    REQUIRE(*ok);
+
+    // The embedding comes back as the same BF16 bits, tied to lm_head.
+    REQUIRE(loaded.embed_bf16.has_value());
+    REQUIRE(loaded.embed_bf16->rows == cfg.vocab_size);
+    REQUIRE(loaded.embed_bf16->cols == cfg.hidden_size);
+    REQUIRE(*loaded.embed_bf16->data == *saved.embed_bf16->data);
+    REQUIRE(loaded.lm_head.bf16_weight.has_value());
+
+    const Linear2& want = saved.layers[2].mlp.down_proj;
+    const Linear2& got = loaded.layers[2].mlp.down_proj;
+    REQUIRE(got.bf16_weight.has_value());
+    REQUIRE(*got.bf16_weight->data == *want.bf16_weight->data);
+    REQUIRE(loaded.layers[3].self_attn.q_norm.gamma.data().data ==
+            saved.layers[3].self_attn.q_norm.gamma.data().data);
+
+    // Both models must now agree token for token.
+    Gemma3KvCache cache_a(cfg, 16);
+    Gemma3KvCache cache_b(cfg, 16);
+    const std::vector<std::size_t> prompt{3, 9, 17};
+    REQUIRE(argmax_row(saved.forward_cached(prompt, cache_a), 0) ==
+            argmax_row(loaded.forward_cached(prompt, cache_b), 0));
+
+    std::remove(path.c_str());
+}
+
+TEST_CASE("load_cache reports a bad magic instead of failing", "[transformer4]") {
+    const std::string path = "/tmp/rt_g3cache_bad.bin";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << "NOTACACHE";
+    }
+    Gemma3Model model = Gemma3Model::new_for_inference(tiny_cfg());
+    const Result<bool> ok = model.load_cache(path);
+    REQUIRE(ok.has_value());
+    REQUIRE_FALSE(*ok);
+    std::remove(path.c_str());
+
+    // A missing file is likewise a "no cache", not an error.
+    const Result<bool> missing = model.load_cache("/tmp/rt_g3cache_does_not_exist.bin");
+    REQUIRE(missing.has_value());
+    REQUIRE_FALSE(*missing);
+}
+
+// -----------------------------------------------------------------------------
+// Quantization
+// -----------------------------------------------------------------------------
+
+TEST_CASE("quantize_for_inference keeps the f32 weights", "[transformer4]") {
+    InitRng rng(5);
+    Gemma3Model model(tiny_cfg(), rng);
+    model.quantize_for_inference();
+    for (const Gemma3Block& layer : model.layers) {
+        REQUIRE(layer.self_attn.q_proj.q4_weight.has_value());
+        REQUIRE(layer.mlp.down_proj.q4_weight.has_value());
+        // Gradients still need the f32 copy, so it stays.
+        REQUIRE(layer.self_attn.q_proj.weight.data().numel() > 0);
+    }
+    REQUIRE(model.lm_head.q4_weight.has_value());
+}
+
+TEST_CASE("quantize_inference_free_f32 drops the f32 weights", "[transformer4]") {
+    InitRng rng(5);
+    Gemma3Model model(tiny_cfg(), rng);
+    model.quantize_inference_free_f32();
+    for (const Gemma3Block& layer : model.layers) {
+        REQUIRE(layer.self_attn.q_proj.q4_weight.has_value());
+        REQUIRE(layer.self_attn.q_proj.weight.data().numel() == 0);
+    }
+    REQUIRE(model.lm_head.q4_weight.has_value());
+    // lm_head is weight-tied, so freeing its f32 copy also empties
+    // `embed_tokens` -- a model quantized this way can no longer look up
+    // embeddings, and the GGUF paths set `embed_bf16` instead.
+    REQUIRE(model.embed_tokens.data().numel() == 0);
+}
+
+// -----------------------------------------------------------------------------
+// GGUF weight loading
+// -----------------------------------------------------------------------------
+
+TEST_CASE("load_weights_from_gguf maps blk.* names onto the model", "[transformer4]") {
+    Config4 cfg = tiny_cfg();
+    cfg.num_hidden_layers = 1;
+    // Q4_K needs 256-element blocks, but this file is written as F32, so the
+    // small dimensions are fine.
+    const std::size_t h = cfg.hidden_size;
+    const std::size_t inter = cfg.intermediate_size;
+    const std::size_t d = cfg.head_dim;
+    const std::size_t nq = cfg.num_attention_heads;
+    const std::size_t nkv = cfg.num_key_value_heads;
+
+    GgufWriter w;
+    w.add_meta_str("general.architecture", "gemma3");
+    // GGUF shapes are [in, out] -- the transpose of our [out, in].
+    w.add_tensor("token_embd.weight", {h, cfg.vocab_size}, GgufType::F32, f32_bytes(ramp(cfg.vocab_size * h, 0.01f)));
+    w.add_tensor("output_norm.weight", {h}, GgufType::F32, f32_bytes(ones(h)));
+    w.add_tensor("blk.0.attn_norm.weight", {h}, GgufType::F32, f32_bytes(ones(h)));
+    w.add_tensor("blk.0.post_attn_norm.weight", {h}, GgufType::F32, f32_bytes(ones(h)));
+    w.add_tensor("blk.0.ffn_pre_norm.weight", {h}, GgufType::F32, f32_bytes(ones(h)));
+    w.add_tensor("blk.0.ffn_post_norm.weight", {h}, GgufType::F32, f32_bytes(ones(h)));
+    w.add_tensor("blk.0.attn_q_norm.weight", {d}, GgufType::F32, f32_bytes(ones(d)));
+    w.add_tensor("blk.0.attn_k_norm.weight", {d}, GgufType::F32, f32_bytes(ones(d)));
+    w.add_tensor("blk.0.attn_q.weight", {h, nq * d}, GgufType::F32, f32_bytes(ramp(nq * d * h, 0.002f)));
+    w.add_tensor("blk.0.attn_k.weight", {h, nkv * d}, GgufType::F32, f32_bytes(ramp(nkv * d * h, 0.003f)));
+    w.add_tensor("blk.0.attn_v.weight", {h, nkv * d}, GgufType::F32, f32_bytes(ramp(nkv * d * h, 0.004f)));
+    w.add_tensor("blk.0.attn_output.weight", {nq * d, h}, GgufType::F32, f32_bytes(ramp(nq * d * h, 0.005f)));
+    w.add_tensor("blk.0.ffn_gate.weight", {h, inter}, GgufType::F32, f32_bytes(ramp(inter * h, 0.006f)));
+    w.add_tensor("blk.0.ffn_up.weight", {h, inter}, GgufType::F32, f32_bytes(ramp(inter * h, 0.007f)));
+    w.add_tensor("blk.0.ffn_down.weight", {inter, h}, GgufType::F32, f32_bytes(ramp(inter * h, 0.008f)));
+    // The vision tower is skipped without complaint.
+    w.add_tensor("v.blk.0.attn_q.weight", {4, 4}, GgufType::F32, f32_bytes(ramp(16, 0.1f)));
+
+    const std::string path = "/tmp/rt_gemma3_load.gguf";
+    w.write(path);
+
+    Gemma3Model model = Gemma3Model::new_for_inference(cfg);
+    REQUIRE(model.load_weights_from_gguf(path).has_value());
+
+    // The embedding loaded as BF16 and lm_head is tied to it.
+    REQUIRE(model.embed_bf16.has_value());
+    REQUIRE(model.embed_bf16->rows == cfg.vocab_size);
+    REQUIRE(model.embed_bf16->cols == h);
+    REQUIRE(model.lm_head.bf16_weight.has_value());
+    REQUIRE(model.lm_head.bf16_weight->data == model.embed_bf16->data);
+
+    // GGUF stores norm gammas as 1 + weight, so a file of ones becomes zeros.
+    const Mat& gamma = model.layers[0].input_layernorm.gamma.data();
+    REQUIRE(gamma.cols == h);
+    for (std::size_t c = 0; c < h; ++c) {
+        REQUIRE(std::fabs(gamma.at(0, c)) < 1e-6f);
+    }
+
+    // The projections transposed into [out, in].
+    REQUIRE(model.layers[0].self_attn.q_proj.weight.data().rows == nq * d);
+    REQUIRE(model.layers[0].self_attn.q_proj.weight.data().cols == h);
+    REQUIRE(model.layers[0].mlp.down_proj.weight.data().rows == h);
+    REQUIRE(model.layers[0].mlp.down_proj.weight.data().cols == inter);
+
+    Gemma3KvCache cache(cfg, 8);
+    require_all_finite(model.forward_cached({1, 2, 3}, cache), "gguf logits");
+    std::remove(path.c_str());
+}
+
+TEST_CASE("load_weights_from_gguf honours an explicit output.weight", "[transformer4]") {
+    Config4 cfg = tiny_cfg();
+    cfg.num_hidden_layers = 1;
+    const std::size_t h = cfg.hidden_size;
+
+    GgufWriter w;
+    w.add_tensor("token_embd.weight", {h, cfg.vocab_size}, GgufType::F32, f32_bytes(ramp(cfg.vocab_size * h, 0.01f)));
+    w.add_tensor("output.weight", {h, cfg.vocab_size}, GgufType::F32, f32_bytes(ramp(cfg.vocab_size * h, 0.02f)));
+
+    const std::string path = "/tmp/rt_gemma3_untied.gguf";
+    w.write(path);
+
+    Gemma3Model model = Gemma3Model::new_for_inference(cfg);
+    REQUIRE(model.load_weights_from_gguf(path).has_value());
+
+    REQUIRE(model.embed_bf16.has_value());
+    // output.weight loaded into the f32 slot, and the final weight-tying step
+    // was skipped because the file supplied its own head.
+    REQUIRE(model.lm_head.weight.data().rows == cfg.vocab_size);
+    REQUIRE(model.lm_head.weight.data().cols == h);
+    // token_embd is read first and ties lm_head to the embedding as it goes, so
+    // the BF16 weight from that tying survives -- and since `fused_linear`
+    // prefers BF16 over f32, an *f32* output.weight is shadowed by it. This
+    // matches the Rust reference; a BF16 or quantized output.weight replaces
+    // the tied one properly.
+    REQUIRE(model.lm_head.bf16_weight.has_value());
+    REQUIRE(model.lm_head.bf16_weight->data == model.embed_bf16->data);
+    std::remove(path.c_str());
+}
+
+TEST_CASE("load_weights_from_dir rejects a directory with no shards", "[transformer4]") {
+    Gemma3Model model = Gemma3Model::new_for_inference(tiny_cfg());
+    const Result<void> missing = model.load_weights_from_dir("/tmp/rt_no_such_dir_12345");
+    REQUIRE_FALSE(missing.has_value());
+
+    const std::string dir = "/tmp/rt_empty_shard_dir";
+    std::filesystem::create_directories(dir);
+    const Result<void> empty = model.load_weights_from_dir(dir);
+    REQUIRE_FALSE(empty.has_value());
+    REQUIRE(empty.error().find("no .safetensors files") != std::string::npos);
+    std::filesystem::remove_all(dir);
 }
