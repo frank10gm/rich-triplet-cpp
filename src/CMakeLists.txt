@@ -10,4 +10,7 @@ target_sources(rt_core PRIVATE
   tokenizer.cpp
   transformer4.cpp
   transformer_qwen35.cpp
+  tensor.cpp
+  autograd.cpp
+  nn.cpp
 )

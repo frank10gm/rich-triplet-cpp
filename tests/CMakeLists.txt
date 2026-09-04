@@ -9,6 +9,7 @@ add_executable(rt_tests
   test_tokenizer.cpp
   test_transformer4.cpp
   test_transformer_qwen35.cpp
+  test_scalar_engine.cpp
 )
 target_link_libraries(rt_tests PRIVATE rt_core Catch2::Catch2WithMain)
 catch_discover_tests(rt_tests)
