@@ -5,4 +5,5 @@ target_sources(rt_core PRIVATE
   gguf.cpp
   ndarray.cpp
   tensor_node.cpp
+  nn2.cpp
 )
