@@ -13,4 +13,5 @@ target_sources(rt_core PRIVATE
   tensor.cpp
   autograd.cpp
   nn.cpp
+  dataset.cpp
 )
