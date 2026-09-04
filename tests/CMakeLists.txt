@@ -7,6 +7,7 @@ add_executable(rt_tests
   test_tensor_node.cpp
   test_nn2.cpp
   test_tokenizer.cpp
+  test_transformer4.cpp
 )
 target_link_libraries(rt_tests PRIVATE rt_core Catch2::Catch2WithMain)
 catch_discover_tests(rt_tests)

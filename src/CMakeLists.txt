@@ -8,4 +8,5 @@ target_sources(rt_core PRIVATE
   nn2.cpp
   utf8.cpp
   tokenizer.cpp
+  transformer4.cpp
 )
