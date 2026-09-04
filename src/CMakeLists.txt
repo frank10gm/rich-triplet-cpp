@@ -6,4 +6,6 @@ target_sources(rt_core PRIVATE
   ndarray.cpp
   tensor_node.cpp
   nn2.cpp
+  utf8.cpp
+  tokenizer.cpp
 )
