@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.24)
 project(rich-triplet-cpp LANGUAGES CXX)
 
+if(APPLE)
+  # Objective-C++ is only needed for the Metal backend, but enabling the
+  # language unconditionally keeps the configure step identical either way.
+  enable_language(OBJCXX)
+  set(CMAKE_OBJCXX_STANDARD 23)
+  set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+endif()
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -58,6 +66,8 @@ if(RT_METAL)
   find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
   target_link_libraries(rt_core PUBLIC ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
   target_compile_definitions(rt_core PUBLIC RT_FEATURE_METAL=1)
+  target_sources(rt_core PRIVATE src/metal_ops.mm)
+  set_source_files_properties(src/metal_ops.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 endif()
 
 if(RT_PARALLEL)

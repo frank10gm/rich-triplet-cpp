@@ -61,7 +61,9 @@ class AdamW {
     /// First and second moment estimates, one per parameter.
     std::vector<float> m_;
     std::vector<float> v_;
-    std::size_t n_params_ = 0;
+    /// The parameter count the optimizer was built for; `step` asserts the
+    /// caller still passes that many.
+    [[maybe_unused]] std::size_t n_params_ = 0;
 };
 
 // =============================================================================

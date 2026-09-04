@@ -9,6 +9,10 @@
 #include <Accelerate/Accelerate.h>
 #endif
 
+#if RT_FEATURE_METAL
+#include "rt/metal_ops.hpp"
+#endif
+
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
@@ -45,6 +49,8 @@ Mat Mat::matmul(const Mat& b) const {
 
 #if RT_FEATURE_BLAS
     return matmul_blas(*this, b);
+#elif RT_FEATURE_METAL
+    return metal_matmul(*this, b);
 #elif RT_FEATURE_PARALLEL
     return matmul_parallel(b, 0);
 #else
