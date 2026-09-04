@@ -9,4 +9,5 @@ target_sources(rt_core PRIVATE
   utf8.cpp
   tokenizer.cpp
   transformer4.cpp
+  transformer_qwen35.cpp
 )
