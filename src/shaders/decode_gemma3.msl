@@ -1,0 +1,673 @@
+#include <metal_stdlib>
+using namespace metal;
+
+// ── RMSNorm (Gemma3 variant: multiply by (1 + gamma)) ────────────────────
+//
+// Input:  x[D], gamma[D]
+// Output: out[D] = x[i] / rms * (1 + gamma[i])
+// One threadgroup, D threads (D ≤ 1024 for Gemma3 hidden_size, but we use
+// 256 threads and loop).
+// Uses threadgroup memory for parallel sum-of-squares reduction.
+
+kernel void rms_norm_gemma3(
+    device const float* x     [[ buffer(0) ]],
+    device const float* gamma [[ buffer(1) ]],
+    device       float* out   [[ buffer(2) ]],
+    constant     uint&  D     [[ buffer(3) ]],
+    constant     float& eps   [[ buffer(4) ]],
+    uint lid  [[ thread_index_in_threadgroup ]],
+    uint tg_size [[ threads_per_threadgroup ]])
+{
+    // Phase 1: compute sum of squares via simd_sum
+    float partial_sq = 0.0f;
+    for (uint i = lid; i < D; i += tg_size) {
+        float v = x[i];
+        partial_sq += v * v;
+    }
+    float sum_sq = simd_sum(partial_sq);
+
+    // If tg_size > 32, need threadgroup reduction across simd groups
+    threadgroup float shared_sq[32];
+    uint simd_lane = lid % 32u;
+    uint simd_group = lid / 32u;
+    uint n_simd_groups = (tg_size + 31u) / 32u;
+
+    if (simd_lane == 0u) {
+        shared_sq[simd_group] = sum_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0u) {
+        float total = 0.0f;
+        for (uint g = 0u; g < n_simd_groups; g++) {
+            total += shared_sq[g];
+        }
+        shared_sq[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms_inv = rsqrt(shared_sq[0] / float(D) + eps);
+
+    // Phase 2: normalize and scale
+    for (uint i = lid; i < D; i += tg_size) {
+        out[i] = x[i] * rms_inv * (1.0f + gamma[i]);
+    }
+}
+
+// ── Per-head RMSNorm ──────────────────────────────────────────────────────
+//
+// Input:  x[n_heads * head_dim], gamma[head_dim] (shared across heads)
+// Output: out[n_heads * head_dim]
+// One threadgroup per head.  32 threads per threadgroup.
+
+kernel void rms_norm_per_head(
+    device const float* x     [[ buffer(0) ]],
+    device const float* gamma [[ buffer(1) ]],
+    device       float* out   [[ buffer(2) ]],
+    constant     uint&  n_heads   [[ buffer(3) ]],
+    constant     uint&  head_dim  [[ buffer(4) ]],
+    constant     float& eps       [[ buffer(5) ]],
+    uint tgid [[ threadgroup_position_in_grid ]],
+    uint lid  [[ thread_index_in_threadgroup ]],
+    uint tg_size [[ threads_per_threadgroup ]])
+{
+    uint h = tgid;
+    if (h >= n_heads) return;
+    uint base = h * head_dim;
+
+    float partial_sq = 0.0f;
+    for (uint i = lid; i < head_dim; i += tg_size) {
+        float v = x[base + i];
+        partial_sq += v * v;
+    }
+    float sum_sq = simd_sum(partial_sq);
+
+    // With 32 threads (one simd group), simd_sum is sufficient
+    float rms_inv = rsqrt(sum_sq / float(head_dim) + eps);
+
+    for (uint i = lid; i < head_dim; i += tg_size) {
+        out[base + i] = x[base + i] * rms_inv * (1.0f + gamma[i]);
+    }
+}
+
+// ── RoPE (NeoX half-split) ───────────────────────────────────────────────
+//
+// Pairs (i, i + half) where half = head_dim / 2.
+// One threadgroup per head, 128 threads (one per pair).
+
+kernel void rope_neox(
+    device const float* x         [[ buffer(0) ]],
+    device       float* out       [[ buffer(1) ]],
+    constant     uint&  n_heads   [[ buffer(2) ]],
+    constant     uint&  head_dim  [[ buffer(3) ]],
+    constant     float& theta     [[ buffer(4) ]],
+    constant     float& freq_scale[[ buffer(5) ]],
+    constant     uint&  position  [[ buffer(6) ]],
+    uint tgid [[ threadgroup_position_in_grid ]],
+    uint lid  [[ thread_index_in_threadgroup ]])
+{
+    uint h = tgid;
+    if (h >= n_heads) return;
+    uint half_dim = head_dim / 2u;
+    if (lid >= half_dim) return;
+
+    uint i = lid;
+    uint base = h * head_dim;
+    float angle = (float(position) * freq_scale) / pow(theta, 2.0f * float(i) / float(head_dim));
+    float cos_a = cos(angle);
+    float sin_a = sin(angle);
+
+    float x0 = x[base + i];
+    float x1 = x[base + i + half_dim];
+    out[base + i]        = x0 * cos_a - x1 * sin_a;
+    out[base + i + half_dim] = x0 * sin_a + x1 * cos_a;
+}
+
+// ── GELU (tanh approximation) ────────────────────────────────────────────
+
+kernel void gelu_tanh_kernel(
+    device const float* x   [[ buffer(0) ]],
+    device       float* out [[ buffer(1) ]],
+    constant     uint&  N   [[ buffer(2) ]],
+    uint gid [[ thread_position_in_grid ]])
+{
+    if (gid >= N) return;
+    float v = x[gid];
+    float v3 = v * v * v;
+    float inner = 0.7978845608f * (v + 0.044715f * v3);
+    // Clamp inner before tanh to avoid fast-math NaN:
+    // Metal's fast-math tanh uses exp(2x), which overflows for |x| > ~44.
+    float t = tanh(clamp(inner, -10.0f, 10.0f));
+    out[gid] = 0.5f * v * (1.0f + t);
+}
+
+// ── Element-wise multiply ────────────────────────────────────────────────
+
+kernel void elem_mul_kernel(
+    device const float* a   [[ buffer(0) ]],
+    device const float* b   [[ buffer(1) ]],
+    device       float* out [[ buffer(2) ]],
+    constant     uint&  N   [[ buffer(3) ]],
+    uint gid [[ thread_position_in_grid ]])
+{
+    if (gid >= N) return;
+    out[gid] = a[gid] * b[gid];
+}
+
+// ── Vector add ───────────────────────────────────────────────────────────
+
+kernel void vec_add_kernel(
+    device const float* a   [[ buffer(0) ]],
+    device const float* b   [[ buffer(1) ]],
+    device       float* out [[ buffer(2) ]],
+    constant     uint&  N   [[ buffer(3) ]],
+    uint gid [[ thread_position_in_grid ]])
+{
+    if (gid >= N) return;
+    out[gid] = a[gid] + b[gid];
+}
+
+// ── KV cache append ──────────────────────────────────────────────────────
+//
+// Write new K and V rows into the cache at row `seq_len`.
+
+kernel void kv_cache_append(
+    device const float* k_new   [[ buffer(0) ]],
+    device const float* v_new   [[ buffer(1) ]],
+    device       half*  k_cache [[ buffer(2) ]],
+    device       half*  v_cache [[ buffer(3) ]],
+    constant     uint&  seq_len [[ buffer(4) ]],
+    constant     uint&  kv_dim  [[ buffer(5) ]],
+    uint gid [[ thread_position_in_grid ]])
+{
+    if (gid >= kv_dim) return;
+    uint offset = seq_len * kv_dim + gid;
+    k_cache[offset] = half(k_new[gid]);
+    v_cache[offset] = half(v_new[gid]);
+}
+
+// f32 to half bulk conversion (for sync_kv_from_cpu)
+kernel void f32_to_f16_convert(
+    device const float* src [[ buffer(0) ]],
+    device       half*  dst [[ buffer(1) ]],
+    constant     uint&  N   [[ buffer(2) ]],
+    uint gid [[ thread_position_in_grid ]])
+{
+    if (gid >= N) return;
+    dst[gid] = half(src[gid]);
+}
+
+// ── BF16 embedding lookup ────────────────────────────────────────────────
+
+kernel void embed_bf16_lookup(
+    device const ushort* embed_table [[ buffer(0) ]],
+    device       float*  out         [[ buffer(1) ]],
+    constant     uint&   token_id    [[ buffer(2) ]],
+    constant     uint&   hidden_size [[ buffer(3) ]],
+    constant     float&  scale       [[ buffer(4) ]],
+    uint gid [[ thread_position_in_grid ]])
+{
+    if (gid >= hidden_size) return;
+    ushort bits = embed_table[token_id * hidden_size + gid];
+    float w = as_type<float>(uint(bits) << 16u);
+    out[gid] = w * scale;
+}
+
+// ── Fused decode attention ───────────────────────────────────────────────
+//
+// For a single query token (t_q = 1), compute GQA attention over the
+// cached K and V.
+//
+// One threadgroup per Q head.  Each threadgroup has TG_ATTN threads.
+// GQA mapping: kvh = qh / group_size.
+//
+// Phase 1: Compute scores[c] = dot(q_h, k_h[c]) * scale for c in [k_start..k_end)
+// Phase 2: Softmax (max-subtract, exp, sum, normalize)
+// Phase 3: out_h = sum_c( scores[c] * v_h[c] )
+
+#define TG_ATTN 32u
+
+// Score-buffer attention with half-precision KV cache.
+// Three-phase: compute scores → softmax → weighted V sum.
+// Uses threadgroup memory for scores (max 2048 context tokens).
+// One threadgroup per Q head, TG_ATTN=32 threads.
+
+kernel void attention_decode(
+    device const float* q         [[ buffer(0)  ]],
+    device const half*  k_cache   [[ buffer(1)  ]],
+    device const half*  v_cache   [[ buffer(2)  ]],
+    device       float* out       [[ buffer(3)  ]],
+    constant     uint&  k_start   [[ buffer(4)  ]],
+    constant     uint&  k_end     [[ buffer(5)  ]],
+    constant     uint&  n_q_heads [[ buffer(6)  ]],
+    constant     uint&  n_kv_heads[[ buffer(7)  ]],
+    constant     uint&  d_head    [[ buffer(8)  ]],
+    constant     float& scale     [[ buffer(9)  ]],
+    constant     uint&  kv_stride [[ buffer(10) ]],
+    uint tgid [[ threadgroup_position_in_grid ]],
+    uint lid  [[ thread_index_in_threadgroup ]])
+{
+    uint qh = tgid;
+    if (qh >= n_q_heads) return;
+    uint group = n_q_heads / n_kv_heads;
+    uint kvh = qh / group;
+    uint q_off = qh * d_head;
+    uint kv_off = kvh * d_head;
+    uint t_kv = k_end - k_start;
+
+    // ── Phase 1: compute scores ──
+    threadgroup float tg_scores[2048];
+
+    for (uint ci = lid; ci < t_kv; ci += TG_ATTN) {
+        uint cache_row = k_start + ci;
+        uint k_base = cache_row * kv_stride + kv_off;
+        float dot = 0.0f;
+        for (uint di = 0u; di < d_head; di++) {
+            dot += q[q_off + di] * float(k_cache[k_base + di]);
+        }
+        tg_scores[ci] = dot * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Phase 2: softmax ──
+    float local_max = -INFINITY;
+    for (uint ci = lid; ci < t_kv; ci += TG_ATTN) {
+        local_max = max(local_max, tg_scores[ci]);
+    }
+    float max_s = simd_max(local_max);
+
+    float local_sum = 0.0f;
+    for (uint ci = lid; ci < t_kv; ci += TG_ATTN) {
+        float e = exp(tg_scores[ci] - max_s);
+        tg_scores[ci] = e;
+        local_sum += e;
+    }
+    float sum_exp = simd_sum(local_sum);
+
+    float inv_sum = 1.0f / sum_exp;
+    for (uint ci = lid; ci < t_kv; ci += TG_ATTN) {
+        tg_scores[ci] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Phase 3: weighted V sum ──
+    for (uint di = 0u; di < d_head; di++) {
+        float partial = 0.0f;
+        for (uint ci = lid; ci < t_kv; ci += TG_ATTN) {
+            uint cache_row = k_start + ci;
+            uint v_base = cache_row * kv_stride + kv_off;
+            partial += tg_scores[ci] * float(v_cache[v_base + di]);
+        }
+        float total = simd_sum(partial);
+        if (lid == 0u) {
+            out[q_off + di] = total;
+        }
+    }
+}
+
+// ── Q4K GEMV (copied from metal_ops.rs) ──────────────────────────────────
+
+#define Q4K_BLOCK_BYTES 144u
+#define Q4K_BLOCK_ELEMS 256u
+#define TG_K 32u
+
+inline float2 scale_min(device const uchar* sc, uint j) {
+    float sv, mv;
+    if (j < 4u) {
+        sv = float(sc[j] & 0x3Fu);
+        mv = float(sc[j + 4u] & 0x3Fu);
+    } else {
+        sv = float((sc[j + 4u] & 0x0Fu) | ((sc[j - 4u] >> 6u) << 4u));
+        mv = float((sc[j + 4u] >> 4u)   | ((sc[j]      >> 6u) << 4u));
+    }
+    return float2(sv, mv);
+}
+
+// ── Fast M=1 Q4K GEMV: C[N] = A[K] @ Q4K[N,K]^T ─────────────────────
+// Single accumulator, no M loop — optimal register usage for decode.
+kernel void gemv_q4k_t(
+    device const float* A         [[ buffer(0) ]],
+    device const uchar* blocks    [[ buffer(1) ]],
+    device       float* C         [[ buffer(2) ]],
+    constant     uint&  K         [[ buffer(3) ]],
+    constant     uint&  N         [[ buffer(4) ]],
+    uint  tgid_x [[ threadgroup_position_in_grid ]],
+    uint  lid    [[ thread_index_in_threadgroup ]])
+{
+    uint j = tgid_x;
+    if (j >= N) return;
+
+    uint n_sb = K / Q4K_BLOCK_ELEMS;
+    float acc = 0.0f;
+
+    for (uint b = lid; b < n_sb; b += TG_K) {
+        uint boff = (j * n_sb + b) * Q4K_BLOCK_BYTES;
+        device const uchar* bp = blocks + boff;
+
+        ushort d_bits    = ushort(bp[0]) | (ushort(bp[1]) << 8u);
+        ushort dmin_bits = ushort(bp[2]) | (ushort(bp[3]) << 8u);
+        float d    = float(as_type<half>(d_bits));
+        float dmin = float(as_type<half>(dmin_bits));
+
+        device const uchar* sc = bp + 4u;
+        device const uchar* qs = bp + 16u;
+        uint a_base = b * Q4K_BLOCK_ELEMS;
+
+        for (uint chunk = 0u; chunk < 4u; chunk++) {
+            float2 sm1 = scale_min(sc, chunk * 2u);
+            float2 sm2 = scale_min(sc, chunk * 2u + 1u);
+            float scale1 = d * sm1.x;  float min1 = dmin * sm1.y;
+            float scale2 = d * sm2.x;  float min2 = dmin * sm2.y;
+
+            device const uchar* qq = qs + chunk * 32u;
+            uint a_off = a_base + chunk * 64u;
+
+            float dot_lo = 0.0f, dot_hi = 0.0f;
+            float sum_lo = 0.0f, sum_hi = 0.0f;
+
+            for (uint l = 0u; l < 32u; l++) {
+                float a_lo = A[a_off + l];
+                float a_hi = A[a_off + 32u + l];
+                dot_lo += float(qq[l] & 0x0Fu) * a_lo;
+                dot_hi += float(qq[l] >> 4u)   * a_hi;
+                sum_lo += a_lo;
+                sum_hi += a_hi;
+            }
+
+            acc += scale1 * dot_lo - min1 * sum_lo
+                 + scale2 * dot_hi - min2 * sum_hi;
+        }
+    }
+
+    acc = simd_sum(acc);
+    if (lid == 0u)
+        C[j] = acc;
+}
+
+// ── Fast M=1 BF16 GEMV: C[N] = A[K] @ BF16[N,K]^T ──────────────────
+#define TG_K_BF16 32u
+
+kernel void gemv_bf16_t(
+    device const float*  A      [[ buffer(0) ]],
+    device const ushort* W      [[ buffer(1) ]],
+    device       float*  C      [[ buffer(2) ]],
+    constant     uint&   K      [[ buffer(3) ]],
+    constant     uint&   N      [[ buffer(4) ]],
+    uint  tgid_x [[ threadgroup_position_in_grid ]],
+    uint  lid    [[ thread_index_in_threadgroup ]])
+{
+    uint j = tgid_x;
+    if (j >= N) return;
+
+    float acc = 0.0f;
+    uint row_start = j * K;
+
+    for (uint p = lid; p < K; p += TG_K_BF16) {
+        ushort bits = W[row_start + p];
+        float w = as_type<float>(uint(bits) << 16u);
+        acc += A[p] * w;
+    }
+
+    acc = simd_sum(acc);
+    if (lid == 0u)
+        C[j] = acc;
+}
+
+// ── Batch Q4K GEMV: C[M,N] = A[M,K] @ Q4K[N,K]^T ───────────────────
+// M accumulators — used by speculative batch verify (M>1).
+#define MAX_BATCH 8u
+
+kernel void gemv_q4k_t_batch(
+    device const float* A         [[ buffer(0) ]],
+    device const uchar* blocks    [[ buffer(1) ]],
+    device       float* C         [[ buffer(2) ]],
+    constant     uint&  K         [[ buffer(3) ]],
+    constant     uint&  N         [[ buffer(4) ]],
+    constant     uint&  M         [[ buffer(5) ]],
+    uint  tgid_x [[ threadgroup_position_in_grid ]],
+    uint  lid    [[ thread_index_in_threadgroup ]])
+{
+    uint j = tgid_x;
+    if (j >= N) return;
+
+    uint n_sb = K / Q4K_BLOCK_ELEMS;
+    float acc[MAX_BATCH];
+    for (uint m = 0u; m < M; m++) acc[m] = 0.0f;
+
+    for (uint b = lid; b < n_sb; b += TG_K) {
+        uint boff = (j * n_sb + b) * Q4K_BLOCK_BYTES;
+        device const uchar* bp = blocks + boff;
+
+        ushort d_bits    = ushort(bp[0]) | (ushort(bp[1]) << 8u);
+        ushort dmin_bits = ushort(bp[2]) | (ushort(bp[3]) << 8u);
+        float d    = float(as_type<half>(d_bits));
+        float dmin = float(as_type<half>(dmin_bits));
+
+        device const uchar* sc = bp + 4u;
+        device const uchar* qs = bp + 16u;
+        uint a_base = b * Q4K_BLOCK_ELEMS;
+
+        for (uint chunk = 0u; chunk < 4u; chunk++) {
+            float2 sm1 = scale_min(sc, chunk * 2u);
+            float2 sm2 = scale_min(sc, chunk * 2u + 1u);
+            float scale1 = d * sm1.x;  float min1 = dmin * sm1.y;
+            float scale2 = d * sm2.x;  float min2 = dmin * sm2.y;
+
+            device const uchar* qq = qs + chunk * 32u;
+            uint a_off = a_base + chunk * 64u;
+
+            for (uint m = 0u; m < M; m++) {
+                uint a_row = m * K;
+                float dot_lo = 0.0f, dot_hi = 0.0f;
+                float sum_lo = 0.0f, sum_hi = 0.0f;
+
+                for (uint l = 0u; l < 32u; l++) {
+                    float a_lo = A[a_row + a_off + l];
+                    float a_hi = A[a_row + a_off + 32u + l];
+                    dot_lo += float(qq[l] & 0x0Fu) * a_lo;
+                    dot_hi += float(qq[l] >> 4u)   * a_hi;
+                    sum_lo += a_lo;
+                    sum_hi += a_hi;
+                }
+
+                acc[m] += scale1 * dot_lo - min1 * sum_lo
+                        + scale2 * dot_hi - min2 * sum_hi;
+            }
+        }
+    }
+
+    for (uint m = 0u; m < M; m++) {
+        float val = simd_sum(acc[m]);
+        if (lid == 0u)
+            C[m * N + j] = val;
+    }
+}
+
+// ── Batch BF16 GEMV: C[M,N] = A[M,K] @ BF16[N,K]^T ─────────────────
+kernel void gemv_bf16_t_batch(
+    device const float*  A      [[ buffer(0) ]],
+    device const ushort* W      [[ buffer(1) ]],
+    device       float*  C      [[ buffer(2) ]],
+    constant     uint&   K      [[ buffer(3) ]],
+    constant     uint&   N      [[ buffer(4) ]],
+    constant     uint&   M      [[ buffer(5) ]],
+    uint  tgid_x [[ threadgroup_position_in_grid ]],
+    uint  lid    [[ thread_index_in_threadgroup ]])
+{
+    uint j = tgid_x;
+    if (j >= N) return;
+
+    float acc[MAX_BATCH];
+    for (uint m = 0u; m < M; m++) acc[m] = 0.0f;
+
+    uint row_start = j * K;
+
+    for (uint p = lid; p < K; p += TG_K_BF16) {
+        ushort bits = W[row_start + p];
+        float w = as_type<float>(uint(bits) << 16u);
+        for (uint m = 0u; m < M; m++) {
+            acc[m] += A[m * K + p] * w;
+        }
+    }
+
+    for (uint m = 0u; m < M; m++) {
+        float val = simd_sum(acc[m]);
+        if (lid == 0u)
+            C[m * N + j] = val;
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Batch kernels for speculative decoding (M tokens in parallel)
+// ══════════════════════════════════════════════════════════════════════
+
+// Batch BF16 embedding lookup: out[M, H] from M token IDs
+kernel void embed_bf16_lookup_batch(
+    device const ushort* embed_table [[ buffer(0) ]],
+    device       float*  out         [[ buffer(1) ]],
+    device const uint*   token_ids   [[ buffer(2) ]],
+    constant     uint&   hidden_size [[ buffer(3) ]],
+    constant     float&  scale       [[ buffer(4) ]],
+    constant     uint&   M           [[ buffer(5) ]],
+    uint gid [[ thread_position_in_grid ]])
+{
+    uint total = M * hidden_size;
+    if (gid >= total) return;
+    uint m = gid / hidden_size;
+    uint c = gid % hidden_size;
+    uint tid = token_ids[m];
+    ushort bits = embed_table[tid * hidden_size + c];
+    float w = as_type<float>(uint(bits) << 16u);
+    out[m * hidden_size + c] = w * scale;
+}
+
+// Batch RMSNorm: one threadgroup per (m, 1) — M independent normalizations.
+// Input: x[M, D], gamma[D], Output: out[M, D]
+// Grid: (M, 1, 1), Threadgroup: (256, 1, 1)
+kernel void rms_norm_gemma3_batch(
+    device const float* x     [[ buffer(0) ]],
+    device const float* gamma [[ buffer(1) ]],
+    device       float* out   [[ buffer(2) ]],
+    constant     uint&  D     [[ buffer(3) ]],
+    constant     float& eps   [[ buffer(4) ]],
+    constant     uint&  M     [[ buffer(5) ]],
+    uint tgid [[ threadgroup_position_in_grid ]],
+    uint lid  [[ thread_index_in_threadgroup ]],
+    uint tg_size [[ threads_per_threadgroup ]])
+{
+    uint m = tgid;
+    if (m >= M) return;
+    uint base = m * D;
+
+    float partial_sq = 0.0f;
+    for (uint i = lid; i < D; i += tg_size) {
+        float v = x[base + i];
+        partial_sq += v * v;
+    }
+    float sum_sq = simd_sum(partial_sq);
+
+    threadgroup float shared_sq[32];
+    uint simd_lane = lid % 32u;
+    uint simd_group = lid / 32u;
+    uint n_simd_groups = (tg_size + 31u) / 32u;
+    if (simd_lane == 0u) shared_sq[simd_group] = sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float total = 0.0f;
+        for (uint g = 0u; g < n_simd_groups; g++) total += shared_sq[g];
+        shared_sq[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms_inv = rsqrt(shared_sq[0] / float(D) + eps);
+    for (uint i = lid; i < D; i += tg_size) {
+        out[base + i] = x[base + i] * rms_inv * (1.0f + gamma[i]);
+    }
+}
+
+// Batch per-head RMSNorm: Grid (M * n_heads, 1, 1)
+kernel void rms_norm_per_head_batch(
+    device const float* x     [[ buffer(0) ]],
+    device const float* gamma [[ buffer(1) ]],
+    device       float* out   [[ buffer(2) ]],
+    constant     uint&  n_heads   [[ buffer(3) ]],
+    constant     uint&  head_dim  [[ buffer(4) ]],
+    constant     float& eps       [[ buffer(5) ]],
+    constant     uint&  M         [[ buffer(6) ]],
+    uint tgid [[ threadgroup_position_in_grid ]],
+    uint lid  [[ thread_index_in_threadgroup ]],
+    uint tg_size [[ threads_per_threadgroup ]])
+{
+    uint total_heads = M * n_heads;
+    if (tgid >= total_heads) return;
+    uint m = tgid / n_heads;
+    uint h = tgid % n_heads;
+    uint row_dim = n_heads * head_dim;
+    uint base = m * row_dim + h * head_dim;
+
+    float partial_sq = 0.0f;
+    for (uint i = lid; i < head_dim; i += tg_size) {
+        float v = x[base + i];
+        partial_sq += v * v;
+    }
+    float sum_sq = simd_sum(partial_sq);
+    float rms_inv = rsqrt(sum_sq / float(head_dim) + eps);
+    for (uint i = lid; i < head_dim; i += tg_size) {
+        out[base + i] = x[base + i] * rms_inv * (1.0f + gamma[i]);
+    }
+}
+
+// Batch RoPE: Grid (M * n_heads, 1, 1), reads positions from buffer
+kernel void rope_neox_batch(
+    device const float* x         [[ buffer(0) ]],
+    device       float* out       [[ buffer(1) ]],
+    constant     uint&  n_heads   [[ buffer(2) ]],
+    constant     uint&  head_dim  [[ buffer(3) ]],
+    constant     float& theta     [[ buffer(4) ]],
+    constant     float& freq_scale[[ buffer(5) ]],
+    device const uint*  positions [[ buffer(6) ]],
+    constant     uint&  M         [[ buffer(7) ]],
+    uint tgid [[ threadgroup_position_in_grid ]],
+    uint lid  [[ thread_index_in_threadgroup ]])
+{
+    uint total_heads = M * n_heads;
+    if (tgid >= total_heads) return;
+    uint m = tgid / n_heads;
+    uint h = tgid % n_heads;
+    uint half_d = head_dim / 2u;
+    if (lid >= half_d) return;
+
+    uint row_dim = n_heads * head_dim;
+    uint base = m * row_dim + h * head_dim;
+    uint position = positions[m];
+
+    float angle = (float(position) * freq_scale) / pow(theta, 2.0f * float(lid) / float(head_dim));
+    float cos_a = cos(angle);
+    float sin_a = sin(angle);
+
+    float x0 = x[base + lid];
+    float x1 = x[base + lid + half_d];
+    out[base + lid]          = x0 * cos_a - x1 * sin_a;
+    out[base + lid + half_d] = x0 * sin_a + x1 * cos_a;
+}
+
+// Batch KV cache append: write M rows starting at seq_len
+kernel void kv_cache_append_batch(
+    device const float* k_new   [[ buffer(0) ]],
+    device const float* v_new   [[ buffer(1) ]],
+    device       half*  k_cache [[ buffer(2) ]],
+    device       half*  v_cache [[ buffer(3) ]],
+    constant     uint&  seq_len [[ buffer(4) ]],
+    constant     uint&  kv_dim  [[ buffer(5) ]],
+    constant     uint&  M       [[ buffer(6) ]],
+    uint gid [[ thread_position_in_grid ]])
+{
+    uint total = M * kv_dim;
+    if (gid >= total) return;
+    uint m = gid / kv_dim;
+    uint c = gid % kv_dim;
+    uint cache_offset = (seq_len + m) * kv_dim + c;
+    uint src_offset = m * kv_dim + c;
+    k_cache[cache_offset] = half(k_new[src_offset]);
+    v_cache[cache_offset] = half(v_new[src_offset]);
+}

@@ -15,6 +15,7 @@ add_executable(rt_tests
   test_train.cpp
   test_transformer3.cpp
   test_metal.cpp
+  test_metal_decode.cpp
 )
 target_link_libraries(rt_tests PRIVATE rt_core Catch2::Catch2WithMain)
 catch_discover_tests(rt_tests)

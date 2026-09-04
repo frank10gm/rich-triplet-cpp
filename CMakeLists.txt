@@ -66,8 +66,18 @@ if(RT_METAL)
   find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
   target_link_libraries(rt_core PUBLIC ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
   target_compile_definitions(rt_core PUBLIC RT_FEATURE_METAL=1)
-  target_sources(rt_core PRIVATE src/metal_ops.mm)
-  set_source_files_properties(src/metal_ops.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+
+  # The decode engines' shaders live as .msl files and are embedded as string
+  # literals at configure time.
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedShader.cmake)
+  set(RT_SHADER_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/rt)
+  rt_embed_shader(${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/decode_gemma3.msl
+                  ${RT_SHADER_DIR}/decode_gemma3_msl.hpp kDecodeGemma3Msl)
+  target_include_directories(rt_core PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+
+  target_sources(rt_core PRIVATE src/metal_ops.mm src/metal_decode.mm)
+  set_source_files_properties(src/metal_ops.mm src/metal_decode.mm
+                              PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 endif()
 
 if(RT_PARALLEL)
