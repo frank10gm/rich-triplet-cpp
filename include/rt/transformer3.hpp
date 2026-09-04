@@ -239,6 +239,34 @@ class GptOssModel : public Trainable {
     [[nodiscard]] TensorNode loss(const std::vector<std::size_t>& token_ids,
                                   const std::vector<std::size_t>& targets) const;
 
+    /// Mean loss over a batch of (input, target) pairs, as a 1x1 scalar node.
+    ///
+    /// Each sequence is run separately -- padding them into one tensor would
+    /// need a mask -- and backward pushes 1/B into every per-sequence loss.
+    [[nodiscard]] TensorNode loss_batch(
+        const std::vector<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>>& batch)
+        const;
+
+    /// Perplexity of a token sequence: `exp(mean negative log-likelihood)`.
+    ///
+    /// A sliding window of `context_len` tokens (0 means the model's maximum)
+    /// predicts the token just past it, advancing by half a window each time so
+    /// most predictions see a reasonable amount of context.
+    [[nodiscard]] float perplexity(const std::vector<std::size_t>& token_ids,
+                                   std::size_t context_len) const;
+
+#if RT_FEATURE_MMAP_LOADING
+    /// Load every `*.safetensors` shard in `dir` through mmap.
+    ///
+    /// The kernel pages each shard in on demand and can evict those pages under
+    /// pressure, so peak memory stays near the parsed tensors rather than
+    /// parsed tensors plus a full file buffer.
+    [[nodiscard]] Result<void> load_weights_from_dir_mmap(const std::string& dir);
+
+    /// Load a single shard through mmap, returning how many tensors it held.
+    [[nodiscard]] Result<std::size_t> load_shard_mmap(const std::string& path);
+#endif
+
     /// The most likely next token for a prompt.
     [[nodiscard]] std::size_t predict_next(const std::vector<std::size_t>& token_ids) const;
 

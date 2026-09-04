@@ -10,6 +10,14 @@
 #include <fstream>
 #include <limits>
 #include <numbers>
+#include <span>
+
+#if RT_FEATURE_MMAP_LOADING
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace rt {
 
@@ -787,6 +795,169 @@ void GptOssModel::generate_with_params_streaming(
         }
     }
 }
+
+TensorNode GptOssModel::loss_batch(
+    const std::vector<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>>& batch)
+    const {
+    assert(!batch.empty() && "loss_batch: empty batch");
+
+    std::vector<TensorNode> loss_nodes;
+    loss_nodes.reserve(batch.size());
+    for (const auto& [inp, tgt] : batch) {
+        loss_nodes.push_back(loss(inp, tgt));
+    }
+
+    const float b = static_cast<float>(loss_nodes.size());
+    float sum_val = 0.0f;
+    for (const TensorNode& n : loss_nodes) {
+        sum_val += n.data().at(0, 0);
+    }
+    sum_val /= b;
+
+    const TensorNode avg = TensorNode::leaf(Mat(std::vector<float>{sum_val}, 1, 1));
+    // Each sequence contributed 1/B of the average, so that is what flows back.
+    std::vector<TensorNode> children = loss_nodes;
+    avg.set_backward(
+        [children, b]() {
+            for (const TensorNode& child : children) {
+                const float cur = child.grad().at(0, 0);
+                child.set_grad(Mat(std::vector<float>{cur + 1.0f / b}, 1, 1));
+                child.call_backward_fn();
+            }
+        },
+        loss_nodes);
+    return avg;
+}
+
+float GptOssModel::perplexity(const std::vector<std::size_t>& token_ids,
+                              std::size_t context_len) const {
+    assert(token_ids.size() >= 2 && "perplexity: need at least 2 tokens");
+    std::size_t ctx = context_len == 0 ? config.max_position_embeddings : context_len;
+    ctx = std::min(ctx, config.max_position_embeddings);
+
+    const std::size_t n = token_ids.size();
+    float total_nll = 0.0f;
+    std::size_t n_tokens = 0;
+
+    for (std::size_t t = 1; t < n; t += std::max<std::size_t>(ctx / 2, 1)) {
+        const std::size_t ctx_start = t > ctx ? t - ctx : 0;
+        const std::vector<std::size_t> ctx_ids(token_ids.begin() + static_cast<std::ptrdiff_t>(ctx_start),
+                                               token_ids.begin() + static_cast<std::ptrdiff_t>(t));
+        const std::size_t target = token_ids[t];
+
+        const TensorNode logits_node = forward(ctx_ids);
+        const Mat& logits = logits_node.data();
+        const std::size_t last = logits.rows - 1;
+        const std::size_t v = logits.cols;
+
+        // Log-softmax the usual stable way: subtract the row max before exp.
+        float row_max = -std::numeric_limits<float>::infinity();
+        for (std::size_t c = 0; c < v; ++c) {
+            row_max = std::max(row_max, logits.at(last, c));
+        }
+        float sum_exp = 0.0f;
+        for (std::size_t c = 0; c < v; ++c) {
+            sum_exp += std::exp(logits.at(last, c) - row_max);
+        }
+        total_nll -= logits.at(last, target) - row_max - std::log(sum_exp);
+        ++n_tokens;
+    }
+
+    return std::exp(total_nll / static_cast<float>(n_tokens));
+}
+
+#if RT_FEATURE_MMAP_LOADING
+
+namespace {
+
+/// A read-only mapping of a whole file, unmapped when it goes out of scope.
+class FileMapping {
+   public:
+    [[nodiscard]] static Result<FileMapping> open(const std::string& path) {
+        const int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) {
+            return err("cannot open " + path + ": " + std::strerror(errno));
+        }
+        struct stat st {};
+        if (::fstat(fd, &st) != 0) {
+            const std::string message = std::strerror(errno);
+            ::close(fd);
+            return err("cannot stat " + path + ": " + message);
+        }
+        const auto len = static_cast<std::size_t>(st.st_size);
+        void* addr = ::mmap(nullptr, len, PROT_READ, MAP_PRIVATE, fd, 0);
+        // The mapping keeps its own reference to the file, so the descriptor
+        // can be closed straight away.
+        ::close(fd);
+        if (addr == MAP_FAILED) {
+            return err("mmap failed for " + path + ": " + std::strerror(errno));
+        }
+        return FileMapping(addr, len);
+    }
+
+    ~FileMapping() {
+        if (addr_ != nullptr) {
+            ::munmap(addr_, len_);
+        }
+    }
+    FileMapping(FileMapping&& other) noexcept : addr_(other.addr_), len_(other.len_) {
+        other.addr_ = nullptr;
+    }
+    FileMapping(const FileMapping&) = delete;
+    FileMapping& operator=(const FileMapping&) = delete;
+
+    [[nodiscard]] std::span<const std::uint8_t> bytes() const {
+        return {static_cast<const std::uint8_t*>(addr_), len_};
+    }
+
+   private:
+    FileMapping(void* addr, std::size_t len) : addr_(addr), len_(len) {}
+
+    void* addr_ = nullptr;
+    std::size_t len_ = 0;
+};
+
+}  // namespace
+
+Result<void> GptOssModel::load_weights_from_dir_mmap(const std::string& dir) {
+    std::error_code ec;
+    std::filesystem::directory_iterator it(dir, ec);
+    if (ec) {
+        return err("cannot read dir " + dir + ": " + ec.message());
+    }
+
+    std::size_t loaded_shards = 0;
+    std::size_t loaded_tensors = 0;
+
+    for (const std::filesystem::directory_entry& entry : it) {
+        const std::filesystem::path path = entry.path();
+        if (path.extension() != ".safetensors") {
+            continue;
+        }
+        RT_TRY(n, load_shard_mmap(path.string()));
+        loaded_tensors += n;
+        ++loaded_shards;
+    }
+
+    if (loaded_shards == 0) {
+        return err("no .safetensors files found in " + dir);
+    }
+
+    std::printf("Loaded %zu tensors from %zu shards via mmap in %s\n", loaded_tensors,
+                loaded_shards, dir.c_str());
+    return {};
+}
+
+Result<std::size_t> GptOssModel::load_shard_mmap(const std::string& path) {
+    RT_TRY(mapping, FileMapping::open(path));
+    const std::span<const std::uint8_t> bytes = mapping.bytes();
+    RT_TRY(tensors, parse_safetensors(std::vector<std::uint8_t>(bytes.begin(), bytes.end())));
+    const std::size_t n = tensors.size();
+    load_into_model(*this, tensors);
+    return n;
+}
+
+#endif  // RT_FEATURE_MMAP_LOADING
 
 void GptOssModel::tie_weights() {
     assert(lm_head.weight.data().rows == embed_tokens.data().rows &&

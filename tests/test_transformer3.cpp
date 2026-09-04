@@ -532,3 +532,100 @@ TEST_CASE("load_weights_from_dir reports an empty directory", "[transformer3]") 
     REQUIRE(result.error().find("no .safetensors files") != std::string::npos);
     std::filesystem::remove(empty_dir);
 }
+
+// -----------------------------------------------------------------------------
+// Batched loss and perplexity
+// -----------------------------------------------------------------------------
+
+TEST_CASE("loss_batch averages the per-sequence losses", "[transformer3]") {
+    const Config3 cfg = tiny_cfg();
+    InitRng rng(31);
+    const GptOssModel model(cfg, rng);
+
+    const std::vector<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>> batch{
+        {{1, 2, 3}, {2, 3, 4}},
+        {{4, 5, 6}, {5, 6, 7}},
+    };
+
+    const TensorNode a = model.loss(batch[0].first, batch[0].second);
+    const TensorNode b = model.loss(batch[1].first, batch[1].second);
+    const TensorNode avg = model.loss_batch(batch);
+
+    REQUIRE(avg.data().rows == 1);
+    REQUIRE(avg.data().cols == 1);
+    const float expected = (a.data().at(0, 0) + b.data().at(0, 0)) / 2.0f;
+    REQUIRE(std::fabs(avg.data().at(0, 0) - expected) < 1e-5f);
+
+    // Backward through the average must reach the parameters.
+    model.zero_grad();
+    avg.backward();
+    float total = 0.0f;
+    for (const TensorNode& p : model.parameters()) {
+        for (float g : p.grad().data) {
+            total += std::fabs(g);
+        }
+    }
+    REQUIRE(total > 0.0f);
+}
+
+TEST_CASE("perplexity is finite and at least 1", "[transformer3]") {
+    const Config3 cfg = tiny_cfg();
+    InitRng rng(32);
+    const GptOssModel model(cfg, rng);
+
+    const std::vector<std::size_t> tokens{1, 2, 3, 4, 5, 6, 7, 8};
+    const float ppl = model.perplexity(tokens, 4);
+    INFO("perplexity " << ppl);
+    REQUIRE(std::isfinite(ppl));
+    // exp of a non-negative mean NLL, so it can never dip below 1.
+    REQUIRE(ppl >= 1.0f);
+
+    // A context length of 0 means "as much as the model allows".
+    REQUIRE(std::isfinite(model.perplexity(tokens, 0)));
+}
+
+#if RT_FEATURE_MMAP_LOADING
+TEST_CASE("load_shard_mmap reads a shard through mmap", "[transformer3]") {
+    const Config3 cfg = tiny_cfg();
+    InitRng rng(33);
+    GptOssModel model(cfg, rng);
+
+    // One f32 tensor the loader recognizes: the final norm gamma.
+    const std::vector<float> gamma(cfg.hidden_size, 0.5f);
+    const std::string json =
+        "{\"model.norm.weight\":{\"dtype\":\"F32\",\"shape\":[" +
+        std::to_string(cfg.hidden_size) + "],\"data_offsets\":[0," +
+        std::to_string(gamma.size() * 4) + "]}}";
+
+    const std::string path = "/tmp/rt_mmap_shard.safetensors";
+    {
+        std::ofstream out(path, std::ios::binary);
+        std::uint64_t header_len = json.size();
+        out.write(reinterpret_cast<const char*>(&header_len), 8);
+        out.write(json.data(), static_cast<std::streamsize>(json.size()));
+        out.write(reinterpret_cast<const char*>(gamma.data()),
+                  static_cast<std::streamsize>(gamma.size() * 4));
+    }
+
+    const Result<std::size_t> n = model.load_shard_mmap(path);
+    REQUIRE(n.has_value());
+    REQUIRE(*n == 1);
+    REQUIRE(model.norm.gamma.data().at(0, 0) == 0.5f);
+
+    REQUIRE_FALSE(model.load_shard_mmap("/tmp/rt_no_such_shard.safetensors").has_value());
+    std::remove(path.c_str());
+}
+
+TEST_CASE("load_weights_from_dir_mmap rejects an empty directory", "[transformer3]") {
+    const Config3 cfg = tiny_cfg();
+    InitRng rng(34);
+    GptOssModel model(cfg, rng);
+
+    const std::string dir = "/tmp/rt_empty_mmap_dir";
+    std::filesystem::create_directories(dir);
+    const Result<void> empty = model.load_weights_from_dir_mmap(dir);
+    REQUIRE_FALSE(empty.has_value());
+    REQUIRE(empty.error().find("no .safetensors files") != std::string::npos);
+    std::filesystem::remove_all(dir);
+}
+#endif  // RT_FEATURE_MMAP_LOADING
