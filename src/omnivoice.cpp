@@ -11,6 +11,8 @@
 
 #include "rt/duration.hpp"
 #include "rt/init_rng.hpp"
+#include "rt/resample.hpp"
+#include "rt/utf8.hpp"
 
 namespace rt {
 
@@ -85,6 +87,144 @@ std::size_t omni_estimate_frames(std::string_view text, const OmniCodecConfig& c
     return std::max<std::size_t>(1, static_cast<std::size_t>(est));
 }
 
+std::size_t omni_estimate_frames_from_reference(std::string_view text, std::string_view ref_text,
+                                                std::size_t ref_frames,
+                                                const OmniCodecConfig& codec) {
+    if (ref_text.empty() || ref_frames == 0) {
+        return omni_estimate_frames(text, codec);
+    }
+    const double rate = static_cast<double>(codec.sample_rate) /
+                        static_cast<double>(codec.hop_length);
+    const double est = estimate_duration(text, ref_text, static_cast<double>(ref_frames),
+                                         2.0 * rate, 3.0);
+    return std::max<std::size_t>(1, static_cast<std::size_t>(est));
+}
+
+// =============================================================================
+// Reference clips
+// =============================================================================
+
+double OmniReference::seconds(const OmniCodecConfig& codec) const {
+    return codec.sample_rate == 0
+               ? 0.0
+               : static_cast<double>(samples.size()) / static_cast<double>(codec.sample_rate);
+}
+
+Result<OmniReference> omni_prepare_reference(std::span<const float> samples,
+                                             std::size_t sample_rate,
+                                             const OmniCodecConfig& codec) {
+    if (samples.empty()) {
+        return err("omnivoice: the reference clip is empty");
+    }
+    if (sample_rate == 0) {
+        return err("omnivoice: the reference clip has no sample rate");
+    }
+
+    OmniReference ref;
+    ref.samples = resample(samples, sample_rate, codec.sample_rate);
+
+    // Whole frames only: the encoder would drop the remainder anyway, and
+    // doing it here keeps the length the caller sees honest.
+    const std::size_t frames = ref.samples.size() / codec.hop_length;
+    if (frames == 0) {
+        return err("omnivoice: the reference clip is shorter than one frame at " +
+                   std::to_string(codec.sample_rate) + " Hz");
+    }
+    ref.samples.resize(frames * codec.hop_length);
+
+    double sum_sq = 0.0;
+    for (const float v : ref.samples) {
+        sum_sq += static_cast<double>(v) * v;
+    }
+    ref.rms = static_cast<float>(std::sqrt(sum_sq / static_cast<double>(ref.samples.size())));
+
+    constexpr float kTargetRms = 0.1f;
+    if (ref.rms > 0.0f && ref.rms < kTargetRms) {
+        const float gain = kTargetRms / ref.rms;
+        for (float& v : ref.samples) {
+            v *= gain;
+        }
+    }
+    return ref;
+}
+
+// =============================================================================
+// Text
+// =============================================================================
+
+namespace {
+
+/// Trim Unicode whitespace from both ends.
+[[nodiscard]] std::string trim(std::string_view s) {
+    const std::vector<std::pair<std::size_t, char32_t>> cps = utf8::decode_indices(s);
+    std::size_t begin = 0;
+    while (begin < cps.size() && utf8::is_whitespace(cps[begin].second)) {
+        ++begin;
+    }
+    std::size_t end = cps.size();
+    while (end > begin && utf8::is_whitespace(cps[end - 1].second)) {
+        --end;
+    }
+    if (begin >= end) {
+        return {};
+    }
+    const std::size_t from = cps[begin].first;
+    const std::size_t to = end < cps.size() ? cps[end].first : s.size();
+    return std::string(s.substr(from, to - from));
+}
+
+/// The CJK Unified Ideographs block, where a space between characters is
+/// typesetting rather than a word boundary.
+[[nodiscard]] bool is_cjk(char32_t cp) { return cp >= 0x4E00 && cp <= 0x9FFF; }
+
+}  // namespace
+
+std::string omni_combine_text(std::string_view text, std::string_view ref_text) {
+    const std::string trimmed_ref = trim(ref_text);
+    const std::string trimmed = trim(text);
+    const std::string joined =
+        trimmed_ref.empty() ? trimmed : trimmed_ref + " " + trimmed;
+
+    // Walk once, applying every rule: line breaks vanish, fullwidth
+    // parentheses become ASCII, runs of spaces and tabs collapse to one.
+    std::vector<char32_t> out;
+    for (const char32_t cp : utf8::decode(joined)) {
+        if (cp == U'\r' || cp == U'\n') {
+            continue;
+        }
+        if (cp == 0xFF08) {
+            out.push_back(U'(');
+            continue;
+        }
+        if (cp == 0xFF09) {
+            out.push_back(U')');
+            continue;
+        }
+        if (cp == U' ' || cp == U'\t') {
+            if (!out.empty() && out.back() == U' ') {
+                continue;
+            }
+            out.push_back(U' ');
+            continue;
+        }
+        out.push_back(cp);
+    }
+
+    // Then drop the spaces that sit against a CJK character on either side.
+    std::string result;
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        if (out[i] == U' ') {
+            const bool cjk_before = i > 0 && is_cjk(out[i - 1]);
+            const bool cjk_after = i + 1 < out.size() && is_cjk(out[i + 1]);
+            if (cjk_before || cjk_after) {
+                continue;
+            }
+        }
+        utf8::encode_into(result, out[i]);
+    }
+    return result;
+}
+
 namespace {
 
 /// Append the text tokens of `s`, if any.
@@ -110,7 +250,30 @@ Result<std::vector<OmniToken>> omni_build_conditional(const HfBpeTokenizer& tok,
         return err("omnivoice: asked for zero frames");
     }
 
+    const std::size_t ref_frames = request.ref_frames();
+    for (const std::vector<std::uint32_t>& stream : request.ref_codes) {
+        if (stream.size() != ref_frames) {
+            return err("omnivoice: the reference codebooks disagree on length");
+        }
+    }
+    if (!request.ref_codes.empty() && request.ref_codes.size() != cfg.num_audio_codebook) {
+        return err("omnivoice: the reference has " +
+                   std::to_string(request.ref_codes.size()) + " codebooks, expected " +
+                   std::to_string(cfg.num_audio_codebook));
+    }
+    if (ref_frames > 0 && request.ref_text.empty()) {
+        return err(
+            "omnivoice: a reference clip needs its transcript, or the model cannot tell which "
+            "part of the text it has already heard");
+    }
+
     std::vector<OmniToken> seq;
+
+    // A reference clip is a recording, so the model is told to clean it up
+    // rather than reproduce its room.
+    if (ref_frames > 0) {
+        seq.push_back(OmniToken::text(cfg.denoise));
+    }
 
     // Style block. The markers are injected as raw ids -- encoding the literal
     // "<|lang_start|>" would split it into ordinary subword pieces.
@@ -122,10 +285,27 @@ Result<std::vector<OmniToken>> omni_build_conditional(const HfBpeTokenizer& tok,
     append_text(seq, tok, request.instruct.empty() ? "None" : request.instruct);
     seq.push_back(OmniToken::text(cfg.instruct_end));
 
-    // Text block.
+    // Text block: the reference transcript and the target text as one run, so
+    // the model reads them as continuous speech.
     seq.push_back(OmniToken::text(cfg.text_start));
-    append_text(seq, tok, request.text);
+    append_text(seq, tok, omni_combine_text(request.text, request.ref_text));
     seq.push_back(OmniToken::text(cfg.text_end));
+
+    // Reference frames, already decided. These are ordinary audio positions
+    // carrying real codes rather than the mask, which is the whole mechanism:
+    // the target frames attend to them like any other position.
+    for (std::size_t t = 0; t < ref_frames; ++t) {
+        OmniToken token;
+        token.audio.resize(cfg.num_audio_codebook);
+        for (std::size_t c = 0; c < cfg.num_audio_codebook; ++c) {
+            if (request.ref_codes[c][t] >= cfg.audio_mask_id) {
+                return err("omnivoice: reference code " +
+                           std::to_string(request.ref_codes[c][t]) + " is out of range");
+            }
+            token.audio[c] = request.ref_codes[c][t];
+        }
+        seq.push_back(std::move(token));
+    }
 
     // Target frames, all masked.
     for (std::size_t i = 0; i < frames; ++i) {
@@ -187,7 +367,9 @@ Result<OmniResult> omni_synthesize(const OmniLm& lm, const OmniCodecDecoder& cod
                   static_cast<double>(request.duration_seconds) *
                   static_cast<double>(codec.config.sample_rate) /
                   static_cast<double>(codec.config.hop_length)))
-            : omni_estimate_frames(request.text, codec.config);
+            : omni_estimate_frames_from_reference(omni_combine_text(request.text, {}),
+                                                 request.ref_text, request.ref_frames(),
+                                                 codec.config);
     if (frames == 0) {
         return err("omnivoice: computed zero frames");
     }
@@ -359,6 +541,17 @@ Result<OmniResult> omni_synthesize(const OmniLm& lm, const OmniCodecDecoder& cod
     }
 
     RT_TRY(samples, codec.decode(codes));
+
+    // Put the reference's own loudness back. Without this a quiet recording
+    // clones into a voice that is the right voice at the wrong level, because
+    // the clip was brought up to 0.1 RMS before it was encoded.
+    constexpr float kTargetRms = 0.1f;
+    if (request.ref_rms > 0.0f && request.ref_rms < kTargetRms) {
+        const float gain = request.ref_rms / kTargetRms;
+        for (float& v : samples) {
+            v *= gain;
+        }
+    }
     const auto end = std::chrono::steady_clock::now();
 
     OmniResult result;

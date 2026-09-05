@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "rt/omnivoice.hpp"
+#include "rt/wav.hpp"
 #include "rt/transformer5.hpp"
 #include "test_helpers.hpp"
 
@@ -316,4 +317,355 @@ TEST_CASE("OmniLm is deterministic", "[omnivoice][.integration]") {
     for (std::size_t i = 0; i < a->data.size(); ++i) {
         REQUIRE(a->data[i] == b->data[i]);
     }
+}
+
+// =============================================================================
+// Text normalisation
+// =============================================================================
+
+TEST_CASE("omni_combine_text trims and joins", "[omnivoice]") {
+    REQUIRE(omni_combine_text("  hello  ", "") == "hello");
+    REQUIRE(omni_combine_text(" world ", "  hello ") == "hello world");
+    // An empty reference is not a leading space.
+    REQUIRE(omni_combine_text("hello", "   ") == "hello");
+}
+
+TEST_CASE("omni_combine_text folds whitespace", "[omnivoice]") {
+    // A line break inside a prompt would be spoken as nothing useful, and runs
+    // of spaces as a pause that is not in the text.
+    REQUIRE(omni_combine_text("a\nb", "") == "ab");
+    REQUIRE(omni_combine_text("a\r\n\r\nb", "") == "ab");
+    REQUIRE(omni_combine_text("a  \t  b", "") == "a b");
+    REQUIRE(omni_combine_text("one   two    three", "") == "one two three");
+}
+
+TEST_CASE("omni_combine_text normalises fullwidth parentheses", "[omnivoice]") {
+    REQUIRE(omni_combine_text("（x）", "") == "(x)");
+}
+
+TEST_CASE("omni_combine_text removes spaces next to CJK", "[omnivoice]") {
+    // Between ideographs a space is typesetting, not a word boundary, and
+    // reading it as one puts a pause where none belongs.
+    REQUIRE(omni_combine_text("你好 世界", "") == "你好世界");
+    REQUIRE(omni_combine_text("hello 你好", "") == "hello你好");
+    REQUIRE(omni_combine_text("你好 world", "") == "你好world");
+    // Latin text keeps its spaces.
+    REQUIRE(omni_combine_text("hello world", "") == "hello world");
+}
+
+// =============================================================================
+// Reference clips
+// =============================================================================
+
+TEST_CASE("omni_prepare_reference trims to whole frames", "[omnivoice]") {
+    const OmniCodecConfig c = OmniCodecConfig::defaults();
+    // Three frames and a bit.
+    const std::vector<float> wav(3 * 960 + 137, 0.2f);
+    const Result<OmniReference> ref = omni_prepare_reference(wav, 24000, c);
+    REQUIRE(ref.has_value());
+    REQUIRE(ref->samples.size() == 3 * 960);
+    REQUIRE(approx(static_cast<float>(ref->seconds(c)), 0.12f));
+}
+
+TEST_CASE("omni_prepare_reference resamples to the codec's rate", "[omnivoice]") {
+    const OmniCodecConfig c = OmniCodecConfig::defaults();
+    // One second at 48 kHz becomes one second at 24 kHz, which is 25 frames.
+    const std::vector<float> wav(48000, 0.3f);
+    const Result<OmniReference> ref = omni_prepare_reference(wav, 48000, c);
+    REQUIRE(ref.has_value());
+    REQUIRE(ref->samples.size() == 25 * 960);
+}
+
+TEST_CASE("omni_prepare_reference lifts a quiet clip to the codec's level",
+          "[omnivoice]") {
+    const OmniCodecConfig c = OmniCodecConfig::defaults();
+    // A constant 0.02 has an RMS of 0.02, so it is scaled by five.
+    const std::vector<float> wav(5 * 960, 0.02f);
+    const Result<OmniReference> ref = omni_prepare_reference(wav, 24000, c);
+    REQUIRE(ref.has_value());
+    // The reported RMS is the original one, which is what the output is scaled
+    // back to.
+    REQUIRE(approx(ref->rms, 0.02f));
+    for (const float v : ref->samples) {
+        REQUIRE(approx(v, 0.1f));
+    }
+}
+
+TEST_CASE("omni_prepare_reference leaves a loud clip alone", "[omnivoice]") {
+    const OmniCodecConfig c = OmniCodecConfig::defaults();
+    const std::vector<float> wav(5 * 960, 0.4f);
+    const Result<OmniReference> ref = omni_prepare_reference(wav, 24000, c);
+    REQUIRE(ref.has_value());
+    REQUIRE(approx(ref->rms, 0.4f));
+    for (const float v : ref->samples) {
+        REQUIRE(approx(v, 0.4f));
+    }
+}
+
+TEST_CASE("omni_prepare_reference rejects what it cannot use", "[omnivoice]") {
+    const OmniCodecConfig c = OmniCodecConfig::defaults();
+    REQUIRE_FALSE(omni_prepare_reference({}, 24000, c).has_value());
+    REQUIRE_FALSE(omni_prepare_reference(std::vector<float>(100, 0.1f), 24000, c).has_value());
+    REQUIRE_FALSE(omni_prepare_reference(std::vector<float>(4800, 0.1f), 0, c).has_value());
+}
+
+// =============================================================================
+// Length with a reference
+// =============================================================================
+
+TEST_CASE("a reference clip calibrates the length estimate", "[omnivoice]") {
+    const OmniCodecConfig c = OmniCodecConfig::defaults();
+    const char* text = "Domani andro al mercato con mia sorella.";
+    const char* ref = "Ciao, mi chiamo Giulia.";
+
+    // A speaker who took 80 frames to say a 44-frame phrase is slow, and the
+    // estimate has to follow them rather than the built-in average.
+    const std::size_t slow = omni_estimate_frames_from_reference(text, ref, 80, c);
+    const std::size_t fast = omni_estimate_frames_from_reference(text, ref, 30, c);
+    REQUIRE(slow > fast);
+
+    // No usable reference falls back to the built-in phrase.
+    REQUIRE(omni_estimate_frames_from_reference(text, "", 80, c) ==
+            omni_estimate_frames(text, c));
+    REQUIRE(omni_estimate_frames_from_reference(text, ref, 0, c) ==
+            omni_estimate_frames(text, c));
+}
+
+// =============================================================================
+// Cloning prompts
+// =============================================================================
+
+namespace {
+
+/// A tokenizer with just enough vocabulary to encode the test prompts. The
+/// prompt layout is what is under test, not the merges.
+[[nodiscard]] HfBpeTokenizer toy_tokenizer() {
+    const char* json =
+        R"({"model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"Ġ":3,"o":4,"e":5,)"
+        R"("i":6,"n":7,"N":8,"t":9,".":10,"s":11,"h":12,"l":13,"d":14},"merges":[]}})";
+    Result<HfBpeTokenizer> t = HfBpeTokenizer::from_json_str(json);
+    REQUIRE(t.has_value());
+    return std::move(*t);
+}
+
+/// `codebooks` streams of `frames` distinct codes.
+[[nodiscard]] std::vector<std::vector<std::uint32_t>> toy_codes(std::size_t codebooks,
+                                                                std::size_t frames) {
+    std::vector<std::vector<std::uint32_t>> out(codebooks);
+    for (std::size_t c = 0; c < codebooks; ++c) {
+        out[c].resize(frames);
+        for (std::size_t t = 0; t < frames; ++t) {
+            out[c][t] = static_cast<std::uint32_t>(c * 100 + t);
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("a reference clip becomes decided frames before the masked ones", "[omnivoice]") {
+    const Config6 cfg = Config6::omnivoice();
+    const HfBpeTokenizer tok = toy_tokenizer();
+
+    OmniRequest r;
+    r.text = "note";
+    r.ref_text = "abc";
+    r.ref_codes = toy_codes(cfg.num_audio_codebook, 5);
+
+    const Result<std::vector<OmniToken>> seq = omni_build_conditional(tok, cfg, r, 4);
+    REQUIRE(seq.has_value());
+
+    // The denoise marker leads, and only when there is a recording to clean up.
+    REQUIRE((*seq)[0].text_id == cfg.denoise);
+    REQUIRE((*seq)[1].text_id == cfg.lang_start);
+
+    // Nine audio positions: five carrying the reference, four masked.
+    REQUIRE(seq->size() > 9);
+    const std::size_t audio_start = seq->size() - 9;
+    for (std::size_t i = 0; i < audio_start; ++i) {
+        REQUIRE_FALSE((*seq)[i].is_audio());
+    }
+    for (std::size_t t = 0; t < 5; ++t) {
+        const OmniToken& token = (*seq)[audio_start + t];
+        REQUIRE(token.is_audio());
+        for (std::size_t c = 0; c < cfg.num_audio_codebook; ++c) {
+            REQUIRE(token.audio[c] == c * 100 + t);
+            REQUIRE(token.audio[c] != cfg.audio_mask_id);
+        }
+    }
+    for (std::size_t t = 5; t < 9; ++t) {
+        const OmniToken& token = (*seq)[audio_start + t];
+        REQUIRE(token.is_audio());
+        for (const std::uint32_t v : token.audio) {
+            REQUIRE(v == cfg.audio_mask_id);
+        }
+    }
+}
+
+TEST_CASE("without a reference there is no denoise marker", "[omnivoice]") {
+    const Config6 cfg = Config6::omnivoice();
+    const HfBpeTokenizer tok = toy_tokenizer();
+    OmniRequest r;
+    r.text = "note";
+
+    const Result<std::vector<OmniToken>> seq = omni_build_conditional(tok, cfg, r, 3);
+    REQUIRE(seq.has_value());
+    REQUIRE((*seq)[0].text_id == cfg.lang_start);
+    // Exactly the target frames, and every one of them masked.
+    REQUIRE((*seq)[seq->size() - 4].is_audio() == false);
+}
+
+TEST_CASE("the target frames stay at the end whatever precedes them", "[omnivoice]") {
+    // `omni_synthesize` finds them by counting back from the end, so this is
+    // the property that makes cloning need no change to the unmasking loop.
+    const Config6 cfg = Config6::omnivoice();
+    const HfBpeTokenizer tok = toy_tokenizer();
+
+    OmniRequest plain;
+    plain.text = "note";
+    OmniRequest cloned;
+    cloned.text = "note";
+    cloned.ref_text = "abc";
+    cloned.ref_codes = toy_codes(cfg.num_audio_codebook, 6);
+
+    const Result<std::vector<OmniToken>> a = omni_build_conditional(tok, cfg, plain, 4);
+    const Result<std::vector<OmniToken>> b = omni_build_conditional(tok, cfg, cloned, 4);
+    REQUIRE(a.has_value());
+    REQUIRE(b.has_value());
+    for (std::size_t i = 1; i <= 4; ++i) {
+        REQUIRE((*a)[a->size() - i].is_audio());
+        REQUIRE((*b)[b->size() - i].is_audio());
+        REQUIRE((*a)[a->size() - i].audio[0] == cfg.audio_mask_id);
+        REQUIRE((*b)[b->size() - i].audio[0] == cfg.audio_mask_id);
+    }
+}
+
+TEST_CASE("a reference clip is rejected without its transcript", "[omnivoice]") {
+    const Config6 cfg = Config6::omnivoice();
+    const HfBpeTokenizer tok = toy_tokenizer();
+    OmniRequest r;
+    r.text = "note";
+    r.ref_codes = toy_codes(cfg.num_audio_codebook, 3);
+    REQUIRE_FALSE(omni_build_conditional(tok, cfg, r, 4).has_value());
+}
+
+TEST_CASE("malformed reference codes are rejected", "[omnivoice]") {
+    const Config6 cfg = Config6::omnivoice();
+    const HfBpeTokenizer tok = toy_tokenizer();
+
+    OmniRequest ragged;
+    ragged.text = "note";
+    ragged.ref_text = "abc";
+    ragged.ref_codes = toy_codes(cfg.num_audio_codebook, 3);
+    ragged.ref_codes[2].pop_back();
+    REQUIRE_FALSE(omni_build_conditional(tok, cfg, ragged, 4).has_value());
+
+    OmniRequest few;
+    few.text = "note";
+    few.ref_text = "abc";
+    few.ref_codes = toy_codes(cfg.num_audio_codebook - 1, 3);
+    REQUIRE_FALSE(omni_build_conditional(tok, cfg, few, 4).has_value());
+
+    OmniRequest wild;
+    wild.text = "note";
+    wild.ref_text = "abc";
+    wild.ref_codes = toy_codes(cfg.num_audio_codebook, 3);
+    // The mask id is not a code, so it cannot appear in a reference.
+    wild.ref_codes[0][1] = static_cast<std::uint32_t>(cfg.audio_mask_id);
+    REQUIRE_FALSE(omni_build_conditional(tok, cfg, wild, 4).has_value());
+}
+
+// =============================================================================
+// End to end
+// =============================================================================
+
+TEST_CASE("OmniVoice clones a voice end to end", "[omnivoice][.e2e]") {
+    // Loads both halves of the model plus the codec's analysis path, so this
+    // is tens of seconds rather than one.
+    constexpr const char* kCodecPath = "models/omnivoice-tokenizer-Q8_0.gguf";
+    if (!std::filesystem::exists(kLmPath) || !std::filesystem::exists(kCodecPath)) {
+        SKIP("OmniVoice weights not present");
+    }
+
+    const OmniCodecConfig codec_cfg = OmniCodecConfig::defaults();
+    const Result<GgufFile> gguf = GgufFile::open(kLmPath);
+    REQUIRE(gguf.has_value());
+    const Result<HfBpeTokenizer> tok = load_gguf_tokenizer(*gguf);
+    REQUIRE(tok.has_value());
+    const Result<OmniLm> lm = OmniLm::load(kLmPath, Config6::omnivoice());
+    REQUIRE(lm.has_value());
+    const Result<OmniCodecDecoder> decoder = OmniCodecDecoder::load(kCodecPath, codec_cfg);
+    REQUIRE(decoder.has_value());
+    const Result<OmniCodecEncoder> encoder = OmniCodecEncoder::load(kCodecPath, codec_cfg);
+    REQUIRE(encoder.has_value());
+
+    // Build a reference clip the way a user would: real audio in, codes out.
+    // Synthesising one first would double the runtime, so this decodes a fixed
+    // set of codes instead -- the point is the plumbing, not the voice.
+    constexpr std::size_t kRefFrames = 25;
+    std::vector<std::vector<std::uint32_t>> seed_codes(codec_cfg.n_codebooks);
+    std::uint32_t state = 987654321;
+    for (std::size_t c = 0; c < codec_cfg.n_codebooks; ++c) {
+        seed_codes[c].resize(kRefFrames);
+        for (std::size_t t = 0; t < kRefFrames; ++t) {
+            state = state * 1664525u + 1013904223u;
+            seed_codes[c][t] = (state >> 16) % codec_cfg.codebook_size;
+        }
+    }
+    const Result<std::vector<float>> ref_wav = decoder->decode(seed_codes);
+    REQUIRE(ref_wav.has_value());
+
+    const Result<OmniReference> ref =
+        omni_prepare_reference(*ref_wav, codec_cfg.sample_rate, codec_cfg);
+    REQUIRE(ref.has_value());
+    const Result<std::vector<std::vector<std::uint32_t>>> ref_codes =
+        encoder->encode(ref->samples);
+    REQUIRE(ref_codes.has_value());
+    REQUIRE((*ref_codes)[0].size() == kRefFrames);
+
+    OmniRequest request;
+    request.text = "Domani andro al mercato.";
+    request.language = "Italian";
+    request.ref_text = "Ciao, mi chiamo Giulia.";
+    request.ref_codes = *ref_codes;
+    request.ref_rms = ref->rms;
+    request.duration_seconds = 1.0f;
+    request.gen.num_step = 4;  // enough to exercise the loop, not to sound good
+    request.gen.seed = 99;
+
+    const Result<OmniResult> out = omni_synthesize(*lm, *decoder, *tok, request);
+    REQUIRE(out.has_value());
+    REQUIRE(out->frames == 25);
+    REQUIRE(out->samples.size() == 25 * codec_cfg.hop_length);
+    REQUIRE(out->forward_passes == 8);
+
+    // The reference's frames ride along in the conditional prompt, so it is
+    // longer than the plain one by exactly their count.
+    OmniRequest plain = request;
+    plain.ref_codes.clear();
+    plain.ref_text.clear();
+    plain.ref_rms = 0.0f;
+    const Result<OmniResult> bare = omni_synthesize(*lm, *decoder, *tok, plain);
+    REQUIRE(bare.has_value());
+    REQUIRE(out->prompt_tokens > bare->prompt_tokens);
+
+    const WaveStats stats = wave_stats(out->samples);
+    REQUIRE(stats.in_range());
+    for (const float v : out->samples) {
+        REQUIRE(std::isfinite(v));
+    }
+
+    // The reference changes what comes out. It cannot be checked that it
+    // changes it in the *right* direction without listening, but a run that
+    // ignored the codes entirely would land on the unconditioned waveform.
+    REQUIRE(out->samples.size() == bare->samples.size());
+    double num = 0.0;
+    double da = 0.0;
+    double db = 0.0;
+    for (std::size_t i = 0; i < out->samples.size(); ++i) {
+        num += static_cast<double>(out->samples[i]) * bare->samples[i];
+        da += static_cast<double>(out->samples[i]) * out->samples[i];
+        db += static_cast<double>(bare->samples[i]) * bare->samples[i];
+    }
+    REQUIRE(std::fabs(num / std::sqrt(da * db)) < 0.5);
 }

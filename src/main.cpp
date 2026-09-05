@@ -155,6 +155,10 @@ struct CliArgs {
     std::optional<std::string> language;
     /// --instruct TEXT : OmniVoice free-text voice description
     std::optional<std::string> instruct;
+    /// --ref-audio PATH : WAV of the voice to clone
+    std::optional<std::string> ref_audio;
+    /// --ref-text TEXT : what that WAV says
+    std::optional<std::string> ref_text;
     /// --duration S : audio seconds to generate; 0 uses the length heuristic
     float duration = 0.0f;
     /// --steps N : OmniVoice unmasking steps
@@ -251,6 +255,10 @@ template <typename T>
             a.language = take(i);
         } else if (arg == "--instruct") {
             a.instruct = take(i);
+        } else if (arg == "--ref-audio") {
+            if (const auto v = take(i)) a.ref_audio = *v;
+        } else if (arg == "--ref-text") {
+            if (const auto v = take(i)) a.ref_text = *v;
         } else if (arg == "--duration") {
             if (const auto v = take(i)) a.duration = parse_or<float>(*v, 0.0f);
         } else if (arg == "--steps") {
@@ -322,6 +330,8 @@ void print_help() {
     std::printf("\nOmniVoice (--model omnivoice):\n");
     std::printf("  --language NAME          Language hint, e.g. Italian    [default: None]\n");
     std::printf("  --instruct TEXT          Voice description              [default: None]\n");
+    std::printf("  --ref-audio PATH         WAV of a voice to clone\n");
+    std::printf("  --ref-text TEXT          What that WAV says (required with it)\n");
     std::printf("  --duration S             Audio seconds (0 = estimate)   [default: 0]\n");
     std::printf("  --steps N                Unmasking steps                [default: 32]\n");
     std::printf("  --guidance G             Guidance scale (0 = off)       [default: 2.0]\n");
@@ -538,6 +548,52 @@ void run_omnivoice(const CliArgs& args, const std::string& prompt) {
     request.language = args.language.value_or("");
     request.instruct = args.instruct.value_or("");
     request.duration_seconds = args.duration;
+
+    // Voice cloning: read the reference, encode it, and hand the codes over as
+    // decided positions. The analysis half of the codec is only loaded when
+    // there is something to analyse -- it is bigger than the synthesis half.
+    if (args.ref_audio) {
+        if (!args.ref_text || args.ref_text->empty()) {
+            die("--ref-audio needs --ref-text: the model has to know which part of the "
+                "prompt it has already heard");
+        }
+        const Result<WavFile> wav = read_wav(*args.ref_audio);
+        if (!wav) {
+            die("failed to read the reference audio: " + wav.error());
+        }
+        const Result<OmniReference> ref =
+            omni_prepare_reference(wav->mono(), wav->sample_rate, codec->config);
+        if (!ref) {
+            die("failed to prepare the reference audio: " + ref.error());
+        }
+        std::fprintf(stderr,
+                     "[ OmniVoice ] Reference: %.2f s, %zu Hz, %zu ch, rms %.4f\n",
+                     ref->seconds(codec->config), wav->sample_rate, wav->channels,
+                     static_cast<double>(ref->rms));
+        if (ref->seconds(codec->config) > 20.0) {
+            std::fprintf(stderr,
+                         "[ OmniVoice ] Warning: reference clips over 20 s slow generation "
+                         "down and clone no better; 3-10 s is the useful range\n");
+        }
+
+        std::fprintf(stderr, "[ OmniVoice ] Loading the codec encoder from %s...\n",
+                     codec_path.c_str());
+        const Result<OmniCodecEncoder> encoder =
+            OmniCodecEncoder::load(codec_path, OmniCodecConfig::defaults());
+        if (!encoder) {
+            die("failed to load the codec encoder: " + encoder.error());
+        }
+        const Result<std::vector<std::vector<std::uint32_t>>> codes =
+            encoder->encode(ref->samples);
+        if (!codes) {
+            die("failed to encode the reference audio: " + codes.error());
+        }
+        std::fprintf(stderr, "[ OmniVoice ] Encoded the reference to %zu frames\n",
+                     (*codes)[0].size());
+        request.ref_codes = *codes;
+        request.ref_text = *args.ref_text;
+        request.ref_rms = ref->rms;
+    }
     request.debug = args.debug;
     request.gen.num_step = args.steps;
     request.gen.guidance_scale = args.guidance;
@@ -550,10 +606,12 @@ void run_omnivoice(const CliArgs& args, const std::string& prompt) {
     } else {
         std::snprintf(duration_field, sizeof(duration_field), "estimated");
     }
-    std::fprintf(stderr, "[ OmniVoice ] lang=%s steps=%zu guidance=%.2f duration=%s rope=%s\n",
+    std::fprintf(stderr,
+                 "[ OmniVoice ] lang=%s steps=%zu guidance=%.2f duration=%s rope=%s clone=%s\n",
                  request.language.empty() ? "None" : request.language.c_str(),
                  request.gen.num_step, static_cast<double>(request.gen.guidance_scale),
-                 duration_field, args.rope_interleaved ? "interleaved" : "half-split");
+                 duration_field, args.rope_interleaved ? "interleaved" : "half-split",
+                 request.ref_codes.empty() ? "off" : "on");
     std::fprintf(stderr, "[ OmniVoice ] Synthesising: \"%s\"\n", prompt.c_str());
 
     const Result<OmniResult> result = omni_synthesize(*lm, *codec, *tok, request);

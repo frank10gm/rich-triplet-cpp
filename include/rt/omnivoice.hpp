@@ -19,6 +19,20 @@
 // alone** -- no style, no text. Both run through the model each step, and their
 // log-probabilities are combined.
 //
+// ## Voice cloning
+//
+// A reference clip does not add a mode. It adds a prefix:
+//
+//   <|denoise|><|lang_start|>...<|instruct_end|>
+//   <|text_start|>{ref_text} {text}<|text_end|>
+//   [ reference frames, decided ][ target frames, all masked ]
+//
+// so the model is continuing a recording it can see rather than imitating one
+// it cannot, and every masked position attends to the reference through the
+// same bidirectional attention it uses for everything else. The unconditional
+// pass is unchanged -- still the masked frames alone -- which is what makes the
+// guidance push *towards* the reference voice.
+//
 // ## The loop
 //
 // Every audio position starts masked. Each step runs both passes, scores every
@@ -42,6 +56,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -110,8 +125,31 @@ struct OmniRequest {
     std::string instruct;
     /// Audio seconds to generate. Zero asks for the length heuristic.
     float duration_seconds = 0.0f;
+
+    // -- voice cloning -------------------------------------------------------
+    //
+    // A reference clip is not a separate mode. Its codes are prepended to the
+    // target frames as *already decided* positions and its transcript to the
+    // text, so the model is asked to continue a recording it can see rather
+    // than to imitate one it cannot. Everything else about the loop is the
+    // same.
+
+    /// What the reference clip says. Required alongside `ref_codes`: the model
+    /// has to know which part of the text it has already heard.
+    std::string ref_text;
+    /// The reference clip encoded, `[codebook][frame]`. Empty means no clone.
+    std::vector<std::vector<std::uint32_t>> ref_codes;
+    /// The reference clip's loudness before it was levelled for the encoder.
+    /// Zero means unknown, which leaves the output gain alone.
+    float ref_rms = 0.0f;
+
     OmniGenConfig gen;
     bool debug = false;
+
+    /// Frames of reference audio, or zero.
+    [[nodiscard]] std::size_t ref_frames() const {
+        return ref_codes.empty() ? 0 : ref_codes.front().size();
+    }
 };
 
 struct OmniResult {
@@ -141,7 +179,51 @@ struct OmniResult {
 [[nodiscard]] std::size_t omni_estimate_frames(std::string_view text,
                                                const OmniCodecConfig& codec);
 
-/// Build the conditional sequence: style markers, text, then masked frames.
+/// The same estimate, calibrated on a reference clip instead of the built-in
+/// phrase.
+///
+/// Strictly better when there is one: it measures this speaker's rate rather
+/// than an average one, so a slow voice gets the frames it needs. Falls back to
+/// the built-in reference when `ref_text` is empty or `ref_frames` is zero.
+[[nodiscard]] std::size_t omni_estimate_frames_from_reference(std::string_view text,
+                                                              std::string_view ref_text,
+                                                              std::size_t ref_frames,
+                                                              const OmniCodecConfig& codec);
+
+/// The reference's text normalisation, applied to the prompt with or without a
+/// reference clip.
+///
+/// Trims, joins the reference transcript in front, drops line breaks, folds
+/// runs of spaces and tabs, swaps fullwidth parentheses for ASCII ones, and
+/// removes whitespace next to a CJK character -- where a space is a typesetting
+/// artefact rather than a word boundary and would be spoken as a pause.
+[[nodiscard]] std::string omni_combine_text(std::string_view text, std::string_view ref_text);
+
+/// A reference clip, ready for the codec.
+struct OmniReference {
+    /// Mono, at the codec's sample rate, and a whole number of frames long.
+    std::vector<float> samples;
+    /// The clip's loudness *before* levelling, which the synthesised audio is
+    /// scaled back to at the end.
+    float rms = 0.0f;
+    /// Seconds of audio, for the caller to warn about.
+    [[nodiscard]] double seconds(const OmniCodecConfig& codec) const;
+};
+
+/// Prepare a reference recording: resample to the codec's rate, level it, and
+/// trim it to a whole number of frames.
+///
+/// The levelling matters more than it looks. The codec was fit on speech at a
+/// particular loudness, and a quiet recording encodes into a part of the
+/// codebook space that carries a quiet voice rather than that voice quietly.
+/// So a clip under 0.1 RMS is brought up to it, and the original loudness is
+/// restored on the way out.
+[[nodiscard]] Result<OmniReference> omni_prepare_reference(std::span<const float> samples,
+                                                           std::size_t sample_rate,
+                                                           const OmniCodecConfig& codec);
+
+/// Build the conditional sequence: style markers, text, reference codes if any,
+/// then masked frames.
 [[nodiscard]] Result<std::vector<OmniToken>> omni_build_conditional(
     const HfBpeTokenizer& tok, const Config6& cfg, const OmniRequest& request,
     std::size_t frames);
