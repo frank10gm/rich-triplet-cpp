@@ -31,6 +31,7 @@
 #include "rt/transformer2.hpp"
 #include "rt/transformer3.hpp"
 #include "rt/transformer4.hpp"
+#include "rt/omnivoice.hpp"
 #include "rt/orpheus.hpp"
 #include "rt/snac.hpp"
 #include "rt/transformer5.hpp"
@@ -150,6 +151,18 @@ struct CliArgs {
     bool no_audio_mask = false;
     /// --no-leading-bos : drop the BOS that vLLM's re-tokenization prepends
     bool no_leading_bos = false;
+    /// --language NAME : OmniVoice language hint
+    std::optional<std::string> language;
+    /// --instruct TEXT : OmniVoice free-text voice description
+    std::optional<std::string> instruct;
+    /// --duration S : audio seconds to generate; 0 uses the length heuristic
+    float duration = 0.0f;
+    /// --steps N : OmniVoice unmasking steps
+    std::size_t steps = 32;
+    /// --guidance G : classifier-free guidance scale; 0 disables it
+    float guidance = 2.0f;
+    /// --rope-interleaved : pair 2i with 2i+1 instead of i with i+head_dim/2
+    bool rope_interleaved = false;
 };
 
 void print_help();
@@ -234,6 +247,18 @@ template <typename T>
             a.no_audio_mask = true;
         } else if (arg == "--no-leading-bos") {
             a.no_leading_bos = true;
+        } else if (arg == "--language") {
+            a.language = take(i);
+        } else if (arg == "--instruct") {
+            a.instruct = take(i);
+        } else if (arg == "--duration") {
+            if (const auto v = take(i)) a.duration = parse_or<float>(*v, 0.0f);
+        } else if (arg == "--steps") {
+            if (const auto v = take(i)) a.steps = parse_or<std::size_t>(*v, 32);
+        } else if (arg == "--guidance") {
+            if (const auto v = take(i)) a.guidance = parse_or<float>(*v, 2.0f);
+        } else if (arg == "--rope-interleaved") {
+            a.rope_interleaved = true;
         } else if (arg == "--draft-len") {
             if (const auto v = take(i)) a.draft_len = parse_or<std::size_t>(*v, 4);
         } else if (arg == "--help" || arg == "-h") {
@@ -274,8 +299,8 @@ void print_help() {
         "  --tokenizer-dir DIR      Dir with tokenizer.json (for GGUF, where tokenizer is "
         "separate)\n");
     std::printf(
-        "  --model NAME             Architecture: gpt-oss | gemma3-1b | gemma3-4b | qwen35-4b | "
-        "qwen35-9b\n");
+        "  --model NAME             Architecture: gpt-oss | gemma3-1b | gemma3-4b | qwen35-0.8b |\n"
+        "                           qwen35-4b | qwen35-9b | orpheus-3b | omnivoice\n");
     std::printf("  --max-new N              Tokens to generate          [default: 200]\n");
     std::printf("  --temp T                 Sampling temperature        [default: 0.8]\n");
     std::printf("  --top-k K                Top-K cutoff (0=disabled)   [default: 40]\n");
@@ -294,6 +319,16 @@ void print_help() {
     std::printf("  --out PATH               Output WAV                  [default: out.wav]\n");
     std::printf("  --no-audio-mask          Allow sampling outside the audio token range\n");
     std::printf("  --no-leading-bos         Drop the leading BOS token from the prompt\n");
+    std::printf("\nOmniVoice (--model omnivoice):\n");
+    std::printf("  --language NAME          Language hint, e.g. Italian    [default: None]\n");
+    std::printf("  --instruct TEXT          Voice description              [default: None]\n");
+    std::printf("  --duration S             Audio seconds (0 = estimate)   [default: 0]\n");
+    std::printf("  --steps N                Unmasking steps                [default: 32]\n");
+    std::printf("  --guidance G             Guidance scale (0 = off)       [default: 2.0]\n");
+    std::printf("  --rope-interleaved       Use interleaved RoPE pairing (debugging; the\n");
+    std::printf("                           default half-split is the correct one)\n");
+    std::printf("  --weights PATH           omnivoice-base GGUF\n");
+    std::printf("  --snac PATH              omnivoice-tokenizer GGUF\n");
     std::printf("\n");
     std::printf("  --pretokenize S D        Tokenize text file S, write binary D.bin\n");
     std::printf("                           Uses char tokenizer built from S.\n");
@@ -436,6 +471,116 @@ void run_gpt_oss(const CliArgs& args, const std::string& prompt) {
         emit(tok->decode({static_cast<std::uint32_t>(tok_id)}));
     });
     std::printf("\n");
+}
+
+// =============================================================================
+// Generation mode -- OmniVoice masked-diffusion text to speech
+// =============================================================================
+
+void run_omnivoice(const CliArgs& args, const std::string& prompt) {
+    const std::string lm_path = args.weights.value_or("models/omnivoice-base-Q8_0.gguf");
+    const std::string codec_path = args.snac.value_or("models/omnivoice-tokenizer-Q8_0.gguf");
+    const std::string out_path = args.out.value_or("out.wav");
+
+    for (const std::string& p : {lm_path, codec_path}) {
+        if (!std::filesystem::exists(p)) {
+            die("OmniVoice weights not found at " + p +
+                "\n       Fetch both halves with:\n"
+                "         curl -L -o models/omnivoice-base-Q8_0.gguf \\\n"
+                "           https://huggingface.co/Serveurperso/OmniVoice-GGUF/resolve/main/"
+                "omnivoice-base-Q8_0.gguf\n"
+                "         curl -L -o models/omnivoice-tokenizer-Q8_0.gguf \\\n"
+                "           https://huggingface.co/Serveurperso/OmniVoice-GGUF/resolve/main/"
+                "omnivoice-tokenizer-Q8_0.gguf");
+        }
+    }
+
+    // The LM's GGUF carries its own byte-level vocabulary, so no separate
+    // tokenizer file is needed.
+    const Result<GgufFile> gguf = GgufFile::open(lm_path);
+    if (!gguf) {
+        die("failed to open GGUF: " + gguf.error());
+    }
+    const Result<HfBpeTokenizer> tok = load_gguf_tokenizer(*gguf);
+    if (!tok) {
+        die("failed to build the tokenizer from GGUF: " + tok.error());
+    }
+
+    Config6 cfg = Config6::omnivoice();
+    cfg.rope_pairing =
+        args.rope_interleaved ? RopePairing::Interleaved : RopePairing::HalfSplit;
+
+    std::fprintf(stderr, "[ OmniVoice ] Loading the language model from %s...\n",
+                 lm_path.c_str());
+    Result<OmniLm> lm = OmniLm::load(lm_path, cfg);
+    if (!lm) {
+        die("failed to load the language model: " + lm.error());
+    }
+    if (args.quantize) {
+        const std::size_t n = lm->quantize_projections_to_q4k();
+        std::fprintf(stderr, "[ OmniVoice ] Requantized %zu projections -> %.2f GB\n", n,
+                     static_cast<double>(lm->weight_bytes()) / 1e9);
+    }
+    release_memory_to_os();
+    print_rss("after weight load");
+
+    std::fprintf(stderr, "[ OmniVoice ] Loading the codec from %s...\n", codec_path.c_str());
+    const Result<OmniCodecDecoder> codec =
+        OmniCodecDecoder::load(codec_path, OmniCodecConfig::defaults());
+    if (!codec) {
+        die("failed to load the codec: " + codec.error());
+    }
+    std::fprintf(stderr, "[ OmniVoice ] Codec decoder: %zu parameters\n",
+                 codec->parameter_count());
+
+    OmniRequest request;
+    request.text = prompt;
+    request.language = args.language.value_or("");
+    request.instruct = args.instruct.value_or("");
+    request.duration_seconds = args.duration;
+    request.debug = args.debug;
+    request.gen.num_step = args.steps;
+    request.gen.guidance_scale = args.guidance;
+    request.gen.seed = args.seed;
+
+    char duration_field[32];
+    if (request.duration_seconds > 0.0f) {
+        std::snprintf(duration_field, sizeof(duration_field), "%.1fs",
+                      static_cast<double>(request.duration_seconds));
+    } else {
+        std::snprintf(duration_field, sizeof(duration_field), "estimated");
+    }
+    std::fprintf(stderr, "[ OmniVoice ] lang=%s steps=%zu guidance=%.2f duration=%s rope=%s\n",
+                 request.language.empty() ? "None" : request.language.c_str(),
+                 request.gen.num_step, static_cast<double>(request.gen.guidance_scale),
+                 duration_field, args.rope_interleaved ? "interleaved" : "half-split");
+    std::fprintf(stderr, "[ OmniVoice ] Synthesising: \"%s\"\n", prompt.c_str());
+
+    const Result<OmniResult> result = omni_synthesize(*lm, *codec, *tok, request);
+    if (!result) {
+        die("synthesis failed: " + result.error());
+    }
+
+    const WaveStats stats = wave_stats(result->samples);
+    std::fprintf(stderr,
+                 "[ OmniVoice ] %zu frames, %zu prompt tokens, %zu forward passes -> %zu samples\n",
+                 result->frames, result->prompt_tokens, result->forward_passes,
+                 result->samples.size());
+    std::fprintf(stderr,
+                 "[ OmniVoice ] %.2f s audio in %.2f s generate + %.2f s decode (RTF %.2f)\n",
+                 result->audio_seconds(), result->generate_seconds, result->decode_seconds,
+                 result->realtime_factor());
+    std::fprintf(stderr, "[ OmniVoice ] waveform: %s\n", stats.describe().c_str());
+    if (!stats.looks_like_speech()) {
+        std::fprintf(stderr,
+                     "[ OmniVoice ] Warning: the waveform statistics do not look like speech\n");
+    }
+
+    if (const Result<void> ok = write_wav(out_path, result->samples, result->sample_rate, 1);
+        !ok) {
+        die("failed to write the WAV: " + ok.error());
+    }
+    std::fprintf(stderr, "[ OmniVoice ] Wrote %s\n", out_path.c_str());
 }
 
 // =============================================================================
@@ -927,15 +1072,18 @@ int main(int argc, char** argv) {
     // Generation mode
     // -------------------------------------------------------------------------
     if (args.prompt) {
+        const bool is_omnivoice = args.model && args.model->starts_with("omnivoice");
         const bool is_orpheus = args.model && args.model->starts_with("orpheus");
         const bool is_qwen35 = args.model && args.model->starts_with("qwen35");
         // A .gguf file with no --model is assumed to be Gemma 3, which is the
         // only architecture this CLI ever loaded from GGUF first.
         const bool is_gemma3 = args.tokenizer_model.has_value() ||
                                (args.model && args.model->starts_with("gemma3")) ||
-                               (!is_qwen35 && !is_orpheus && args.weights &&
+                               (!is_qwen35 && !is_orpheus && !is_omnivoice && args.weights &&
                                 args.weights->ends_with(".gguf"));
-        if (is_orpheus) {
+        if (is_omnivoice) {
+            run_omnivoice(args, *args.prompt);
+        } else if (is_orpheus) {
             if (!args.weights) {
                 die("--model orpheus-3b needs --weights pointing at the GGUF file");
             }

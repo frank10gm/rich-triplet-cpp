@@ -4,13 +4,13 @@ A complete LLM stack built from first principles in C++23, **with no ML dependen
 
 This is a port of [the Rust original](../rich-triplet), kept numerically identical: the parity work behind it is described in [Porting notes](#porting-notes).
 
-Supports **Gemma 3** and **Qwen 3.5** text inference on Apple Silicon with Q4_K_M / Q4_0 GGUF weights and full-graph Metal GPU decode, plus **Orpheus** text-to-speech synthesis end to end in English, Italian and Spanish — text in, WAV out, including the SNAC neural audio codec.
+Supports **Gemma 3** and **Qwen 3.5** text inference on Apple Silicon with Q4_K_M / Q4_0 GGUF weights and full-graph Metal GPU decode, plus two complete text-to-speech stacks — text in, WAV out, neural audio codecs included: **Orpheus**, an autoregressive Llama 3.2 emitting SNAC codes, and **OmniVoice**, a masked-diffusion Qwen3 that unmasks eight codebooks in parallel.
 
 ---
 
 ## What this project is
 
-Six transformer implementations (GPT-2 scalar, GPT-2 tensor, GPT-OSS, Gemma 3, Qwen 3.5, Llama 3.2), a neural audio codec decoder, a tensor autodiff engine, Apple Metal GPU acceleration, Flash Attention, GGUF / safetensors / torch-pickle weight loading, and a CLI for inference, training and speech synthesis.
+Seven transformer implementations (GPT-2 scalar, GPT-2 tensor, GPT-OSS, Gemma 3, Qwen 3.5, Llama 3.2, and a bidirectional Qwen3 used as a diffusion model), two neural audio codec decoders, a tensor autodiff engine, Apple Metal GPU acceleration, Flash Attention, GGUF / safetensors / torch-pickle weight loading, and a CLI for inference, training and speech synthesis.
 
 | File | What you understand after writing it |
 |---|---|
@@ -23,9 +23,13 @@ Six transformer implementations (GPT-2 scalar, GPT-2 tensor, GPT-OSS, Gemma 3, Q
 | `transformer4.cpp` | Gemma 3: NeoX RoPE, sliding window, 4-norm blocks, GGUF |
 | `transformer_qwen35.cpp` | Qwen 3.5: Gated DeltaNet + softmax attention hybrid |
 | `transformer5.cpp` | Llama 3.2: the two RoPE pair conventions, and why GGUF needs the other one |
+| `transformer6.cpp` | Bidirectional attention, and what a model without a KV cache costs |
 | `conv1d.cpp` | Dilated, grouped and transposed 1-D convolution; Snake; weight norm |
 | `snac.cpp` | Multi-scale residual vector quantization, and a codec decoder |
 | `orpheus.cpp` | Audio tokens: slot offsets, frame de-interleaving, resynchronisation |
+| `omnivoice.cpp` | Masked diffusion decoding: confidence unmasking, classifier-free guidance |
+| `omnivoice_codec.cpp` | Dense residual convolution, and why im2col earns its memory |
+| `duration.cpp` | That Unicode has opinions about how long a character takes to say |
 | `torch_pickle.cpp` | ZIP central directories, and just enough pickle to be safe |
 | `wav.cpp` | RIFF, and how to tell speech from noise without listening |
 | `gguf.cpp` | GGUF file format: Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, BF16, F16, F32 |
@@ -250,12 +254,165 @@ invisible in the audio itself.
 
 ---
 
+## OmniVoice text to speech
+
+```bash
+# Both halves of the model -- the LM and its codec (0.94 GB together)
+curl -L -o models/omnivoice-base-Q8_0.gguf \
+  https://huggingface.co/Serveurperso/OmniVoice-GGUF/resolve/main/omnivoice-base-Q8_0.gguf
+curl -L -o models/omnivoice-tokenizer-Q8_0.gguf \
+  https://huggingface.co/Serveurperso/OmniVoice-GGUF/resolve/main/omnivoice-tokenizer-Q8_0.gguf
+
+./build/rich-triplet \
+  --model omnivoice \
+  --prompt "Ciao, mi chiamo Giulia. Oggi è una bella giornata a Roma." \
+  --language Italian \
+  --steps 12 \
+  --out giulia.wav
+```
+
+OmniVoice is a **masked diffusion** language model, not an autoregressive one,
+and that single fact reaches all the way down into the attention kernel. It is
+also a much smaller model than Orpheus — a Qwen3 0.6B backbone against a Llama
+3.2 3B — so both halves together are 0.94 GB on disk against Orpheus's 2.4–3.5.
+Speed depends on `--steps`: at 12 a 4 s clip takes about 8 s, at the reference
+default of 32 about 21, which is where Orpheus lands too.
+
+`--language` and `--instruct` are free text, not enumerations: there is no
+voice list, because a voice is described rather than named. `--instruct
+"a calm young woman"` is a valid request, and so is leaving it out.
+
+### Two GGUF files, and what is in each
+
+| | `omnivoice-base` | `omnivoice-tokenizer` |
+|---|---|---|
+| On disk | 0.66 GB | 0.29 GB |
+| Holds | the diffusion LM | the audio codec |
+| Loaded | 312 tensors, 1.23 GB resident | 21.6 M parameters |
+| Also carries | its own 151 676-entry vocabulary | the analysis half, unused |
+
+The LM's GGUF embeds its tokenizer, so there is no `--tokenizer-dir`. The
+codec's file is about 60% unused: the `acoustic_encoder`, `encoder_semantic`
+and a 12-layer wav2vec2-style `semantic_model` are the analysis path, needed to
+turn reference audio into codes for voice cloning. Synthesis needs none of
+them, so roughly 300 of its 486 tensors are skipped at load.
+
+### How it works
+
+1. **Every audio position starts masked.** The sequence is built once — style
+   markers, language, instruction, text, then `N` masked frames — and its
+   length is fixed before a single sample exists.
+2. **Each step runs the whole sequence**, scores every `(codebook, position)`
+   pair by confidence, and unmasks the `k` most confident, where `k` comes from
+   a warped timestep schedule. After `--steps` steps everything is decided.
+3. **Classifier-free guidance means two passes per step**: one conditioned on
+   the text, one on the masked frames alone. `log_probs = c + g * (c - u)`.
+4. **A layer penalty makes decoding coarse to fine.** Codebook 0 is unpenalised
+   and is decided first; the later codebooks condition on what it chose.
+5. **The codec reconstructs the waveform** from all eight codebooks at one
+   rate, upsampling by 8, 5, 4, 2 and 3 — exactly 960 samples per frame, so
+   25 Hz at 24 kHz.
+
+### Why there is no KV cache
+
+Unmasking a position changes the hidden state of every position that attends to
+it, and under a bidirectional mask that is all of them. Nothing computed at
+step *n* is still valid at step *n+1*, so there is nothing to cache.
+
+The same reasoning forces bidirectional attention: a masked position has to see
+the positions *after* it, or the first step would have nothing to condition on.
+Every other attention path in this project is causal, so this one needed its own
+kernel, `bidirectional_gqa_attention`.
+
+The head is likewise not the usual one. Eight codebooks are predicted at once by
+a single `[1024 -> 8200]` matmul reshaped to `[T, 8, 1025]` — the extra entry
+per codebook is its mask token. A position's *input* embedding is the sum across
+all eight codebooks, so a fully masked position still has a well-defined
+embedding: the sum of the eight mask rows.
+
+### `--steps` is the quality/speed dial
+
+Cost is `steps * 2` full-sequence forward passes and nothing else, so it is
+almost exactly linear. Measured on an M3 Pro (18 GB, CPU build), synthesising
+4 s of Italian:
+
+| `--steps` | Realtime factor | Wall clock for 4 s |
+|---|---|---|
+| 8 | 1.30 | 5.2 s |
+| 12 | 1.96 | 7.9 s |
+| 16 | 2.46 | 9.8 s |
+| 32 | 5.17 | 20.7 s |
+
+The default stays at 32 because that is the reference's. Whether a lower one is
+free is a question about how it *sounds*, and none of the numbers this project
+prints can answer it — the waveform statistics look like speech across the whole
+range, and only stop doing so at the extreme, where a single step produces
+something the check flags and warns about. Picking a cheaper default needs a
+listening comparison that has not been done yet.
+
+### Length has to be decided in advance
+
+A diffusion model cannot stop early: every frame exists, masked, from the first
+step. Get the length wrong and the failure is not graceful — measured on one
+sentence, asking for 2 s of a 4 s phrase truncated it mid-sentence, and asking
+for 10 s collapsed into 98% silence at a peak of 0.001.
+
+So `duration.cpp` ports the reference's `RuleDurationEstimator`, which is not a
+neural model but a lookup table. Every character gets a phonetic weight
+relative to one Latin letter — a CJK ideograph is a whole syllable at 3.0, a
+combining accent is silent at 0.0, a digit is 3.5 because "2024" is four
+characters and fourteen letters' worth of speech — and the sum is scaled
+against "Nice to meet you." at 25 frames.
+
+Unicode general category is consulted *before* the script block, which is the
+part that is easy to get backwards: a Devanagari vowel sign sits inside the
+Devanagari block but is a combining mark, and charging it 1.8 would inflate
+every Hindi estimate. Below 50 frames the result is pulled up a cube-root
+curve, because the fixed costs of an utterance — onset, final lengthening, the
+breath at the end — do not shrink with the text.
+
+The port was checked exhaustively rather than by sampling: all 1 112 064
+Unicode code points were classified by both implementations and compared, and
+they agree everywhere. That is a one-off harness, not a test in the suite —
+running it needs Python's `unicodedata`, which is the thing being replaced.
+
+`--duration S` overrides the whole thing.
+
+### Diagnosing it
+
+The same rule as Orpheus applies, and harder: every fault sounds identical.
+`wave_stats` prints on every run and the exact length invariants hold here too —
+each upsampling block multiplies its input length by exactly its stride, and
+`frames * 960` has no slack.
+
+One trap is worth naming because no automated check catches it. RoPE can pair
+dimension `i` with `i + head_dim/2` (half-split) or `2i` with `2i+1`
+(interleaved), and the right answer depends on whether the GGUF converter
+permuted the Q and K weight rows — llama.cpp permutes for the `llama`
+architecture and not for Qwen3. So Orpheus needs interleaved and OmniVoice needs
+half-split, off the same file format.
+
+**Half-split here is confirmed by listening, not by measurement.** Both settings
+produce finite, in-range, speech-shaped output that passes every check in the
+suite, because the two conventions rotate by the same angles and differ only in
+which pairs receive them. Half-split is intelligible Italian; interleaved is
+not. The only numeric hint was interleaved's DC offset of -0.03 against
+half-split's -0.0001, with a zero-crossing rate of 0.009 — rumble rather than
+voice — and that is too weak to have trusted alone. `--rope-interleaved` stays
+as the first thing to try when a *new* checkpoint sounds wrong.
+
+The model and its codec are `k2-fsa/OmniVoice` (Apache 2.0, Xiaomi Corp.),
+re-uploaded as GGUF by a third party; the backbone is Qwen3-0.6B, also
+Apache 2.0.
+
+---
+
 ## CLI options
 
 | Flag | Default | Description |
 |---|---|---|
 | `--prompt TEXT` | — | Text to complete |
-| `--model NAME` | — | `gpt-oss`, `gemma3-1b`, `gemma3-4b`, `qwen35-0.8b`, `qwen35-4b`, `qwen35-9b`, `orpheus-3b` |
+| `--model NAME` | — | `gpt-oss`, `gemma3-1b`, `gemma3-4b`, `qwen35-0.8b`, `qwen35-4b`, `qwen35-9b`, `orpheus-3b`, `omnivoice` |
 | `--weights PATH` | — | GGUF file or safetensors directory |
 | `--tokenizer-dir DIR` | — | Directory containing `tokenizer.json` |
 | `--vocab PATH` / `--merges PATH` | — | BPE files, for GPT-OSS |
@@ -273,27 +430,33 @@ invisible in the audio itself.
 | `--pretokenize S D` | — | Tokenize text file `S` into binary `D`, then exit |
 | `--benchmark` | off | Scalar autograd vs tensor autodiff benchmark |
 | `--voice NAME` | `tara` | Orpheus speaker |
-| `--snac PATH` | `models/snac_24khz.bin` | SNAC 24 kHz codec checkpoint |
+| `--snac PATH` | `models/snac_24khz.bin` | Codec checkpoint — SNAC for Orpheus, the tokenizer GGUF for OmniVoice |
 | `--out PATH` | `out.wav` | Where to write the synthesised audio |
 | `--no-audio-mask` | off | Let Orpheus sample outside the audio token range |
 | `--no-leading-bos` | off | Drop the leading BOS from the Orpheus prompt |
+| `--language NAME` | `None` | OmniVoice language hint, e.g. `Italian` |
+| `--instruct TEXT` | `None` | OmniVoice voice description, e.g. `a calm young woman` |
+| `--duration S` | 0 | OmniVoice audio seconds; 0 estimates from the text |
+| `--steps N` | 32 | OmniVoice unmasking steps — the quality/speed dial |
+| `--guidance G` | 2.0 | OmniVoice classifier-free guidance; 0 halves the work |
+| `--rope-interleaved` | off | Use interleaved RoPE pairing (debugging only) |
 
 ---
 
 ## Running tests
 
 ```bash
-./build/tests/rt_tests          # 401 cases
-./build-metal/tests/rt_tests    # 413 cases, including the GPU kernels
+./build/tests/rt_tests          # 443 cases
+./build-metal/tests/rt_tests    # 455 cases, including the GPU kernels
 ```
 
 Covers matrix ops, gradient correctness against finite differences, attention
 shapes, Flash Attention, Q4_K/BF16 quantization, GGUF, safetensors and
 torch-pickle parsing, all four tokenizers, every architecture, 1-D convolution
-against reference loops, the SNAC decoder, RIFF output, the Metal kernels, and
-the weight-loading paths.
+against reference loops, both codec decoders, RIFF output, the duration
+estimator's character classes, the Metal kernels, and the weight-loading paths.
 
-A further 12 cases are hidden by default because they need downloaded weights:
+A further 22 cases are hidden by default because they need downloaded weights:
 
 ```bash
 ./build/tests/rt_tests '[.integration]'   # real checkpoints, seconds
@@ -309,6 +472,13 @@ its logits identically to running N-1 through prefill and the last through the
 incremental decode path. It needs no reference implementation, and it separates
 a KV-cache or RoPE-offset bug from an architecture one — which otherwise
 present the same way.
+
+The OmniVoice half is checked mostly *without* weights, because its invariants
+are arithmetic: each decoder block multiplies its input length by exactly its
+stride, the full chain by exactly 960, the unmask schedule accounts for every
+`(codebook, position)` pair with none left masked, and the duration estimator
+puts each script, category and boundary code point in the class the reference
+does. What needs the checkpoint is only that it loads and is deterministic.
 
 ---
 
@@ -370,10 +540,15 @@ src/
 ├── transformer_qwen35_load.cpp  Qwen 3.5 weight loading and generation
 ├── transformer5.cpp             Llama 3.2 architecture, RoPE, large-vocab sampling
 ├── transformer5_load.cpp        Llama 3.2 GGUF loading, embedded tokenizer
+├── transformer6.cpp             Bidirectional Qwen3, multi-codebook head
+├── transformer6_load.cpp        OmniVoice GGUF loading
 │
-├── conv1d.cpp          1-D convolution: dilated, grouped, transposed; Snake
+├── conv1d.cpp          1-D convolution: dilated, grouped, transposed; Snake, im2col
 ├── snac.cpp            SNAC 24 kHz codec decoder and residual vector quantizer
 ├── orpheus.cpp         Audio-token protocol, frame de-interleaving, synthesis
+├── omnivoice.cpp       Masked-diffusion sampler: schedules, guidance, unmasking
+├── omnivoice_codec.cpp OmniVoice codec decoder — 8 codebooks, 960x upsampling
+├── duration.cpp        Rule-based duration estimation from character weights
 ├── torch_pickle.cpp    PyTorch .bin reader: ZIP container + pickle manifest
 ├── wav.cpp             16-bit PCM WAV output and waveform statistics
 │
@@ -429,15 +604,18 @@ Local layers use theta = 10000 and freq_scale = 1.0; global layers (every sixth)
 Rotary embeddings can pair dimension `i` with `i + head_dim/2` (half-split) or
 `2i` with `2i + 1` (interleaved). HuggingFace's Llama uses half-split;
 llama.cpp uses interleaved and reconciles the two by permuting the Q and K
-weight rows during conversion. So Gemma 3 and Llama 3.2 need *different*
+weight rows during conversion. So Gemma 3, Llama 3.2 and Qwen3 need *different*
 conventions off the same file format — `convert_hf_to_gguf.py` permutes for
-llama and not for Gemma.
+llama and not for the other two. Orpheus is a Llama, so it takes interleaved;
+OmniVoice is a Qwen3, so it takes half-split.
 
 Both conventions rotate by the same angles and differ only in which pairs those
 angles apply to, so at low positions — where every rotation is near identity —
-they agree to several decimals. They separate as position grows. In a speech
-model that means the first three or four tokens come out right and everything
-after is noise.
+they agree to several decimals. They separate as position grows. In an
+autoregressive speech model that means the first three or four tokens come out
+right and everything after is noise. In a diffusion one there is no such tell:
+the whole sequence is wrong at once, and the waveform statistics stay
+speech-shaped either way. Only listening separates them.
 
 ### Llama 3 RoPE scaling
 
@@ -504,14 +682,53 @@ out = S^T q
 
 so decode is O(1) in sequence length rather than O(T).
 
+### Masked diffusion decoding
+
+An autoregressive model spends its compute on one new position at a time and
+caches the rest. A masked diffusion model does the opposite: every position
+exists from the start, all of them masked, and each step re-runs the entire
+sequence to decide which few to commit.
+
+```
+for step in 0..num_step:
+    c = model(text + frames)          # conditional
+    u = model(frames)                 # unconditional
+    log_probs = log_softmax(c + g * (c - u))
+    score     = max(log_probs) - codebook_index * layer_penalty
+    unmask the top k of score, ignoring what is already decided
+```
+
+That trades a memory-bound GEMV per token for a compute-bound matmul over the
+whole sequence — the shape BLAS is good at — but it forfeits the KV cache
+entirely, because unmasking one position invalidates every hidden state that
+attends to it. Two passes per step is the price of classifier-free guidance,
+and the layer penalty is what makes decoding coarse to fine: codebook 0 is
+unpenalised, so it commits first and the rest condition on it.
+
+### How long is this text, in frames?
+
+A diffusion model has to know its output length before it generates anything,
+so OmniVoice ships a rule-based estimator: a phonetic weight per character,
+summed and scaled against a reference phrase. The weights say something real
+about writing systems — a CJK ideograph is a syllable (3.0), a Hangul block is
+close (2.5), an abugida consonant carries its vowel (1.8), a Latin letter is
+the 1.0 baseline, a combining mark is silent (0.0), and a digit is 3.5 because
+it is read as a word.
+
+The ordering is the subtle part. Unicode *category* is checked before Unicode
+*block*, so a Devanagari vowel sign is a mark rather than an Indic letter and a
+full stop inside a CJK run is a pause rather than an ideograph. Getting that
+backwards costs nothing visible and inflates every estimate for half the
+world's scripts.
+
 ---
 
 ## Stats
 
-- ~27,100 lines of C++, Objective-C++ and MSL, plus ~9,700 of tests
-- 413 test cases with Metal, 401 without, plus 12 that need downloaded weights
+- ~30,100 lines of C++, Objective-C++ and MSL, plus ~10,800 of tests
+- 455 test cases with Metal, 443 without, plus 22 that need downloaded weights
 - Zero ML dependencies (Accelerate and Metal are system frameworks)
 - Every published weight format read from scratch: GGUF, safetensors, and
   PyTorch's ZIP-plus-pickle `.bin`
 - The ported modules are bit-exact against the Rust reference, module by
-  module; the text-to-speech stack has no Rust counterpart and is new here
+  module; both text-to-speech stacks have no Rust counterpart and are new here

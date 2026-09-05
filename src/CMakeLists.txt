@@ -7,6 +7,7 @@ target_sources(rt_core PRIVATE
   torch_pickle.cpp
   snac.cpp
   wav.cpp
+  duration.cpp
   ndarray.cpp
   tensor_node.cpp
   nn2.cpp
@@ -17,6 +18,10 @@ target_sources(rt_core PRIVATE
   transformer5.cpp
   transformer5_load.cpp
   orpheus.cpp
+  omnivoice_codec.cpp
+  transformer6.cpp
+  transformer6_load.cpp
+  omnivoice.cpp
   transformer_qwen35.cpp
   transformer_qwen35_load.cpp
   tensor.cpp

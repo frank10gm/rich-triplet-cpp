@@ -7,8 +7,11 @@ add_executable(rt_tests
   test_torch_pickle.cpp
   test_snac.cpp
   test_orpheus.cpp
+  test_omnivoice_codec.cpp
+  test_omnivoice.cpp
   test_transformer5.cpp
   test_wav.cpp
+  test_duration.cpp
   test_ndarray.cpp
   test_tensor_node.cpp
   test_nn2.cpp
