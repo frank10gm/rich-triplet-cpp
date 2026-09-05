@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -17,7 +18,74 @@ using namespace rt;
 
 namespace {
 
-constexpr const char* kGgufPath = "models/orpheus-3b-0.1-ft-q4_k_m.gguf";
+/// An Orpheus checkpoint found on disk, with text it can actually speak.
+///
+/// The published fine-tunes share an architecture and a vocabulary but not a
+/// language, and which one is present depends on what has been downloaded. So
+/// the integration tests discover the checkpoint rather than naming it, and
+/// take their prompt from whatever `general.languages` it declares -- an
+/// English sentence in an Italian voice would test very little.
+struct FoundModel {
+    std::string path;
+    std::string language;
+    std::string prompt;
+    std::string voice;
+};
+
+[[nodiscard]] std::optional<FoundModel> find_orpheus_model() {
+    if (!std::filesystem::is_directory("models")) {
+        return std::nullopt;
+    }
+    for (const std::filesystem::directory_entry& entry :
+         std::filesystem::directory_iterator("models")) {
+        if (entry.path().extension() != ".gguf") {
+            continue;
+        }
+        const Result<GgufFile> gguf = GgufFile::open(entry.path().string());
+        if (!gguf) {
+            continue;
+        }
+        const auto arch = gguf->metadata.find("general.architecture");
+        if (arch == gguf->metadata.end() || arch->second.as_str() != "llama") {
+            continue;
+        }
+        // The audio-token arithmetic depends on this exact vocabulary.
+        const auto vocab = gguf->metadata.find("llama.vocab_size");
+        if (vocab == gguf->metadata.end() || vocab->second.as_u64() != 156940u) {
+            continue;
+        }
+
+        FoundModel found;
+        found.path = entry.path().string();
+        found.language = "en";
+        if (const auto langs = gguf->metadata.find("general.languages");
+            langs != gguf->metadata.end()) {
+            if (const std::vector<GgufMetaValue>* array = langs->second.as_array()) {
+                for (const GgufMetaValue& v : *array) {
+                    if (const std::optional<std::string_view> code = v.as_str()) {
+                        // Prefer a language this build has voices for.
+                        if (!orpheus_voices_for(*code).empty()) {
+                            found.language = std::string(*code);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (found.language == "it") {
+            found.prompt = "Ciao, oggi e una bella giornata.";
+        } else if (found.language == "es") {
+            found.prompt = "Hola, hoy hace un dia estupendo.";
+        } else {
+            found.prompt = "Hello, my name is Tara.";
+        }
+        const std::vector<std::string> voices = orpheus_voices_for(found.language);
+        found.voice = voices.empty() ? "tara" : voices.front();
+        return found;
+    }
+    return std::nullopt;
+}
 
 /// The id of the code-`code` token for slot `slot`.
 [[nodiscard]] std::size_t audio_id(const OrpheusConfig& cfg, std::size_t slot, std::size_t code) {
@@ -62,11 +130,22 @@ TEST_CASE("the audio range fits inside the Orpheus vocabulary", "[orpheus]") {
     REQUIRE(cfg.audio_token_limit() <= Config5::orpheus_3b().vocab_size);
 }
 
-TEST_CASE("voices list the trained speakers", "[orpheus]") {
-    REQUIRE(orpheus_voices().size() == 8);
+TEST_CASE("voices carry the language of their checkpoint", "[orpheus]") {
     REQUIRE(orpheus_voice_known("tara"));
-    REQUIRE(orpheus_voice_known("zoe"));
+    REQUIRE(orpheus_voice_known("giulia"));
     REQUIRE(!orpheus_voice_known("nobody"));
+
+    REQUIRE(orpheus_voice_language("tara") == "en");
+    REQUIRE(orpheus_voice_language("giulia") == "it");
+    REQUIRE(orpheus_voice_language("javi") == "es");
+    REQUIRE(orpheus_voice_language("nobody").empty());
+
+    // The English fine-tune has eight speakers; the Spanish/Italian research
+    // release has three each.
+    REQUIRE(orpheus_voices_for("en").size() == 8);
+    REQUIRE(orpheus_voices_for("it") == std::vector<std::string>{"pietro", "giulia", "carlo"});
+    REQUIRE(orpheus_voices_for("es") == std::vector<std::string>{"javi", "sergio", "maria"});
+    REQUIRE(orpheus_voices_for("xx").empty());
 }
 
 TEST_CASE("default sampling matches the reference engine", "[orpheus]") {
@@ -223,10 +302,11 @@ TEST_CASE("OrpheusCodeStream output is accepted by the SNAC quantizer", "[orpheu
 // =============================================================================
 
 TEST_CASE("orpheus_build_prompt frames the encoded text", "[orpheus][.integration]") {
-    if (!std::filesystem::exists(kGgufPath)) {
-        SKIP("models/orpheus-3b-0.1-ft-q4_k_m.gguf not present");
+    const std::optional<FoundModel> model = find_orpheus_model();
+    if (!model) {
+        SKIP("no Orpheus GGUF in models/");
     }
-    const Result<GgufFile> gguf = GgufFile::open(kGgufPath);
+    const Result<GgufFile> gguf = GgufFile::open(model->path);
     REQUIRE(gguf.has_value());
     const Result<HfBpeTokenizer> tok = load_gguf_tokenizer(*gguf);
     if (!tok.has_value()) {
@@ -255,10 +335,11 @@ TEST_CASE("orpheus_build_prompt frames the encoded text", "[orpheus][.integratio
 }
 
 TEST_CASE("orpheus_build_prompt can drop the leading BOS", "[orpheus][.integration]") {
-    if (!std::filesystem::exists(kGgufPath)) {
-        SKIP("models/orpheus-3b-0.1-ft-q4_k_m.gguf not present");
+    const std::optional<FoundModel> model = find_orpheus_model();
+    if (!model) {
+        SKIP("no Orpheus GGUF in models/");
     }
-    const Result<GgufFile> gguf = GgufFile::open(kGgufPath);
+    const Result<GgufFile> gguf = GgufFile::open(model->path);
     REQUIRE(gguf.has_value());
     const Result<HfBpeTokenizer> tok = load_gguf_tokenizer(*gguf);
     REQUIRE(tok.has_value());
@@ -299,10 +380,11 @@ TEST_CASE("orpheus_build_prompt rejects empty text", "[orpheus]") {
 // =============================================================================
 
 TEST_CASE("load_gguf_tokenizer reads the embedded vocabulary", "[orpheus][.integration]") {
-    if (!std::filesystem::exists(kGgufPath)) {
-        SKIP("models/orpheus-3b-0.1-ft-q4_k_m.gguf not present");
+    const std::optional<FoundModel> model = find_orpheus_model();
+    if (!model) {
+        SKIP("no Orpheus GGUF in models/");
     }
-    const Result<GgufFile> gguf = GgufFile::open(kGgufPath);
+    const Result<GgufFile> gguf = GgufFile::open(model->path);
     REQUIRE(gguf.has_value());
     const Result<HfBpeTokenizer> tok = load_gguf_tokenizer(*gguf);
     if (!tok.has_value()) {
@@ -327,10 +409,11 @@ TEST_CASE("load_gguf_tokenizer reads the embedded vocabulary", "[orpheus][.integ
 }
 
 TEST_CASE("the GGUF tokenizer groups digits the Llama 3 way", "[orpheus][.integration]") {
-    if (!std::filesystem::exists(kGgufPath)) {
-        SKIP("models/orpheus-3b-0.1-ft-q4_k_m.gguf not present");
+    const std::optional<FoundModel> model = find_orpheus_model();
+    if (!model) {
+        SKIP("no Orpheus GGUF in models/");
     }
-    const Result<GgufFile> gguf = GgufFile::open(kGgufPath);
+    const Result<GgufFile> gguf = GgufFile::open(model->path);
     REQUIRE(gguf.has_value());
     const Result<HfBpeTokenizer> tok = load_gguf_tokenizer(*gguf);
     REQUIRE(tok.has_value());
@@ -357,14 +440,15 @@ TEST_CASE("the GGUF tokenizer groups digits the Llama 3 way", "[orpheus][.integr
 // =============================================================================
 
 TEST_CASE("rope_freqs divisors stretch the low-frequency bands", "[orpheus][.integration]") {
-    if (!std::filesystem::exists(kGgufPath)) {
-        SKIP("models/orpheus-3b-0.1-ft-q4_k_m.gguf not present");
+    const std::optional<FoundModel> found = find_orpheus_model();
+    if (!found) {
+        SKIP("no Orpheus GGUF in models/");
     }
     LlamaModel model = LlamaModel::new_for_inference(Config5::orpheus_3b());
     // The unscaled frequencies, before the file is read.
     const std::vector<float> plain = model.config.inv_freq();
 
-    const Result<GgufFile> gguf = GgufFile::open(kGgufPath);
+    const Result<GgufFile> gguf = GgufFile::open(found->path);
     REQUIRE(gguf.has_value());
     const std::optional<std::size_t> idx = gguf->find_tensor("rope_freqs.weight");
     REQUIRE(idx.has_value());
@@ -395,18 +479,19 @@ TEST_CASE("rope_freqs divisors stretch the low-frequency bands", "[orpheus][.int
 TEST_CASE("Orpheus synthesises speech-shaped audio", "[orpheus][.e2e]") {
     // Tagged separately from [.integration]: this one loads 2.4 GB of weights
     // and generates, so it is a minute of work rather than a second.
-    if (!std::filesystem::exists(kGgufPath) ||
-        !std::filesystem::exists("models/snac_24khz.bin")) {
+    const std::optional<FoundModel> found = find_orpheus_model();
+    if (!found || !std::filesystem::exists("models/snac_24khz.bin")) {
         SKIP("Orpheus or SNAC weights not present");
     }
+    INFO("using " << found->path << " (" << found->language << ", voice " << found->voice << ")");
 
-    const Result<GgufFile> gguf = GgufFile::open(kGgufPath);
+    const Result<GgufFile> gguf = GgufFile::open(found->path);
     REQUIRE(gguf.has_value());
     const Result<HfBpeTokenizer> tok = load_gguf_tokenizer(*gguf);
     REQUIRE(tok.has_value());
 
     LlamaModel model = LlamaModel::new_for_inference(Config5::orpheus_3b());
-    const Result<void> loaded = model.load_weights_from_gguf(kGgufPath);
+    const Result<void> loaded = model.load_weights_from_gguf(found->path);
     if (!loaded.has_value()) {
         FAIL(loaded.error());
     }
@@ -417,8 +502,8 @@ TEST_CASE("Orpheus synthesises speech-shaped audio", "[orpheus][.e2e]") {
     REQUIRE(snac.has_value());
 
     OrpheusRequest request;
-    request.text = "Hello, my name is Tara.";
-    request.voice = "tara";
+    request.text = found->prompt;
+    request.voice = found->voice;
     request.max_new = 210;  // 30 groups, about 2.5 s
     request.sampling = orpheus_default_sampling(1234);
 
@@ -454,11 +539,12 @@ TEST_CASE("prefill and incremental decode agree", "[orpheus][.e2e]") {
     // through the incremental decode path. Any disagreement is a KV cache or
     // RoPE-offset bug, which otherwise shows up only as audio that starts
     // plausible and degrades.
-    if (!std::filesystem::exists(kGgufPath)) {
-        SKIP("Orpheus weights not present");
+    const std::optional<FoundModel> found = find_orpheus_model();
+    if (!found) {
+        SKIP("no Orpheus GGUF in models/");
     }
     LlamaModel model = LlamaModel::new_for_inference(Config5::orpheus_3b());
-    const Result<void> loaded = model.load_weights_from_gguf(kGgufPath);
+    const Result<void> loaded = model.load_weights_from_gguf(found->path);
     if (!loaded.has_value()) {
         FAIL(loaded.error());
     }

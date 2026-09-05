@@ -260,6 +260,33 @@ class LlamaModel {
     /// gamma` convention is Gemma's alone.
     [[nodiscard]] Result<void> load_weights_from_gguf(const std::string& path);
 
+    /// How many projections are currently held as BF16 rather than Q4_K.
+    ///
+    /// The signal for whether a checkpoint was stored at uniform higher
+    /// precision. A Q4_K_M file keeps most projections native and widens only
+    /// the deliberately-higher-precision minority, so this stays small; a Q8_0
+    /// or F16 file widens all of them.
+    [[nodiscard]] std::size_t bf16_projection_count() const;
+
+    /// Total projections, `7 * layers + 1` for the lm_head.
+    [[nodiscard]] std::size_t projection_count() const;
+
+    /// Requantize every BF16 projection to Q4_K, freeing the BF16 copies.
+    ///
+    /// For files stored at a uniform higher precision. A Q8_0 checkpoint has no
+    /// Q4_K tensors at all, so this loader widens every one of them to BF16 --
+    /// 2 bytes an element, about 6.6 GB for a 3B model, and roughly 3.5x the
+    /// per-token memory traffic of Q4_K. Requantizing brings both back down.
+    ///
+    /// Do **not** call this on a Q4_K_M file. That format deliberately keeps
+    /// `attn_v` and `ffn_down` at Q6_K because they are the quality-sensitive
+    /// projections; flattening them to Q4_K discards a choice the quantizer
+    /// made on purpose. Tensors already stored as Q4_K are untouched either
+    /// way, so the damage would be exactly to the ones worth keeping.
+    ///
+    /// Returns the number of projections converted.
+    std::size_t quantize_projections_to_q4k();
+
     /// Quantize `lm_head` from BF16 to Q4_K, freeing the BF16 copy.
     ///
     /// Worth doing for a large vocabulary. Orpheus ships `output.weight` as

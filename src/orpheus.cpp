@@ -13,15 +13,39 @@ namespace rt {
 
 OrpheusConfig OrpheusConfig::defaults() { return OrpheusConfig{}; }
 
-const std::vector<std::string>& orpheus_voices() {
-    static const std::vector<std::string> voices{"tara", "leah", "jess", "leo",
-                                                 "dan",  "mia",  "zac",  "zoe"};
+const std::vector<OrpheusVoice>& orpheus_voices() {
+    static const std::vector<OrpheusVoice> voices{
+        // canopylabs/orpheus-3b-0.1-ft
+        {"tara", "en"}, {"leah", "en"}, {"jess", "en"}, {"leo", "en"},
+        {"dan", "en"},  {"mia", "en"},  {"zac", "en"},  {"zoe", "en"},
+        // canopylabs/3b-es_it-ft-research_release
+        {"javi", "es"}, {"sergio", "es"}, {"maria", "es"},
+        {"pietro", "it"}, {"giulia", "it"}, {"carlo", "it"},
+    };
     return voices;
 }
 
 bool orpheus_voice_known(std::string_view voice) {
-    const std::vector<std::string>& voices = orpheus_voices();
-    return std::find(voices.begin(), voices.end(), voice) != voices.end();
+    return !orpheus_voice_language(voice).empty();
+}
+
+std::string_view orpheus_voice_language(std::string_view voice) {
+    for (const OrpheusVoice& v : orpheus_voices()) {
+        if (v.name == voice) {
+            return v.language;
+        }
+    }
+    return {};
+}
+
+std::vector<std::string> orpheus_voices_for(std::string_view language) {
+    std::vector<std::string> out;
+    for (const OrpheusVoice& v : orpheus_voices()) {
+        if (v.language == language) {
+            out.push_back(v.name);
+        }
+    }
+    return out;
 }
 
 SamplingParams orpheus_default_sampling(std::uint64_t seed) {
@@ -156,8 +180,8 @@ Result<OrpheusResult> orpheus_synthesize(const LlamaModel& model, const SnacDeco
 
     if (!orpheus_voice_known(request.voice)) {
         std::fprintf(stderr,
-                     "[ orpheus ] Warning: '%s' is not a trained voice; output will not sound "
-                     "like a consistent speaker\n",
+                     "[ orpheus ] Warning: '%s' is not a trained voice of any published "
+                     "checkpoint; output will not sound like a consistent speaker\n",
                      request.voice.c_str());
     }
 

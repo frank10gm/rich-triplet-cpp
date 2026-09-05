@@ -4,7 +4,7 @@ A complete LLM stack built from first principles in C++23, **with no ML dependen
 
 This is a port of [the Rust original](../rich-triplet), kept numerically identical: the parity work behind it is described in [Porting notes](#porting-notes).
 
-Supports **Gemma 3** and **Qwen 3.5** text inference on Apple Silicon with Q4_K_M / Q4_0 GGUF weights and full-graph Metal GPU decode, plus **Orpheus** text-to-speech synthesis end to end — text in, WAV out, including the SNAC neural audio codec.
+Supports **Gemma 3** and **Qwen 3.5** text inference on Apple Silicon with Q4_K_M / Q4_0 GGUF weights and full-graph Metal GPU decode, plus **Orpheus** text-to-speech synthesis end to end in English, Italian and Spanish — text in, WAV out, including the SNAC neural audio codec.
 
 ---
 
@@ -120,27 +120,48 @@ Qwen 3.5 is a hybrid: three quarters of its layers use Gated DeltaNet (linear at
 ## Orpheus text to speech
 
 ```bash
-# The codec weights (80 MB) -- fetched once
+# The codec weights (80 MB) -- fetched once, shared by every language
 curl -L -o models/snac_24khz.bin \
   https://huggingface.co/hubertsiuzdak/snac_24khz/resolve/main/pytorch_model.bin
 
 ./build/rich-triplet \
   --model orpheus-3b \
-  --weights ./models/orpheus-3b-0.1-ft-q4_k_m.gguf \
+  --weights ./models/Orpheus-3b-Italian_Spanish-FT-Q8_0.gguf \
   --snac ./models/snac_24khz.bin \
-  --prompt "Hello, my name is Tara and I am running entirely in C plus plus." \
-  --voice tara \
-  --out tara.wav
+  --prompt "Ciao, mi chiamo Giulia. Oggi è una bella giornata a Roma." \
+  --voice giulia \
+  --out giulia.wav
 ```
 
-Voices: `tara`, `leah`, `jess`, `leo`, `dan`, `mia`, `zac`, `zoe`. Emotion tags
-like `<laugh>` and `<sigh>` are ordinary text — the tokenizer merges them like
-any other word, so they need no special handling.
+Emotion tags like `<laugh>` and `<sigh>` are ordinary text — the tokenizer
+merges them like any other word, so they need no special handling.
+
+### Checkpoints and voices
+
+The published fine-tunes share an architecture, a vocabulary and a codec, and
+differ only in language. Any of them loads with no code changes.
+
+| Checkpoint | Languages | Voices |
+|---|---|---|
+| `canopylabs/orpheus-3b-0.1-ft` | en | tara, leah, jess, leo, dan, mia, zac, zoe |
+| `lex-au/Orpheus-3b-Italian_Spanish-FT-Q8_0` | it, es | pietro, giulia, carlo · javi, sergio, maria |
+
+A voice is only a prompt prefix, so naming one the checkpoint was not trained
+on still synthesises — it just will not sound like a consistent speaker. The
+CLI warns.
+
+The Italian and Spanish weights are a **research release**, and it shows in the
+download counts: a few hundred against a quarter of a million for the English
+fine-tune. Judge the output by ear before building anything on it.
 
 No `--tokenizer-dir` is needed. The GGUF carries its own 156 940-entry
-vocabulary and 280 147 merges, which matters because the Orpheus repository is
-gated on HuggingFace — the weights are freely mirrored as GGUF but
+vocabulary and 280 147 merges, which matters because the Orpheus repositories
+are gated on HuggingFace — the weights are freely mirrored as GGUF but
 `tokenizer.json` is not.
+
+Nothing in the pipeline is language-specific. The tokenizer is byte-level BPE,
+so accented text encodes and round-trips without special handling, and the
+codec is phonetically neutral. The language lives entirely in the weights.
 
 ### How it works
 
@@ -155,26 +176,54 @@ gated on HuggingFace — the weights are freely mirrored as GGUF but
    and 1/1 of the frame rate, then four transposed-convolution blocks upsample
    by 8, 8, 4 and 2 for 512 samples per frame.
 
+### How the file was quantized decides what happens at load
+
+The two published checkpoints are packaged differently, and each needs
+something the other does not. Both cases are handled automatically; the CLI
+prints which branch it took.
+
+| | English Q4_K_M | Italian/Spanish Q8_0 |
+|---|---|---|
+| On disk | 2.36 GB | 3.52 GB |
+| Tensors | 256 | 255 — **lm_head is weight-tied** |
+| Widened to BF16 | 29 of 197 projections | **197 of 197** |
+| After load | 4.08 GB | 7.57 GB |
+| Action taken | requantize lm_head only | requantize every projection |
+| Resident | **3.5 GB** | **2.8 GB** |
+
+A Q4_K_M file keeps most projections native and lifts only `attn_v`,
+`ffn_down` and `output` to Q6_K — those are the quality-sensitive ones, chosen
+deliberately by the quantizer. Flattening them to Q4_K would throw that choice
+away, so only the lm_head is requantized: at 156 940 entries it costs 964 MB as
+BF16 against 271 MB as Q4_K, and it is the largest single read per token.
+
+A uniformly higher-precision file has no Q4_K tensors at all, so every
+projection widens and there is no deliberate choice to preserve. Requantizing
+all of them is the right call, and lands *below* the Q4_K_M model.
+
+The decision is made on the fraction of projections widened, not on a byte
+threshold, because that fraction is what actually distinguishes the two cases.
+
+Weight tying is free: `MatBf16` is reference-counted, so a checkpoint with no
+`output.weight` has its lm_head adopt the embedding's bits rather than copy
+964 MB of them. The orientations already agree — the table is `[vocab, hidden]`
+and `Linear2` computes `input @ weight.T`.
+
 ### Measured on an M3 Pro (18 GB, CPU build)
 
 | | |
 |---|---|
-| Resident weights | ~3.5 GB (2.36 GB on disk) |
+| Resident weights | 2.8–3.5 GB depending on the checkpoint |
 | Decode | ~16 tokens/s |
-| Realtime factor | ~5.0 |
+| Realtime factor | ~5.3 |
 | SNAC decode | ~0.1 s per second of audio |
 
-So a 4.7 s clip takes about 24 s. Decode runs on the CPU: there is no
-full-graph Metal path for Llama yet, and the Metal build measures the same,
-because per-token cost is Q4_K GEMV rather than the large matmuls
-`Mat::matmul` sends to the GPU. Two things would close most of the gap — a
-`metal_decode_llama.mm` trimmed from the Gemma engine, and speculative
-decoding, which is already implemented for Gemma.
-
-`--quantize`-style savings are applied automatically: Orpheus ships
-`output.weight` as Q6_K, which the loader widens to BF16 at 964 MB for a
-156 940-entry vocabulary, so the CLI requantizes it to Q4_K (271 MB). That is
-also the largest single read per token.
+So a 4 s clip takes about 21 s. Decode runs on the CPU: there is no full-graph
+Metal path for Llama yet, and the Metal build measures the same, because
+per-token cost is Q4_K GEMV rather than the large matmuls `Mat::matmul` sends
+to the GPU. Two things would close most of the gap — a `metal_decode_llama.mm`
+trimmed from the Gemma engine, and speculative decoding, which is already
+implemented for Gemma.
 
 ### Diagnosing it
 
@@ -251,7 +300,10 @@ A further 12 cases are hidden by default because they need downloaded weights:
 ./build/tests/rt_tests '[.e2e]'           # loads 2.4 GB and generates, minutes
 ```
 
-They skip cleanly when `models/` is empty. The `[.e2e]` set includes a
+They skip cleanly when `models/` is empty, and they *discover* whichever
+Orpheus checkpoint is present rather than naming one, taking their prompt from
+the `general.languages` it declares — an English sentence in an Italian voice
+would test very little. The `[.e2e]` set includes a
 consistency check worth calling out: running N tokens through prefill must rank
 its logits identically to running N-1 through prefill and the last through the
 incremental decode path. It needs no reference implementation, and it separates
@@ -419,6 +471,18 @@ tensor. Which axis that is depends on the layer: `Conv1d` stores
 `ConvTranspose1d` stores `[in, out, k]`, so it is per **input** channel.
 Deriving the group count from `g`'s own length gets both right with no special
 case.
+
+### Quantization is a set of choices, not a single knob
+
+A Q4_K_M checkpoint is not uniformly Q4_K. The quantizer keeps `attn_v`,
+`ffn_down` and the output projection at Q6_K because those carry most of the
+quality, and reads back as a mix. A Q8_0 checkpoint is uniform, so a loader
+that widens anything non-native to BF16 lands at 7.57 GB for the same model
+that fits in 2.8 GB requantized.
+
+So "should I requantize?" has no single answer: yes for the uniform file,
+no for the mixed one, where it would discard exactly the tensors the format
+went out of its way to protect.
 
 ### Grouped Multi-Query Attention
 

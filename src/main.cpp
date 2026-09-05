@@ -287,7 +287,9 @@ void print_help() {
     std::printf("  --benchmark              Run scalar-vs-tensor autograd benchmark\n");
     std::printf("  --debug                  Enable per-step diagnostic logging\n");
     std::printf("\nText to speech (--model orpheus-3b):\n");
-    std::printf("  --voice NAME             tara|leah|jess|leo|dan|mia|zac|zoe [default: tara]\n");
+    std::printf("  --voice NAME             en: tara leah jess leo dan mia zac zoe [default: tara]\n");
+    std::printf("                           es: javi sergio maria   it: pietro giulia carlo\n");
+    std::printf("                           (which work depends on the checkpoint loaded)\n");
     std::printf("  --snac PATH              SNAC 24 kHz checkpoint (pytorch_model.bin)\n");
     std::printf("  --out PATH               Output WAV                  [default: out.wav]\n");
     std::printf("  --no-audio-mask          Allow sampling outside the audio token range\n");
@@ -470,12 +472,33 @@ void run_orpheus(const CliArgs& args, const std::string& prompt) {
         die("failed to load weights: " + ok.error());
     }
 
-    // Orpheus ships output.weight as Q6_K, which the loader widens to BF16 --
-    // 964 MB for a 156 940-entry vocabulary. Q4_K brings that to 271 MB, and
-    // since the lm_head GEMV is the largest read per token it speeds decode up
-    // as well.
-    std::fprintf(stderr, "[ Orpheus ] Quantizing lm_head to Q4_K...\n");
-    model.quantize_lm_head();
+    // How the file was quantized decides what to do next.
+    //
+    // A Q4_K_M checkpoint keeps most projections native and lifts only
+    // attn_v, ffn_down and output to Q6_K -- those are the quality-sensitive
+    // ones, chosen deliberately. Flattening them would throw that away, so
+    // only the lm_head is requantized: it is the largest single read per
+    // token, and at 156 940 entries it costs 964 MB as BF16 against 271 MB as
+    // Q4_K.
+    //
+    // A uniformly higher-precision file -- Q8_0, F16 -- has no Q4_K tensors at
+    // all, so every projection widens to BF16 and the model lands near 6.6 GB
+    // with roughly 3.5x the per-token memory traffic. There is no deliberate
+    // choice to preserve there, so requantizing all of them is the right call.
+    const std::size_t projections = model.projection_count();
+    const std::size_t widened = model.bf16_projection_count();
+    if (widened * 2 > projections) {
+        std::fprintf(stderr,
+                     "[ Orpheus ] %zu of %zu projections were widened to BF16 (%.2f GB); "
+                     "requantizing to Q4_K...\n",
+                     widened, projections, static_cast<double>(model.weight_bytes()) / 1e9);
+        const std::size_t converted = model.quantize_projections_to_q4k();
+        std::fprintf(stderr, "[ Orpheus ] Requantized %zu projections, now %.2f GB\n", converted,
+                     static_cast<double>(model.weight_bytes()) / 1e9);
+    } else {
+        std::fprintf(stderr, "[ Orpheus ] Quantizing lm_head to Q4_K...\n");
+        model.quantize_lm_head();
+    }
     release_memory_to_os();
     print_rss("after weight load");
 

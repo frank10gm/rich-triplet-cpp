@@ -130,14 +130,30 @@ struct OrpheusConfig {
     }
 };
 
-/// Voices the fine-tuned model was trained on, in the order the model card
-/// lists them. `tara` is the reference's default.
-[[nodiscard]] const std::vector<std::string>& orpheus_voices();
+/// A speaker one of the Orpheus fine-tunes was trained on.
+struct OrpheusVoice {
+    std::string name;
+    /// ISO 639-1 code of the checkpoint that carries this voice.
+    std::string language;
+};
 
-/// True when `voice` is one of the trained voices. An unknown voice still
-/// synthesises -- it is only a prompt prefix -- but it will not sound like a
-/// consistent speaker, so callers should warn.
+/// Every trained voice across the published fine-tunes.
+///
+/// Which of these actually work depends on the weights loaded: the English
+/// fine-tune knows only the `en` voices, the Spanish/Italian research release
+/// only the `es` and `it` ones. A voice is nothing but a prompt prefix, so
+/// naming one the checkpoint has never seen still synthesises -- it just will
+/// not sound like a consistent speaker.
+[[nodiscard]] const std::vector<OrpheusVoice>& orpheus_voices();
+
+/// True when `voice` is a trained voice of some checkpoint.
 [[nodiscard]] bool orpheus_voice_known(std::string_view voice);
+
+/// The language a voice belongs to, or empty when it is not a known voice.
+[[nodiscard]] std::string_view orpheus_voice_language(std::string_view voice);
+
+/// The trained voices for one language code.
+[[nodiscard]] std::vector<std::string> orpheus_voices_for(std::string_view language);
 
 // =============================================================================
 // Code stream

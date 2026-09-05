@@ -287,6 +287,46 @@ std::size_t LlamaModel::weight_bytes() const {
 
 void LlamaModel::quantize_lm_head() { lm_head.quantize_bf16_to_q4k(); }
 
+std::size_t LlamaModel::projection_count() const { return 7 * layers.size() + 1; }
+
+std::size_t LlamaModel::bf16_projection_count() const {
+    std::size_t n = lm_head.bf16_weight ? 1 : 0;
+    for (const LlamaBlock& layer : layers) {
+        for (const Linear2* l : {&layer.self_attn.q_proj, &layer.self_attn.k_proj,
+                                 &layer.self_attn.v_proj, &layer.self_attn.o_proj,
+                                 &layer.mlp.gate_proj, &layer.mlp.up_proj,
+                                 &layer.mlp.down_proj}) {
+            if (l->bf16_weight) {
+                ++n;
+            }
+        }
+    }
+    return n;
+}
+
+std::size_t LlamaModel::quantize_projections_to_q4k() {
+    // `quantize_bf16_to_q4k` is a no-op without a BF16 weight, so anything
+    // already stored as Q4_K passes through untouched.
+    std::size_t converted = 0;
+    const auto convert = [&converted](Linear2& l) {
+        if (l.bf16_weight) {
+            l.quantize_bf16_to_q4k();
+            ++converted;
+        }
+    };
+    for (LlamaBlock& layer : layers) {
+        convert(layer.self_attn.q_proj);
+        convert(layer.self_attn.k_proj);
+        convert(layer.self_attn.v_proj);
+        convert(layer.self_attn.o_proj);
+        convert(layer.mlp.gate_proj);
+        convert(layer.mlp.up_proj);
+        convert(layer.mlp.down_proj);
+    }
+    convert(lm_head);
+    return converted;
+}
+
 // =============================================================================
 // Sampling
 // =============================================================================

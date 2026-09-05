@@ -234,6 +234,12 @@ Result<void> LlamaModel::load_weights_from_gguf(const std::string& path) {
                 case GgufType::Q6K:
                     RT_TRY_VOID(set_from_f32(gguf.decode_q6k_to_f32(idx)));
                     break;
+                case GgufType::Q8_0:
+                    RT_TRY_VOID(set_from_f32(gguf.decode_q8_0_to_f32(idx)));
+                    break;
+                case GgufType::Q5K:
+                    RT_TRY_VOID(set_from_f32(gguf.decode_q5k_to_f32(idx)));
+                    break;
                 default:
                     return err(std::string("llama: token_embd has unsupported type ") +
                                gguf_type_name(gtype));
@@ -319,9 +325,18 @@ Result<void> LlamaModel::load_weights_from_gguf(const std::string& path) {
         return err("llama: GGUF has no token_embd.weight");
     }
     if (!have_output) {
-        // Llama 3.2 3B ties its lm_head to the embedding, but Orpheus does
-        // not, and a tied fallback would need an f32 copy of a 964 MB table.
-        return err("llama: GGUF has no output.weight; weight-tied lm_head is not supported");
+        // Weight tying, which Llama 3.2 3B does and the English Orpheus
+        // fine-tune does not. `MatBf16` is shared_ptr-backed, so the lm_head
+        // adopts the embedding's bits rather than copying 964 MB of them.
+        //
+        // The orientations already agree: the table is [vocab, hidden] and
+        // Linear2 computes `input @ weight.T` for a weight of
+        // [out_features, in_features].
+        if (!embed_bf16) {
+            return err("llama: GGUF has neither output.weight nor a usable token_embd");
+        }
+        std::fprintf(stderr, "[ GGUF ] No output.weight; tying lm_head to the embedding\n");
+        lm_head.load_bf16_shared(embed_bf16->data, embed_bf16->rows, embed_bf16->cols);
     }
 
     // The divisors are read from the same tensor loop that fills the layers,
