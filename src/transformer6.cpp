@@ -132,6 +132,9 @@ OmniAttention::OmniAttention(const Config6& cfg)
 
 Mat OmniAttention::forward(const Mat& x, const std::vector<float>& inv_freq) const {
     assert(inv_freq.size() >= head_dim / 2 && "omnivoice lm: not enough inverse frequencies");
+    // Every projection here runs on a BF16 weight, so `fused_linear` returns a
+    // plain leaf and there is no graph to break. See `OmniBlock::forward` for
+    // the ops that do build one.
     const TensorNode xn = TensorNode::leaf(x);
 
     // Qwen3 normalizes each head of Q and K before rotating, like Gemma 3.
@@ -161,7 +164,17 @@ OmniMlp::OmniMlp(const Config6& cfg)
 Mat OmniMlp::forward(const Mat& x) const {
     const TensorNode xn = TensorNode::leaf(x);
     const TensorNode gate = gate_proj.forward(xn).silu();
-    return down_proj.forward(gate.mul_elem_node(up_proj.forward(xn))).data();
+    const TensorNode fused = gate.mul_elem_node(up_proj.forward(xn));
+    Mat out = down_proj.forward(fused).data();
+
+    // `silu` and `mul_elem_node` always wire up a backward closure, and that
+    // closure captures its own node -- a reference cycle plain refcounting can
+    // never collect. Inference never walks it, so without this the SwiGLU
+    // intermediates of every layer of every pass stay resident: at 550
+    // positions that is ~13 GB over a single clip, and the kernel kills the
+    // process somewhere past a thousand.
+    fused.free_graph();
+    return out;
 }
 
 OmniBlock::OmniBlock(const Config6& cfg)
@@ -171,11 +184,20 @@ OmniBlock::OmniBlock(const Config6& cfg)
       mlp(cfg) {}
 
 Mat OmniBlock::forward(const Mat& x, const std::vector<float>& inv_freq) const {
-    const Mat normed = input_layernorm.forward(TensorNode::leaf(x)).data();
+    // Same cycle as the MLP's: `rms_norm` captures its own output node in the
+    // backward closure it always builds. Copying the data out and freeing the
+    // graph immediately is what keeps a forward-only pass flat in memory.
+    const TensorNode norm1 = input_layernorm.forward(TensorNode::leaf(x));
+    const Mat normed = norm1.data();
+    norm1.free_graph();
+
     Mat h = self_attn.forward(normed, inv_freq);
     h.add_assign(x);
 
-    const Mat normed2 = post_attention_layernorm.forward(TensorNode::leaf(h)).data();
+    const TensorNode norm2 = post_attention_layernorm.forward(TensorNode::leaf(h));
+    const Mat normed2 = norm2.data();
+    norm2.free_graph();
+
     Mat ff = mlp.forward(normed2);
     ff.add_assign(h);
     return ff;
@@ -265,7 +287,9 @@ Result<Mat> OmniLm::forward(const std::vector<OmniToken>& tokens) const {
     // Unlike an autoregressive model there is no "last position" shortcut:
     // every position's logits matter, because any of them might be unmasked
     // this step.
-    const Mat normed = norm.forward(TensorNode::leaf(h)).data();
+    const TensorNode final_norm = norm.forward(TensorNode::leaf(h));
+    const Mat normed = final_norm.data();
+    final_norm.free_graph();
     return audio_head.forward(TensorNode::leaf(normed)).data();
 }
 
