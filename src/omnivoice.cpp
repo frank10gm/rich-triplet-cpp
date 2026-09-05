@@ -485,39 +485,85 @@ std::vector<std::string> omni_chunk_text(std::string_view text, std::size_t chun
     return out;
 }
 
+std::pair<std::size_t, std::size_t> omni_voiced_span(std::span<const float> samples,
+                                                     std::size_t sample_rate,
+                                                     float threshold_db, std::size_t margin) {
+    // -50 dBFS is the reference's silence threshold: about 1/316 of full scale,
+    // below anything the codec produces for speech and above its noise floor.
+    const float threshold = std::pow(10.0f, threshold_db / 20.0f);
+    const std::size_t win =
+        std::max<std::size_t>(1, static_cast<std::size_t>(sample_rate / 100));  // 10 ms
+    const std::size_t frames = samples.size() / win;
+    if (frames == 0) {
+        return {0, samples.size()};
+    }
+
+    const auto loud = [&](std::size_t f) {
+        double sum = 0.0;
+        for (std::size_t i = f * win; i < (f + 1) * win; ++i) {
+            sum += static_cast<double>(samples[i]) * samples[i];
+        }
+        return std::sqrt(sum / static_cast<double>(win)) >= threshold;
+    };
+
+    std::size_t first = 0;
+    while (first < frames && !loud(first)) {
+        ++first;
+    }
+    if (first == frames) {
+        return {0, 0};
+    }
+    std::size_t last = frames;
+    while (last > first && !loud(last - 1)) {
+        --last;
+    }
+
+    const std::size_t begin_raw = first * win;
+    const std::size_t end_raw = std::min(samples.size(), last * win);
+    return {begin_raw > margin ? begin_raw - margin : 0,
+            std::min(samples.size(), end_raw + margin)};
+}
+
 std::vector<float> omni_cross_fade(const std::vector<std::vector<float>>& chunks,
-                                   std::size_t sample_rate, float silence_seconds) {
+                                   std::size_t sample_rate, float gap_seconds) {
     if (chunks.empty()) {
         return {};
     }
     if (chunks.size() == 1) {
+        // One piece is the whole utterance; nothing to join and nothing to
+        // trim, so it passes through untouched.
         return chunks.front();
     }
 
-    // A third of the gap fades out, a third is silence, a third fades in.
-    const auto total = static_cast<std::size_t>(silence_seconds *
-                                                static_cast<float>(sample_rate));
-    const std::size_t fade = total / 3;
+    // Long enough to stop a click at a discontinuity, short enough that it
+    // cannot swallow a syllable. A tenth of a second -- what the reference
+    // uses -- is not short enough.
+    const auto fade = static_cast<std::size_t>(0.008f * static_cast<float>(sample_rate));
+    const auto gap =
+        static_cast<std::size_t>(std::max(0.0f, gap_seconds) * static_cast<float>(sample_rate));
 
-    std::vector<float> out = chunks.front();
-    for (std::size_t i = 1; i < chunks.size(); ++i) {
-        const std::size_t fade_out = std::min(fade, out.size());
-        for (std::size_t j = 0; j < fade_out; ++j) {
-            const float w = 1.0f - static_cast<float>(j) /
-                                       static_cast<float>(std::max<std::size_t>(fade_out - 1, 1));
-            out[out.size() - fade_out + j] *= w;
+    std::vector<float> out;
+    for (const std::vector<float>& chunk : chunks) {
+        // Trim to what this piece actually says, keeping the fade's worth of
+        // room so the ramp runs over near-silence rather than over speech.
+        const auto [begin, end] = omni_voiced_span(chunk, sample_rate, -50.0f, fade);
+        if (begin == end) {
+            continue;  // a piece with nothing in it contributes nothing
         }
+        const std::size_t len = end - begin;
 
-        out.insert(out.end(), fade, 0.0f);
+        if (!out.empty()) {
+            out.insert(out.end(), gap, 0.0f);
+        }
+        const std::size_t at = out.size();
+        out.insert(out.end(), chunk.begin() + static_cast<long>(begin),
+                   chunk.begin() + static_cast<long>(end));
 
-        const std::vector<float>& next = chunks[i];
-        const std::size_t fade_in = std::min(fade, next.size());
-        const std::size_t before = out.size();
-        out.insert(out.end(), next.begin(), next.end());
-        for (std::size_t j = 0; j < fade_in; ++j) {
-            const float w = static_cast<float>(j) /
-                            static_cast<float>(std::max<std::size_t>(fade_in - 1, 1));
-            out[before + j] *= w;
+        const std::size_t n = std::min(fade, len / 2);
+        for (std::size_t i = 0; i < n; ++i) {
+            const float w = static_cast<float>(i) / static_cast<float>(n);
+            out[at + i] *= w;
+            out[at + len - 1 - i] *= w;
         }
     }
     return out;

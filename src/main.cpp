@@ -172,6 +172,8 @@ struct CliArgs {
     float chunk_seconds = 15.0f;
     /// --chunk-threshold S : split only when the estimate exceeds this
     float chunk_threshold = 30.0f;
+    /// --chunk-gap S : silence between chunks
+    float chunk_gap = 0.3f;
     /// --rope-interleaved : pair 2i with 2i+1 instead of i with i+head_dim/2
     bool rope_interleaved = false;
 };
@@ -266,6 +268,8 @@ template <typename T>
             if (const auto v = take(i)) a.chunk_seconds = parse_or<float>(*v, 15.0f);
         } else if (arg == "--chunk-threshold") {
             if (const auto v = take(i)) a.chunk_threshold = parse_or<float>(*v, 30.0f);
+        } else if (arg == "--chunk-gap") {
+            if (const auto v = take(i)) a.chunk_gap = parse_or<float>(*v, 0.3f);
         } else if (arg == "--ref-audio") {
             if (const auto v = take(i)) a.ref_audio = *v;
         } else if (arg == "--ref-text") {
@@ -343,6 +347,7 @@ void print_help() {
     std::printf("  --instruct TEXT          Voice description              [default: None]\n");
     std::printf("  --chunk-seconds S        Audio per chunk for long text  [default: 15]\n");
     std::printf("  --chunk-threshold S      Split above this many seconds   [default: 30]\n");
+    std::printf("  --chunk-gap S            Pause between chunks           [default: 0.3]\n");
     std::printf("  --ref-audio PATH         WAV of a voice to clone\n");
     std::printf("  --ref-text TEXT          What that WAV says (required with it)\n");
     std::printf("  --duration S             Audio seconds (0 = estimate)   [default: 0]\n");
@@ -613,6 +618,7 @@ void run_omnivoice(const CliArgs& args, const std::string& prompt) {
     request.gen.seed = args.seed;
     request.gen.chunk_seconds = args.chunk_seconds;
     request.gen.chunk_threshold_seconds = args.chunk_threshold;
+    request.gen.chunk_gap_seconds = args.chunk_gap;
 
     char duration_field[32];
     if (request.duration_seconds > 0.0f) {

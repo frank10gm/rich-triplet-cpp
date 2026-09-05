@@ -58,6 +58,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <utility>
 #include <string_view>
 #include <vector>
 
@@ -107,7 +108,8 @@ struct OmniGenConfig {
     float chunk_threshold_seconds = 30.0f;
     /// Roughly how much audio one chunk should carry.
     float chunk_seconds = 15.0f;
-    /// Silence between chunks, a third of it spent fading each side.
+    /// Silence between one chunk and the next. The pieces break at sentence
+    /// ends, so this is the pause a reader would take there.
     float chunk_gap_seconds = 0.3f;
 
     [[nodiscard]] static OmniGenConfig defaults();
@@ -263,15 +265,43 @@ struct OmniReference {
                                                        std::size_t chunk_chars,
                                                        std::size_t min_chunk_chars = 3);
 
-/// Join chunk waveforms with a fade-out, a silence, and a fade-in.
+/// The span of `samples` that carries signal, widened by `margin` samples at
+/// each end and clamped.
+///
+/// Loudness is RMS over 10 ms windows rather than a per-sample peak, which is
+/// what the reference's silence detector uses too. The difference is not
+/// theoretical: a chunk's quiet head crosses -50 dBFS on the odd sample while
+/// averaging well below it, so a peak test keeps everything from the first
+/// crossing and leaves half a second of near-silence sitting in a join. A
+/// window still keeps a genuinely loud transient, and should -- that is
+/// content, not noise.
+///
+/// Returns `[begin, end)`, and `begin == end` when nothing is above
+/// `threshold_db`.
+[[nodiscard]] std::pair<std::size_t, std::size_t> omni_voiced_span(
+    std::span<const float> samples, std::size_t sample_rate, float threshold_db = -50.0f,
+    std::size_t margin = 0);
+
+/// Join chunk waveforms into one utterance.
 ///
 /// Not an overlap-add: the pieces are separate utterances, not a continuous
 /// signal cut in two, so crossfading them onto each other would sound like two
-/// people talking over one another. The gap is a breath, and the fades keep
-/// its edges from clicking.
+/// people talking over one another. Each is trimmed to what it actually says,
+/// and a fixed silence is placed between them.
+///
+/// **Trimming is what makes the joins even.** A chunk's length comes from a
+/// duration estimate, so it ends with however much silence the estimate
+/// overshot by -- measured across four joins of one clip, the pause came out at
+/// 113, 127, 191 and 649 ms for the same intended gap. Cutting each piece back
+/// to its own speech makes every join the pause it was asked for.
+///
+/// The fade at each edge is a few milliseconds, only enough to stop a click.
+/// The reference fades a tenth of a second, which is long enough to ramp the
+/// last syllable of a chunk to nothing when the estimate was tight -- and it
+/// usually is.
 [[nodiscard]] std::vector<float> omni_cross_fade(const std::vector<std::vector<float>>& chunks,
                                                  std::size_t sample_rate,
-                                                 float silence_seconds = 0.3f);
+                                                 float gap_seconds = 0.3f);
 
 /// Build the conditional sequence: style markers, text, reference codes if any,
 /// then masked frames.

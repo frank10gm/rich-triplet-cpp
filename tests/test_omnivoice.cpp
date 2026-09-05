@@ -765,55 +765,147 @@ TEST_CASE("omni_chunk_text loses no text", "[omnivoice]") {
 // Joining the pieces
 // =============================================================================
 
-TEST_CASE("omni_cross_fade passes a single chunk through", "[omnivoice]") {
-    const std::vector<std::vector<float>> one{{0.1f, 0.2f, 0.3f}};
-    const std::vector<float> got = omni_cross_fade(one, 24000, 0.3f);
-    REQUIRE(got == one[0]);
+TEST_CASE("omni_voiced_span finds where a signal actually starts", "[omnivoice]") {
+    // 0.2 s of silence, 0.3 s of tone, 0.2 s of silence, at 3 kHz.
+    constexpr std::size_t kRate = 3000;
+    std::vector<float> x(kRate * 7 / 10, 0.0f);
+    for (std::size_t i = 0; i < kRate * 3 / 10; ++i) {
+        x[kRate * 2 / 10 + i] = 0.4f;
+    }
+    const auto [begin, end] = omni_voiced_span(x, kRate);
+    // Resolved to the 10 ms window, so within one window of the true edges.
+    REQUIRE(begin <= kRate * 2 / 10);
+    REQUIRE(begin >= kRate * 2 / 10 - kRate / 100);
+    REQUIRE(end >= kRate * 5 / 10 - kRate / 100);
+    REQUIRE(end <= kRate * 5 / 10 + kRate / 100);
+}
+
+TEST_CASE("omni_voiced_span ignores a noise floor that grazes the threshold",
+          "[omnivoice]") {
+    // The case that made this a window rather than a peak test. A chunk's
+    // quiet head crosses -50 dBFS on the odd sample while averaging well below
+    // it; a peak test keeps everything from the first crossing, and half a
+    // second of near-silence lands in the middle of a join.
+    constexpr std::size_t kRate = 3000;
+    const float threshold = std::pow(10.0f, -50.0f / 20.0f);
+    std::vector<float> x(kRate, 0.0f);
+    for (std::size_t i = 0; i < kRate / 2; i += 17) {
+        x[i] = threshold * 3.0f;  // above the line on its own, not on average
+    }
+    for (std::size_t i = kRate / 2; i < kRate * 3 / 4; ++i) {
+        x[i] = 0.4f;
+    }
+    const auto [begin, end] = omni_voiced_span(x, kRate);
+    REQUIRE(begin >= kRate / 2 - kRate / 100);
+    REQUIRE(end <= kRate * 3 / 4 + kRate / 100);
+}
+
+TEST_CASE("omni_voiced_span reports nothing for silence", "[omnivoice]") {
+    const std::vector<float> quiet(3000, 0.0f);
+    const auto [begin, end] = omni_voiced_span(quiet, 3000);
+    REQUIRE(begin == end);
+}
+
+TEST_CASE("omni_voiced_span widens by the margin", "[omnivoice]") {
+    constexpr std::size_t kRate = 3000;
+    std::vector<float> x(kRate, 0.0f);
+    for (std::size_t i = kRate / 2; i < kRate * 3 / 4; ++i) {
+        x[i] = 0.4f;
+    }
+    const auto [tight_begin, tight_end] = omni_voiced_span(x, kRate, -50.0f, 0);
+    const auto [wide_begin, wide_end] = omni_voiced_span(x, kRate, -50.0f, 50);
+    REQUIRE(wide_begin == tight_begin - 50);
+    REQUIRE(wide_end == tight_end + 50);
+    // And it cannot run off either end.
+    const auto [all_begin, all_end] = omni_voiced_span(x, kRate, -50.0f, 100000);
+    REQUIRE(all_begin == 0);
+    REQUIRE(all_end == x.size());
+}
+
+TEST_CASE("omni_cross_fade passes a single chunk through untouched", "[omnivoice]") {
+    // One piece is the whole utterance: no join, and nothing trimmed. Short
+    // text has to come out exactly as the codec produced it.
+    const std::vector<std::vector<float>> one{{0.1f, 0.2f, 0.0f, 0.0f}};
+    REQUIRE(omni_cross_fade(one, 24000, 0.3f) == one[0]);
     REQUIRE(omni_cross_fade({}, 24000, 0.3f).empty());
 }
 
-TEST_CASE("omni_cross_fade inserts a gap and fades both edges", "[omnivoice]") {
-    // A third of the gap fades out, a third is silence, a third fades in.
-    constexpr std::size_t kRate = 3000;   // 0.3 s -> 900 samples, fade 300
-    constexpr std::size_t kFade = 300;
-    const std::vector<std::vector<float>> chunks{std::vector<float>(1000, 1.0f),
-                                                 std::vector<float>(1000, 1.0f)};
+TEST_CASE("omni_cross_fade puts the asked-for pause between pieces", "[omnivoice]") {
+    // Both pieces are loud throughout, so nothing is trimmed and the join is
+    // exactly the gap.
+    constexpr std::size_t kRate = 3000;
+    const std::vector<std::vector<float>> chunks{std::vector<float>(1000, 0.5f),
+                                                 std::vector<float>(1000, 0.5f)};
     const std::vector<float> got = omni_cross_fade(chunks, kRate, 0.3f);
-    REQUIRE(got.size() == 1000 + kFade + 1000);
-
-    // Untouched in the middle of the first chunk.
-    REQUIRE(approx(got[500], 1.0f));
-    // Fading out towards the gap.
-    REQUIRE(got[1000 - kFade] > got[999]);
-    REQUIRE(approx(got[999], 0.0f));
-    // The gap itself.
-    for (std::size_t i = 1000; i < 1000 + kFade; ++i) {
+    const std::size_t gap = static_cast<std::size_t>(0.3f * kRate);
+    REQUIRE(got.size() == 1000 + gap + 1000);
+    for (std::size_t i = 1000; i < 1000 + gap; ++i) {
         REQUIRE(got[i] == 0.0f);
     }
-    // Fading back in.
-    REQUIRE(approx(got[1000 + kFade], 0.0f));
-    REQUIRE(got[1000 + kFade + kFade] > 0.9f);
-    REQUIRE(approx(got[1000 + kFade + 500], 1.0f));
 }
 
-TEST_CASE("omni_cross_fade handles chunks shorter than the fade", "[omnivoice]") {
-    // A very short piece cannot give the fade all the samples it wants, and
-    // must not read past its own end.
-    const std::vector<std::vector<float>> chunks{std::vector<float>(4, 1.0f),
-                                                 std::vector<float>(4, 1.0f)};
+TEST_CASE("omni_cross_fade trims each piece to what it says", "[omnivoice]") {
+    // The point of the trim: a chunk's length comes from a duration estimate,
+    // so it ends with however much silence the estimate overshot by. Without
+    // trimming, the pause is the gap plus two accidents.
+    constexpr std::size_t kRate = 3000;
+    std::vector<float> a(1500, 0.0f);
+    std::vector<float> b(1500, 0.0f);
+    for (std::size_t i = 0; i < 500; ++i) {
+        a[i] = 0.5f;              // speech, then 1000 samples of overshoot
+        b[1000 + i] = 0.5f;       // 1000 samples of silence, then speech
+    }
+    const std::vector<float> got = omni_cross_fade({a, b}, kRate, 0.3f);
+    const std::size_t gap = static_cast<std::size_t>(0.3f * kRate);
+    const std::size_t fade = static_cast<std::size_t>(0.008f * kRate);
+    // Each piece keeps its 500 samples plus the fade's margin at the inner
+    // edge; the dead 1000 samples on each side are gone.
+    REQUIRE(got.size() < 500 + gap + 500 + 4 * fade);
+    REQUIRE(got.size() > 500 + gap + 500);
+}
+
+TEST_CASE("omni_cross_fade does not fade away a whole syllable", "[omnivoice]") {
+    // The reference ramps a tenth of a second to nothing at every edge, which
+    // is long enough to swallow the last sound of a chunk when the estimate
+    // was tight -- and it usually is. The fade here is a few milliseconds.
+    constexpr std::size_t kRate = 24000;
+    const std::vector<std::vector<float>> chunks{std::vector<float>(kRate, 0.5f),
+                                                 std::vector<float>(kRate, 0.5f)};
+    const std::vector<float> got = omni_cross_fade(chunks, kRate, 0.3f);
+    // 50 ms before the join the signal is still at full level.
+    const std::size_t join = kRate;
+    REQUIRE(approx(got[join - kRate / 20], 0.5f));
+    // And it does reach zero, so there is no click.
+    REQUIRE(got[join - 1] < 0.05f);
+}
+
+TEST_CASE("omni_cross_fade drops a piece with nothing in it", "[omnivoice]") {
+    constexpr std::size_t kRate = 3000;
+    const std::vector<std::vector<float>> chunks{
+        std::vector<float>(500, 0.5f), std::vector<float>(500, 0.0f),
+        std::vector<float>(500, 0.5f)};
+    const std::vector<float> got = omni_cross_fade(chunks, kRate, 0.3f);
+    const std::size_t gap = static_cast<std::size_t>(0.3f * kRate);
+    // Two pieces and one gap, not three and two.
+    REQUIRE(got.size() == 500 + gap + 500);
+}
+
+TEST_CASE("omni_cross_fade handles pieces shorter than the fade", "[omnivoice]") {
+    const std::vector<std::vector<float>> chunks{std::vector<float>(4, 0.5f),
+                                                 std::vector<float>(4, 0.5f)};
     const std::vector<float> got = omni_cross_fade(chunks, 3000, 0.3f);
-    REQUIRE(got.size() == 4 + 300 + 4);
     for (const float v : got) {
         REQUIRE(std::isfinite(v));
         REQUIRE(std::fabs(v) <= 1.0f);
     }
 }
 
-TEST_CASE("omni_cross_fade joins three pieces", "[omnivoice]") {
+TEST_CASE("omni_cross_fade joins three pieces with two gaps", "[omnivoice]") {
+    constexpr std::size_t kRate = 3000;
     const std::vector<std::vector<float>> chunks{std::vector<float>(500, 0.5f),
                                                  std::vector<float>(600, 0.5f),
                                                  std::vector<float>(700, 0.5f)};
-    const std::vector<float> got = omni_cross_fade(chunks, 3000, 0.3f);
-    // Two gaps of 300 between three pieces.
-    REQUIRE(got.size() == 500 + 600 + 700 + 2 * 300);
+    const std::vector<float> got = omni_cross_fade(chunks, kRate, 0.3f);
+    const std::size_t gap = static_cast<std::size_t>(0.3f * kRate);
+    REQUIRE(got.size() == 500 + 600 + 700 + 2 * gap);
 }

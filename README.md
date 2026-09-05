@@ -495,9 +495,30 @@ the reference for every chunk instead, and chunk one is no longer special.
 
 **The pieces are joined with a gap, not an overlap.** They are separate
 utterances rather than one signal cut in two, so cross-fading them onto each
-other would sound like two people talking over one another. A third of
-`chunk_gap_seconds` fades the previous piece out, a third is silence, a third
-fades the next one in — a breath, with no click at either edge.
+other would sound like two people talking over one another.
+
+Two things about that join are worth more than they look, and both are
+departures from the reference, made after measuring what it produces.
+
+*Each piece is trimmed to what it actually says.* A chunk's length comes from a
+duration estimate, so it ends with however much silence the estimate overshot
+by and begins with however much the model took to start. Measured across four
+joins of one clip, the pause came out at 113, 127, 191 and **649** ms for the
+same intended gap — a hole in the middle of a paragraph. Trimming first makes
+every join exactly `--chunk-gap`.
+
+The trim measures RMS over 10 ms windows, not a per-sample peak. That is not a
+detail: a chunk's quiet head crosses -50 dBFS on the odd sample while averaging
+far below it, so a peak test keeps everything from the first crossing and
+leaves half a second of near-silence in the join. A genuinely loud transient is
+still kept — that is content.
+
+*The fade is 8 ms, not 100.* The reference ramps a tenth of a second to nothing
+at every chunk edge. When the duration estimate is tight — and it usually is —
+that ramp lands on speech. Measured on the last 100 ms before four joins, the
+level fell 0.176 → 0.011 across the fade: the final syllable of every chunk was
+being faded out. At 8 ms the level holds to the edge and the fade only does
+what it is for, which is stopping a click.
 
 Measured on an M3 Pro, Metal build:
 
@@ -684,6 +705,7 @@ Apache 2.0.
 | `--steps N` | 12 | OmniVoice unmasking steps — the quality/speed dial |
 | `--chunk-seconds S` | 15 | Audio per chunk when splitting long text; 0 never splits |
 | `--chunk-threshold S` | 30 | Split only when the estimate exceeds this |
+| `--chunk-gap S` | 0.3 | Pause between chunks, in seconds |
 | `--guidance G` | 2.0 | OmniVoice classifier-free guidance; 0 halves the work |
 | `--ref-audio PATH` | — | WAV of a voice for OmniVoice to clone |
 | `--ref-text TEXT` | — | What that WAV says; required alongside it |
@@ -694,8 +716,8 @@ Apache 2.0.
 ## Running tests
 
 ```bash
-./build/tests/rt_tests          # 511 cases
-./build-metal/tests/rt_tests    # 523 cases, including the GPU kernels
+./build/tests/rt_tests          # 518 cases
+./build-metal/tests/rt_tests    # 530 cases, including the GPU kernels
 ```
 
 Covers matrix ops, gradient correctness against finite differences, attention
@@ -1024,7 +1046,7 @@ world's scripts.
 ## Stats
 
 - ~33,500 lines of C++, Objective-C++ and MSL, plus ~12,500 of tests
-- 523 test cases with Metal, 511 without, plus 32 that need downloaded weights
+- 530 test cases with Metal, 518 without, plus 32 that need downloaded weights
   (36 with Metal)
 - Zero ML dependencies (Accelerate and Metal are system frameworks)
 - Every published weight format read from scratch: GGUF, safetensors, and
