@@ -4,13 +4,13 @@ A complete LLM stack built from first principles in C++23, **with no ML dependen
 
 This is a port of [the Rust original](../rich-triplet), kept numerically identical: the parity work behind it is described in [Porting notes](#porting-notes).
 
-Supports **Gemma 3** and **Qwen 3.5** text inference on Apple Silicon with Q4_K_M / Q4_0 GGUF weights and full-graph Metal GPU decode, plus two complete text-to-speech stacks — text in, WAV out, neural audio codecs included: **Orpheus**, an autoregressive Llama 3.2 emitting SNAC codes, and **OmniVoice**, a masked-diffusion Qwen3 that unmasks eight codebooks in parallel.
+Supports **Gemma 3** and **Qwen 3.5** text inference on Apple Silicon with Q4_K_M / Q4_0 GGUF weights and full-graph Metal GPU decode, plus two complete text-to-speech stacks — text in, WAV out, neural audio codecs included: **Orpheus**, an autoregressive Llama 3.2 emitting SNAC codes, and **OmniVoice**, a masked-diffusion Qwen3 that unmasks eight codebooks in parallel and clones a voice from a few seconds of reference audio.
 
 ---
 
 ## What this project is
 
-Seven transformer implementations (GPT-2 scalar, GPT-2 tensor, GPT-OSS, Gemma 3, Qwen 3.5, Llama 3.2, and a bidirectional Qwen3 used as a diffusion model), two neural audio codec decoders, a tensor autodiff engine, Apple Metal GPU acceleration, Flash Attention, GGUF / safetensors / torch-pickle weight loading, and a CLI for inference, training and speech synthesis.
+Eight transformer implementations (GPT-2 scalar, GPT-2 tensor, GPT-OSS, Gemma 3, Qwen 3.5, Llama 3.2, a bidirectional Qwen3 used as a diffusion model, and HuBERT reading raw audio), two neural audio codec decoders and one encoder, a tensor autodiff engine, Apple Metal GPU acceleration, Flash Attention, GGUF / safetensors / torch-pickle weight loading, and a CLI for inference, training and speech synthesis.
 
 | File | What you understand after writing it |
 |---|---|
@@ -24,14 +24,16 @@ Seven transformer implementations (GPT-2 scalar, GPT-2 tensor, GPT-OSS, Gemma 3,
 | `transformer_qwen35.cpp` | Qwen 3.5: Gated DeltaNet + softmax attention hybrid |
 | `transformer5.cpp` | Llama 3.2: the two RoPE pair conventions, and why GGUF needs the other one |
 | `transformer6.cpp` | Bidirectional attention, and what a model without a KV cache costs |
+| `hubert.cpp` | A transformer whose input is a waveform, and whose position is a convolution |
 | `conv1d.cpp` | Dilated, grouped and transposed 1-D convolution; Snake; weight norm |
 | `snac.cpp` | Multi-scale residual vector quantization, and a codec decoder |
 | `orpheus.cpp` | Audio tokens: slot offsets, frame de-interleaving, resynchronisation |
 | `omnivoice.cpp` | Masked diffusion decoding: confidence unmasking, classifier-free guidance |
 | `omnivoice_codec.cpp` | Dense residual convolution, and why im2col earns its memory |
 | `duration.cpp` | That Unicode has opinions about how long a character takes to say |
+| `resample.cpp` | Polyphase rate conversion, and why the filter has to be *that* filter |
 | `torch_pickle.cpp` | ZIP central directories, and just enough pickle to be safe |
-| `wav.cpp` | RIFF, and how to tell speech from noise without listening |
+| `wav.cpp` | RIFF in both directions, and how to tell speech from noise without listening |
 | `gguf.cpp` | GGUF file format: Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, BF16, F16, F32 |
 | `tokenizer.cpp` | Character, BPE, SentencePiece and HuggingFace BPE tokenizers |
 | `metal_ops.mm` | Metal GPU tiled matmul, Q4_K/BF16 GEMV kernels |
@@ -288,14 +290,14 @@ voice list, because a voice is described rather than named. `--instruct
 |---|---|---|
 | On disk | 0.66 GB | 0.29 GB |
 | Holds | the diffusion LM | the audio codec |
-| Loaded | 312 tensors, 1.23 GB resident | 21.6 M parameters |
-| Also carries | its own 151 676-entry vocabulary | the analysis half, unused |
+| Loaded | 312 tensors, 1.23 GB resident | 21.6 M to synthesise, 163 M to analyse |
+| Also carries | its own 151 676-entry vocabulary | both directions of the codec |
 
 The LM's GGUF embeds its tokenizer, so there is no `--tokenizer-dir`. The
-codec's file is about 60% unused: the `acoustic_encoder`, `encoder_semantic`
-and a 12-layer wav2vec2-style `semantic_model` are the analysis path, needed to
-turn reference audio into codes for voice cloning. Synthesis needs none of
-them, so roughly 300 of its 486 tensors are skipped at load.
+codec's file holds both halves: `acoustic_decoder` and the codebooks for
+synthesis, and `acoustic_encoder`, `encoder_semantic` and a 94 M-parameter
+`semantic_model` for analysis. Plain synthesis loads only the first, about 190
+of its 486 tensors; `--ref-audio` loads the rest.
 
 ### How it works
 
@@ -343,6 +345,10 @@ almost exactly linear. Measured on an M3 Pro (18 GB, CPU build), synthesising
 | 16 | 2.46 | 9.8 s |
 | 32 | 5.17 | 20.7 s |
 
+A reference clip adds its own frames to every forward pass, so cloning costs
+more per step: a 4 s reference roughly doubles the sequence and takes `--steps
+12` from a realtime factor of 1.96 to 3.4.
+
 The default stays at 32 because that is the reference's. Whether a lower one is
 free is a question about how it *sounds*, and none of the numbers this project
 prints can answer it — the waveform statistics look like speech across the whole
@@ -377,6 +383,113 @@ they agree everywhere. That is a one-off harness, not a test in the suite —
 running it needs Python's `unicodedata`, which is the thing being replaced.
 
 `--duration S` overrides the whole thing.
+
+### Voice cloning
+
+```bash
+./build/rich-triplet \
+  --model omnivoice \
+  --ref-audio giulia.wav \
+  --ref-text "Ciao, mi chiamo Giulia. Oggi è una bella giornata a Roma." \
+  --prompt "Domani andrò al mercato con mia sorella." \
+  --language Italian \
+  --out clone.wav
+```
+
+A reference clip is not a second mode. It is a prefix:
+
+```
+<|denoise|><|lang_start|>...<|instruct_end|>
+<|text_start|>{ref_text} {text}<|text_end|>
+[ reference frames, decided ][ target frames, masked ]
+```
+
+The clip is encoded to codes and those codes go into the sequence as
+*already-decided* audio positions, with its transcript joined to the prompt.
+So the model is continuing a recording it can see rather than imitating one it
+cannot, and every masked position attends to the reference through the same
+bidirectional attention it uses for everything else. The unconditional branch
+is unchanged — still the masked frames alone — which is what makes guidance
+push *towards* the reference voice.
+
+The unmasking loop needed no change: it finds the target frames by counting
+back from the end of the sequence, so anything before them is transparent to
+it.
+
+`--ref-text` is required. Without it the model cannot tell which part of the
+text it has already heard, and would try to say the whole thing again. 3–10 s
+of reference is the useful range; the CLI warns past 20.
+
+Two details are the reference implementation's and are not obvious:
+
+**`<|denoise|>` leads the prompt** whenever there is a recording, and only
+then. It asks the model to clean the reference up rather than reproduce the
+room it was recorded in.
+
+**A quiet clip is levelled before encoding** — brought up to 0.1 RMS — and the
+original loudness restored on the way out. The codec was fit on speech at a
+particular level, and a quiet recording otherwise encodes into a part of the
+codebook space that carries a quiet voice rather than that voice quietly.
+
+Duration estimation switches reference too: with a clip, the estimator
+calibrates on *this speaker's* rate rather than on the built-in phrase, which
+is strictly better when one is available.
+
+### Reading audio in
+
+Cloning is the first thing here that needs analysis rather than synthesis, and
+it pulled in three pieces the project did not have.
+
+**A WAV reader.** `wav.cpp` could write a file and not open one. It now takes
+8, 16, 24 and 32-bit PCM plus 32 and 64-bit float and WAVE_FORMAT_EXTENSIBLE,
+and walks the chunk list rather than assuming the 44-byte header it writes —
+almost nothing else writes that, and `LIST`/`INFO` metadata between `fmt ` and
+`data` would otherwise be read as samples.
+
+**A resampler.** The codec's two analysis paths run at different rates, so
+something has to convert 24 kHz to 16 kHz. It matters that it is *that* filter
+and not merely a good one: the features that come out feed a quantizer, so a
+different transition band puts the latents somewhere the codebooks were never
+fit. `resample.cpp` is a port of `torchaudio.functional.resample` at its
+defaults, in polyphase form — 24 kHz to 16 kHz is 3 to 2, so two filter phases
+of 23 taps and one pass over the input.
+
+**HuBERT.** The codec quantizes the concatenation of an *acoustic* path and a
+*semantic* one, so that a code carries what was said and not only how it
+sounded. The semantic path is a 94 M-parameter HuBERT, which is the eighth
+transformer here and the first that is not a language model:
+
+| | Every other model here | HuBERT |
+|---|---|---|
+| Input | token ids | a raw waveform |
+| Position | RoPE | a grouped convolution, added once |
+| Norm placement | before each sublayer | **after each residual add** |
+| Norm | RMSNorm | **LayerNorm**, mean subtraction included |
+| GELU | tanh approximation | **the erf form** |
+| What is used | the last hidden state | **the mean of all thirteen** |
+
+Seven strided convolutions with no padding anywhere reduce 16 kHz audio by
+exactly 320, to 50 Hz; the codec keeps every other frame to reach its own 25.
+That the two paths arrive at the same frame rate by different arithmetic — 24
+kHz over 960 against 16 kHz over 320 and then halved — is the invariant the
+whole analysis half rests on, and both ends assert it.
+
+### Checking an encoder with no reference implementation
+
+The decoder could be checked by ear. The encoder cannot: its output is a
+thousand integers.
+
+What makes it checkable is that the two halves invert each other. Decode a set
+of codes, encode the waveform back, and compare. On real speech codebook 0
+recovers **90%** of its indices, falling to 47% by codebook 7 — which is
+exactly the shape residual quantization should give, because each codebook only
+ever sees the error the ones before it could not represent, and by the eighth
+that error is nearly noise. Chance is one in 1024. The waveform correlates at
+0.92 with the original and its statistics match to three decimals.
+
+Nothing subtly wrong survives that. A normalisation applied on the wrong axis,
+the two paths concatenated in the wrong order, a padding off by one — all of
+them land at chance, not near it.
 
 ### Diagnosing it
 
@@ -439,6 +552,8 @@ Apache 2.0.
 | `--duration S` | 0 | OmniVoice audio seconds; 0 estimates from the text |
 | `--steps N` | 32 | OmniVoice unmasking steps — the quality/speed dial |
 | `--guidance G` | 2.0 | OmniVoice classifier-free guidance; 0 halves the work |
+| `--ref-audio PATH` | — | WAV of a voice for OmniVoice to clone |
+| `--ref-text TEXT` | — | What that WAV says; required alongside it |
 | `--rope-interleaved` | off | Use interleaved RoPE pairing (debugging only) |
 
 ---
@@ -446,17 +561,18 @@ Apache 2.0.
 ## Running tests
 
 ```bash
-./build/tests/rt_tests          # 443 cases
-./build-metal/tests/rt_tests    # 455 cases, including the GPU kernels
+./build/tests/rt_tests          # 498 cases
+./build-metal/tests/rt_tests    # 510 cases, including the GPU kernels
 ```
 
 Covers matrix ops, gradient correctness against finite differences, attention
 shapes, Flash Attention, Q4_K/BF16 quantization, GGUF, safetensors and
 torch-pickle parsing, all four tokenizers, every architecture, 1-D convolution
-against reference loops, both codec decoders, RIFF output, the duration
+against reference loops, both codec decoders and the OmniVoice encoder, RIFF in
+both directions, resampling against the reference filter, the duration
 estimator's character classes, the Metal kernels, and the weight-loading paths.
 
-A further 22 cases are hidden by default because they need downloaded weights:
+A further 32 cases are hidden by default because they need downloaded weights:
 
 ```bash
 ./build/tests/rt_tests '[.integration]'   # real checkpoints, seconds
@@ -478,7 +594,10 @@ are arithmetic: each decoder block multiplies its input length by exactly its
 stride, the full chain by exactly 960, the unmask schedule accounts for every
 `(codebook, position)` pair with none left masked, and the duration estimator
 puts each script, category and boundary code point in the class the reference
-does. What needs the checkpoint is only that it loads and is deterministic.
+does. The cloning prompt is checked the same way, against a twenty-word
+tokenizer built inside the test, since what is under test is the layout and not
+the merges. What needs the checkpoint is the codec round trip, and that
+everything loads and is deterministic.
 
 ---
 
@@ -542,15 +661,17 @@ src/
 ├── transformer5_load.cpp        Llama 3.2 GGUF loading, embedded tokenizer
 ├── transformer6.cpp             Bidirectional Qwen3, multi-codebook head
 ├── transformer6_load.cpp        OmniVoice GGUF loading
+├── hubert.cpp                   HuBERT: waveform in, semantic features out
 │
 ├── conv1d.cpp          1-D convolution: dilated, grouped, transposed; Snake, im2col
 ├── snac.cpp            SNAC 24 kHz codec decoder and residual vector quantizer
 ├── orpheus.cpp         Audio-token protocol, frame de-interleaving, synthesis
 ├── omnivoice.cpp       Masked-diffusion sampler: schedules, guidance, unmasking
-├── omnivoice_codec.cpp OmniVoice codec decoder — 8 codebooks, 960x upsampling
+├── omnivoice_codec.cpp OmniVoice codec, both directions — 8 codebooks, 960x
 ├── duration.cpp        Rule-based duration estimation from character weights
+├── resample.cpp        Polyphase windowed-sinc sample rate conversion
 ├── torch_pickle.cpp    PyTorch .bin reader: ZIP container + pickle manifest
-├── wav.cpp             16-bit PCM WAV output and waveform statistics
+├── wav.cpp             RIFF reading and writing, and waveform statistics
 │
 ├── gguf.cpp            GGUF parser and every quantized tensor decoder
 ├── metal_ops.mm        Metal GPU kernels (tiled matmul, per-dispatch GEMV)
@@ -625,6 +746,29 @@ survives, low-frequency ones divided by 32 so positions stretch, with a smooth
 ramp between. GGUF ships the resulting per-dimension values in
 `rope_freqs.weight`, running from 1.0 up to 32.0 — they are **divisors**, not
 multipliers.
+
+### Residual vector quantization, in both directions
+
+Reconstruction from codes is a sum, and the codebooks can be read in any order.
+Going the other way they cannot: quantization is greedy and sequential.
+
+```
+residual = latents
+for each codebook:
+    code     = nearest entry to project_in(residual)
+    residual = residual - project_out(codebook[code])
+```
+
+So codebook `i` only ever sees the error codebooks `0..i-1` could not
+represent. That is why the coarse ones are robust and the fine ones are nearly
+coding noise — measured over a decode-and-re-encode cycle, codebook 0 recovers
+90% of its indices and codebook 7 recovers 47% — and it is also why OmniVoice's
+diffusion loop penalises the later codebooks and decides them last. The order
+is not a heuristic; it is the structure of the code.
+
+The nearest-neighbour search does not need distances. `||x||^2` is the same for
+every candidate, so `argmin ||x - e||^2` is `argmin(||e||^2 - 2 x·e)`, which is
+one gemm against the codebook plus a precomputed norm.
 
 ### Multi-scale residual vector quantization
 
@@ -725,8 +869,8 @@ world's scripts.
 
 ## Stats
 
-- ~30,100 lines of C++, Objective-C++ and MSL, plus ~10,800 of tests
-- 455 test cases with Metal, 443 without, plus 22 that need downloaded weights
+- ~32,200 lines of C++, Objective-C++ and MSL, plus ~12,200 of tests
+- 510 test cases with Metal, 498 without, plus 32 that need downloaded weights
 - Zero ML dependencies (Accelerate and Metal are system frameworks)
 - Every published weight format read from scratch: GGUF, safetensors, and
   PyTorch's ZIP-plus-pickle `.bin`

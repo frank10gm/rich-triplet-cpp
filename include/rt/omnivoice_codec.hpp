@@ -35,12 +35,14 @@
 // one frame is 960 samples: 25 Hz at 24 kHz. Eight codes per frame means 200
 // tokens per second of audio.
 //
-// ## What is not implemented
+// ## Both directions
 //
-// The checkpoint also carries an `acoustic_encoder`, an `encoder_semantic`
-// stack and a 12-layer wav2vec2-style `semantic_model`. Those are the analysis
-// half, needed to turn reference audio into codes for voice cloning. Synthesis
-// needs none of them, so roughly 300 of the file's 486 tensors are skipped.
+// `OmniCodecDecoder` is the synthesis half and is all that plain generation
+// needs -- about 190 of the file's 486 tensors. `OmniCodecEncoder`, at the
+// bottom of this header, is the analysis half: the `acoustic_encoder`, the
+// `encoder_semantic` stack and a 94 M-parameter HuBERT, which turn reference
+// audio into codes for voice cloning. It is loaded only when there is a
+// reference, since it is eight times the size of the decoder.
 
 #include <cstddef>
 #include <cstdint>
