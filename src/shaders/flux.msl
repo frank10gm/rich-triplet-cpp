@@ -1,0 +1,467 @@
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+// =============================================================================
+// Q4_K dequantization
+// =============================================================================
+//
+// The existing quantized kernels in this project are GEMV: one output row per
+// dispatch, which is exactly right for autoregressive decode and exactly wrong
+// here. A diffusion transformer pushes four thousand tokens through every
+// projection at once, so what it needs is a GEMM.
+//
+// Writing a Q4_K x dense GEMM is possible. Dequantizing the weight once per
+// layer per step and running an ordinary bfloat GEMM is better, and it is not
+// close. The largest FLUX weight is a single-stream block's fused `linear1` at
+// 3072 -> 21504: 66 M parameters, 132 MB as bfloat, and 575 GFLOP of GEMM to
+// follow. Touching 66 M elements to save writing a fused kernel is noise
+// against that, and the block-decode arithmetic below is the same arithmetic
+// the GEMV kernels already carry.
+//
+// A Q4_K super-block is 144 bytes covering 256 weights:
+//
+//   bytes[0..2]    f16 super-block scale
+//   bytes[2..4]    f16 super-block minimum
+//   bytes[4..16]   twelve packed 6-bit scale/min pairs, eight sub-blocks
+//   bytes[16..144] 128 bytes of nibbles, four chunks of 32
+//
+// Within a chunk the low nibbles are elements 0..31 of its 64 and the high
+// nibbles are elements 32..63 -- a split, not an interleave. Reading them as
+// interleaved produces weights that are individually plausible and collectively
+// scrambled, which trains no alarm anywhere downstream.
+
+#define Q4K_BLOCK_BYTES 144u
+#define Q4K_BLOCK_ELEMS 256u
+
+inline float2 flux_scale_min(device const uchar* sc, uint j) {
+    float sv, mv;
+    if (j < 4u) {
+        sv = float(sc[j] & 0x3Fu);
+        mv = float(sc[j + 4u] & 0x3Fu);
+    } else {
+        sv = float((sc[j + 4u] & 0x0Fu) | ((sc[j - 4u] >> 6u) << 4u));
+        mv = float((sc[j + 4u] >> 4u)   | ((sc[j]      >> 6u) << 4u));
+    }
+    return float2(sv, mv);
+}
+
+// One thread per super-block. `out` is the bfloat weight in [N, K] order, the
+// same order the blocks are stored in, so this is a straight streaming write.
+kernel void flux_dequant_q4k(
+    device const uchar*  blocks [[buffer(0)]],
+    device       bfloat* out    [[buffer(1)]],
+    constant     uint&   n_blocks [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n_blocks) return;
+
+    device const uchar* bp = blocks + gid * Q4K_BLOCK_BYTES;
+    ushort d_bits    = ushort(bp[0]) | (ushort(bp[1]) << 8u);
+    ushort dmin_bits = ushort(bp[2]) | (ushort(bp[3]) << 8u);
+    float d    = float(as_type<half>(d_bits));
+    float dmin = float(as_type<half>(dmin_bits));
+
+    device const uchar* sc = bp + 4u;
+    device const uchar* qs = bp + 16u;
+    device bfloat* dst = out + gid * Q4K_BLOCK_ELEMS;
+
+    for (uint chunk = 0u; chunk < 4u; ++chunk) {
+        float2 sm1 = flux_scale_min(sc, chunk * 2u);
+        float2 sm2 = flux_scale_min(sc, chunk * 2u + 1u);
+        float scale1 = d * sm1.x;  float min1 = dmin * sm1.y;
+        float scale2 = d * sm2.x;  float min2 = dmin * sm2.y;
+
+        device const uchar* qq = qs + chunk * 32u;
+        uint base = chunk * 64u;
+        for (uint l = 0u; l < 32u; ++l) {
+            dst[base + l]       = bfloat(scale1 * float(qq[l] & 0x0Fu) - min1);
+            dst[base + 32u + l] = bfloat(scale2 * float(qq[l] >> 4u)   - min2);
+        }
+    }
+}
+
+// =============================================================================
+// GEMM
+// =============================================================================
+//
+// C[M,N] = A[M,K] @ W[N,K]^T, the weight in bfloat.
+//
+// One threadgroup is four simdgroups covering a 64x64 tile of C, each owning a
+// 32x32 quadrant as sixteen 8x8 accumulators. Every 8x8 operand loaded from
+// memory feeds four multiply-accumulates rather than one, which is the whole
+// difference against a scalar tiled kernel.
+//
+// M and N are always multiples of 64 and K a multiple of 8, because the caller
+// pads. That is what lets the inner loop carry no bounds checks at all.
+
+kernel void flux_gemm_bt(
+    device const float*  A [[buffer(0)]],
+    device const bfloat* W [[buffer(1)]],
+    device       float*  C [[buffer(2)]],
+    constant uint& K [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]])
+{
+    const uint m0 = tgid.y * 64u + (sgid / 2u) * 32u;
+    const uint n0 = tgid.x * 64u + (sgid % 2u) * 32u;
+
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < 4; ++i)
+        for (uint j = 0; j < 4; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    simdgroup_float8x8  a[4];
+    simdgroup_bfloat8x8 b[4];
+
+    for (uint k0 = 0; k0 < K; k0 += 8u) {
+        for (uint i = 0; i < 4; ++i)
+            simdgroup_load(a[i], A + (m0 + i * 8u) * K + k0, K);
+        // transpose=true reads W[n,k] as the [k,n] operand the product wants,
+        // so the weight is never stored twice.
+        for (uint j = 0; j < 4; ++j)
+            simdgroup_load(b[j], W + (n0 + j * 8u) * K + k0, K, ulong2(0, 0), true);
+        for (uint i = 0; i < 4; ++i)
+            for (uint j = 0; j < 4; ++j)
+                simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+    }
+
+    for (uint i = 0; i < 4; ++i)
+        for (uint j = 0; j < 4; ++j)
+            simdgroup_store(acc[i][j], C + (m0 + i * 8u) * N + (n0 + j * 8u), N);
+}
+
+// Add a per-column bias to every row of a [M, N] matrix.
+kernel void flux_add_bias(
+    device       float* C    [[buffer(0)]],
+    device const float* bias [[buffer(1)]],
+    constant uint& N [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    C[gid.y * N + gid.x] += bias[gid.x];
+}
+
+// =============================================================================
+// Attention
+// =============================================================================
+//
+// The OmniVoice attention kernel keeps a whole row of scores in threadgroup
+// memory, which caps it at 2048 keys. FLUX runs 4352 at 1024x1024 and 16640 at
+// 2048x2048, so this one streams instead: it walks the keys in tiles, keeping
+// only a running maximum, a running denominator and the output accumulator.
+//
+// That is the online-softmax recurrence. On seeing a tile whose maximum
+// exceeds the running one, the accumulator and the denominator are rescaled by
+// `exp(old_max - new_max)` before the tile is folded in, which keeps every
+// exponential bounded without ever materialising the score row.
+//
+// One threadgroup per (head, query). 128 threads: enough for one output
+// dimension each at head_dim 128, and twice the key tile.
+
+#define FLUX_ATTN_TILE 64u
+
+kernel void flux_attention(
+    device const float* q   [[buffer(0)]],
+    device const float* k   [[buffer(1)]],
+    device const float* v   [[buffer(2)]],
+    device       float* out [[buffer(3)]],
+    constant uint&  T        [[buffer(4)]],
+    constant uint&  n_heads  [[buffer(5)]],
+    constant uint&  head_dim [[buffer(6)]],
+    constant float& scale    [[buffer(7)]],
+    uint2 gid   [[threadgroup_position_in_grid]],
+    uint2 tid_v [[thread_position_in_threadgroup]])
+{
+    const uint tid = tid_v.x;
+    const uint head = gid.x;
+    const uint row  = gid.y;
+    if (row >= T) return;
+
+    const uint stride = n_heads * head_dim;
+    device const float* qv = q + row * stride + head * head_dim;
+    device const float* kb = k + head * head_dim;
+    device const float* vb = v + head * head_dim;
+
+    threadgroup float sc[FLUX_ATTN_TILE];
+    threadgroup float acc[128];
+    threadgroup float state[2];  // running max, running denominator
+    threadgroup float alpha;     // this tile's rescale of the accumulator
+
+    if (tid < head_dim) acc[tid] = 0.0f;
+    if (tid == 0) { state[0] = -INFINITY; state[1] = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint base = 0u; base < T; base += FLUX_ATTN_TILE) {
+        const uint n = min(FLUX_ATTN_TILE, T - base);
+
+        if (tid < n) {
+            device const float* kv = kb + (base + tid) * stride;
+            float dot = 0.0f;
+            for (uint d = 0; d < head_dim; ++d) dot += qv[d] * kv[d];
+            sc[tid] = dot * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // The rescale is decided once per tile by a single thread. A parallel
+        // reduction over 64 values would cost more in barriers than it saves.
+        if (tid == 0) {
+            float tile_max = -INFINITY;
+            for (uint j = 0; j < n; ++j) tile_max = max(tile_max, sc[j]);
+            const float new_max = max(state[0], tile_max);
+            alpha = (state[0] == -INFINITY) ? 0.0f : exp(state[0] - new_max);
+
+            float tile_sum = 0.0f;
+            for (uint j = 0; j < n; ++j) {
+                sc[j] = exp(sc[j] - new_max);
+                tile_sum += sc[j];
+            }
+            state[0] = new_max;
+            state[1] = state[1] * alpha + tile_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid < head_dim) {
+            float a = acc[tid] * alpha;
+            for (uint j = 0; j < n; ++j) {
+                a += sc[j] * vb[(base + j) * stride + tid];
+            }
+            acc[tid] = a;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid < head_dim) {
+        out[row * stride + head * head_dim + tid] = acc[tid] / state[1];
+    }
+}
+
+// =============================================================================
+// Normalisation
+// =============================================================================
+
+// LayerNorm with no affine parameters. Every norm in FLUX is one of these: the
+// scale and the shift arrive from the modulation path instead.
+kernel void flux_layer_norm(
+    device const float* x   [[buffer(0)]],
+    device       float* out [[buffer(1)]],
+    constant uint&  width [[buffer(2)]],
+    constant float& eps   [[buffer(3)]],
+    uint  row [[threadgroup_position_in_grid]],
+    uint  tid [[thread_position_in_threadgroup]],
+    uint  nth [[threads_per_threadgroup]])
+{
+    threadgroup float reduce[256];
+    device const float* src = x + row * width;
+    device float* dst = out + row * width;
+
+    float local = 0.0f;
+    for (uint c = tid; c < width; c += nth) local += src[c];
+    reduce[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nth / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float mean = reduce[0] / float(width);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float lv = 0.0f;
+    for (uint c = tid; c < width; c += nth) {
+        const float d = src[c] - mean;
+        lv += d * d;
+    }
+    reduce[tid] = lv;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nth / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv = rsqrt(reduce[0] / float(width) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint c = tid; c < width; c += nth) dst[c] = (src[c] - mean) * inv;
+}
+
+// Per-head RMSNorm with a learned scale, applied to Q and K before rotation.
+//
+// `row_stride` and `col_offset` let this run directly on a slice of a fused
+// QKV projection: Q sits at offset 0 and K at offset `hidden` inside a row that
+// is three or four times as wide. Normalising before the split is what keeps
+// the image and text streams on their own learned scales, which they must be --
+// the two halves of a double block share an attention but not a parameter.
+//
+// One threadgroup per (row, head).
+kernel void flux_head_rms_norm(
+    device       float* x     [[buffer(0)]],
+    device const float* gain  [[buffer(1)]],
+    constant uint&  row_stride [[buffer(2)]],
+    constant uint&  col_offset [[buffer(3)]],
+    constant uint&  head_dim  [[buffer(4)]],
+    constant float& eps       [[buffer(5)]],
+    // MSL wants every position attribute in a kernel to have the same width,
+    // so these are uint2 with an unused y rather than plain uints.
+    uint2 gid   [[threadgroup_position_in_grid]],
+    uint2 tid_v [[thread_position_in_threadgroup]],
+    uint2 nth_v [[threads_per_threadgroup]])
+{
+    const uint tid = tid_v.x;
+    const uint nth = nth_v.x;
+    threadgroup float reduce[128];
+    device float* head = x + gid.y * row_stride + col_offset + gid.x * head_dim;
+
+    float local = 0.0f;
+    for (uint c = tid; c < head_dim; c += nth) local += head[c] * head[c];
+    reduce[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nth / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv = rsqrt(reduce[0] / float(head_dim) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint c = tid; c < head_dim; c += nth) head[c] = head[c] * inv * gain[c];
+}
+
+// =============================================================================
+// Modulation
+// =============================================================================
+
+// `(1 + scale) * x + shift`, with the scale and shift broadcast from one row.
+//
+// `params` points at the modulation projection's output; `shift_off` and
+// `scale_off` are element offsets into it, which is what lets one kernel serve
+// the six-way, three-way and two-way splits without repacking any of them.
+kernel void flux_modulate(
+    device       float* x      [[buffer(0)]],
+    device const float* params [[buffer(1)]],
+    constant uint& width      [[buffer(2)]],
+    constant uint& shift_off  [[buffer(3)]],
+    constant uint& scale_off  [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint c = gid.x;
+    const uint i = gid.y * width + c;
+    x[i] = (1.0f + params[scale_off + c]) * x[i] + params[shift_off + c];
+}
+
+// `dst += gate * src`, the gate broadcast from one row.
+kernel void flux_gated_add(
+    device       float* dst    [[buffer(0)]],
+    device const float* src    [[buffer(1)]],
+    device const float* params [[buffer(2)]],
+    constant uint& width     [[buffer(3)]],
+    constant uint& gate_off  [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint i = gid.y * width + gid.x;
+    dst[i] += params[gate_off + gid.x] * src[i];
+}
+
+// =============================================================================
+// RoPE
+// =============================================================================
+//
+// Three axes over (t, h, w), each owning a contiguous slice of the head
+// dimension and rotating adjacent pairs within it. The cosine and sine tables
+// are precomputed on the CPU -- they depend only on the image size, so they are
+// built once per generation rather than once per block.
+//
+// One thread per (row, head, pair).
+kernel void flux_rope(
+    device       float* x   [[buffer(0)]],
+    device const float* cos_tab [[buffer(1)]],
+    device const float* sin_tab [[buffer(2)]],
+    constant uint& n_heads  [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    const uint pairs = head_dim / 2u;
+    const uint row = gid.z;
+    const uint head = gid.y;
+    const uint p = gid.x;
+
+    device float* h = x + row * (n_heads * head_dim) + head * head_dim;
+    const float a = h[2u * p];
+    const float b = h[2u * p + 1u];
+    const float c = cos_tab[row * pairs + p];
+    const float s = sin_tab[row * pairs + p];
+    h[2u * p]      = a * c - b * s;
+    h[2u * p + 1u] = a * s + b * c;
+}
+
+// =============================================================================
+// Elementwise
+// =============================================================================
+
+kernel void flux_gelu_tanh(
+    device float* x [[buffer(0)]],
+    uint i [[thread_position_in_grid]])
+{
+    const float v = x[i];
+    const float inner = 0.7978845608028654f * (v + 0.044715f * v * v * v);
+    x[i] = 0.5f * v * (1.0f + tanh(inner));
+}
+
+kernel void flux_silu(
+    device float* x [[buffer(0)]],
+    uint i [[thread_position_in_grid]])
+{
+    x[i] = x[i] / (1.0f + exp(-x[i]));
+}
+
+kernel void flux_add(
+    device       float* dst [[buffer(0)]],
+    device const float* src [[buffer(1)]],
+    uint i [[thread_position_in_grid]])
+{
+    dst[i] += src[i];
+}
+
+kernel void flux_zero(
+    device float* x [[buffer(0)]],
+    uint i [[thread_position_in_grid]])
+{
+    x[i] = 0.0f;
+}
+
+// Copy a column range out of a [rows, src_width] matrix into a
+// [rows, count] one. Splitting a fused QKV projection is three of these.
+kernel void flux_slice_cols(
+    device const float* src [[buffer(0)]],
+    device       float* dst [[buffer(1)]],
+    constant uint& src_width [[buffer(2)]],
+    constant uint& dst_width [[buffer(3)]],
+    constant uint& from      [[buffer(4)]],
+    constant uint& src_row0  [[buffer(5)]],
+    constant uint& dst_row0  [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    dst[(dst_row0 + gid.y) * dst_width + gid.x] =
+        src[(src_row0 + gid.y) * src_width + from + gid.x];
+}
+
+// The inverse: write a [rows, count] block into a column range.
+kernel void flux_paste_cols(
+    device const float* src [[buffer(0)]],
+    device       float* dst [[buffer(1)]],
+    constant uint& src_width [[buffer(2)]],
+    constant uint& dst_width [[buffer(3)]],
+    constant uint& at        [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    dst[gid.y * dst_width + at + gid.x] = src[gid.y * src_width + gid.x];
+}
+
+// Copy a row range, for splitting and rejoining the text and image streams.
+kernel void flux_copy_rows(
+    device const float* src [[buffer(0)]],
+    device       float* dst [[buffer(1)]],
+    constant uint& width    [[buffer(2)]],
+    constant uint& src_from [[buffer(3)]],
+    constant uint& dst_from [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    dst[(dst_from + gid.y) * width + gid.x] = src[(src_from + gid.y) * width + gid.x];
+}
