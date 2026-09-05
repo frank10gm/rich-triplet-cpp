@@ -101,11 +101,27 @@ namespace rt {
 ///
 /// `x` is [T, Cin], `weight` is [Cout, Cin * K], output is [T_out, Cout].
 ///
-/// Delegates to `conv1d_pointwise` when `kernel == 1 && dilation == 1 &&
-/// padding == 0`. Otherwise this is a direct accumulation loop rather than an
-/// im2col + gemm: the only dense wide-kernel convolution in a SNAC decoder is
-/// the final `[64 -> 1, k=7]` projection, where im2col would cost more than it
-/// saves. Revisit if a codec turns up that leans on dense wide kernels.
+/// Three paths, picked by shape:
+///
+///   * `kernel == 1` with no dilation or padding delegates to
+///     `conv1d_pointwise`, which is a plain matmul.
+///   * Small problems use a direct accumulation loop, which avoids the scratch
+///     buffer entirely.
+///   * Everything else goes through im2col: gather the `Cin * K` receptive
+///     field of each output position into a row, then one `matmul_bt` against
+///     the weight. That turns the convolution into a gemm and hands it to
+///     BLAS.
+///
+/// The third path is not an optimisation so much as a requirement. A SNAC
+/// decoder only needs a dense wide kernel for its final `[64 -> 1, k=7]`
+/// projection, but OmniVoice's residual units are dense 7-taps at up to 512
+/// channels running over a sequence that has already been upsampled toward
+/// 96 000 samples -- tens of GFLOP per clip. The direct loop would take tens of
+/// seconds where a gemm takes well under one.
+///
+/// im2col is materialised in row tiles rather than all at once, since the full
+/// matrix would be `T_out * Cin * K` floats -- hundreds of megabytes at those
+/// shapes.
 ///
 /// `bias` may be empty, meaning no bias.
 [[nodiscard]] Mat conv1d_dense(const Mat& x, const Mat& weight, std::size_t out_channels,

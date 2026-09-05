@@ -1,5 +1,6 @@
 #include "rt/conv1d.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -117,8 +118,57 @@ Mat conv1d_dense(const Mat& x, const Mat& weight, std::size_t out_channels, std:
 
     const std::size_t c_in = x.cols;
     const std::size_t t_out = conv1d_out_len(x.rows, kernel, dilation, padding);
-    Mat out = Mat::zeros(t_out, out_channels);
 
+    // im2col + gemm once the problem is big enough to pay for the scratch
+    // buffer. The threshold is deliberately low: below it the direct loop is
+    // within noise, above it the gemm wins by orders of magnitude.
+    constexpr std::size_t kGemmThreshold = 1 << 16;  // output elements x taps
+    if (t_out * out_channels * c_in * kernel >= kGemmThreshold) {
+        Mat out = Mat::zeros(t_out, out_channels);
+        // Tile over output positions so the patch matrix stays cache-sized
+        // rather than `t_out * c_in * kernel` floats.
+        const std::size_t patch = c_in * kernel;
+        const std::size_t tile =
+            std::max<std::size_t>(1, (1u << 21) / std::max<std::size_t>(patch, 1));
+        Mat cols = Mat::zeros(std::min(tile, t_out), patch);
+
+        for (std::size_t base = 0; base < t_out; base += tile) {
+            const std::size_t rows = std::min(tile, t_out - base);
+            if (cols.rows != rows) {
+                cols = Mat::zeros(rows, patch);
+            } else {
+                std::fill(cols.data.begin(), cols.data.end(), 0.0f);
+            }
+            for (std::size_t r = 0; r < rows; ++r) {
+                float* crow = cols.row_mut(r).data();
+                for (std::size_t k = 0; k < kernel; ++k) {
+                    const std::size_t shifted = base + r + k * dilation;
+                    if (shifted < padding) {
+                        continue;
+                    }
+                    const std::size_t src = shifted - padding;
+                    if (src >= x.rows) {
+                        continue;
+                    }
+                    const float* xrow = x.row(src).data();
+                    // Column `ci * kernel + k` mirrors the weight's layout, so
+                    // the gemm needs no repacking of either operand.
+                    for (std::size_t ci = 0; ci < c_in; ++ci) {
+                        crow[ci * kernel + k] = xrow[ci];
+                    }
+                }
+            }
+            const Mat block = cols.matmul_bt(weight);
+            for (std::size_t r = 0; r < rows; ++r) {
+                std::copy(block.row(r).begin(), block.row(r).end(),
+                          out.row_mut(base + r).begin());
+            }
+        }
+        add_bias_rows(out, bias);
+        return out;
+    }
+
+    Mat out = Mat::zeros(t_out, out_channels);
     for (std::size_t t = 0; t < t_out; ++t) {
         float* orow = out.row_mut(t).data();
         for (std::size_t k = 0; k < kernel; ++k) {

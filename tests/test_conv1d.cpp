@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <vector>
@@ -13,6 +14,18 @@ using namespace rt;
 using rt::testing::approx;
 
 namespace {
+
+/// Relative comparison, for results large enough that an absolute tolerance
+/// says nothing.
+///
+/// im2col + gemm and the direct accumulation loop sum the same products in
+/// different orders, so they agree to f32 epsilon and not further. At values in
+/// the thousands that is millivolts of absolute difference and entirely
+/// expected; only the relative error is meaningful.
+[[nodiscard]] bool approx_rel(float a, float b, float tol = 1e-5f) {
+    const float scale = std::max({1.0f, std::fabs(a), std::fabs(b)});
+    return std::fabs(a - b) / scale < tol;
+}
 
 /// Fill a matrix with a deterministic spread of small signed values.
 [[nodiscard]] Mat ramp(std::size_t rows, std::size_t cols, float scale = 0.01f, float shift = 0.5f) {
@@ -464,5 +477,67 @@ TEST_CASE("weight_norm_combine yields zeros for a zero direction", "[conv1d]") {
     for (const float value : w) {
         REQUIRE(value == 0.0f);
         REQUIRE(std::isfinite(value));
+    }
+}
+
+TEST_CASE("conv1d_dense im2col path matches the direct loop", "[conv1d]") {
+    // Big enough to cross the gemm threshold, so this compares the two
+    // implementations against each other rather than re-testing one of them.
+    constexpr std::size_t c_in = 24;
+    constexpr std::size_t c_out = 24;
+    constexpr std::size_t kernel = 7;
+    const Mat x = ramp(600, c_in, 0.0013f, 0.4f);
+    const Mat w = ramp(c_out, c_in * kernel, 0.0007f, 0.15f);
+    std::vector<float> bias(c_out);
+    for (std::size_t i = 0; i < c_out; ++i) {
+        bias[i] = 0.01f * static_cast<float>(i) - 0.1f;
+    }
+
+    const Mat got = conv1d_dense(x, w, c_out, kernel, bias, 1, 3);
+    Mat want = ref_conv1d_dense(x, w, c_out, kernel, 1, 3);
+    for (std::size_t r = 0; r < want.rows; ++r) {
+        for (std::size_t c = 0; c < want.cols; ++c) {
+            want.at_mut(r, c) += bias[c];
+        }
+    }
+    REQUIRE(got.rows == 600);
+    REQUIRE(got.cols == c_out);
+    for (std::size_t i = 0; i < got.data.size(); ++i) {
+        REQUIRE(approx_rel(got.data[i], want.data[i]));
+    }
+}
+
+TEST_CASE("conv1d_dense im2col is correct across tile boundaries", "[conv1d]") {
+    // The patch matrix is built in row tiles, so a position whose receptive
+    // field straddles a tile edge is the interesting case: the gather reads
+    // from `x`, not from the previous tile, so it must not depend on tiling at
+    // all. Dilation 3 widens the field to 18 positions to make that bite.
+    constexpr std::size_t c_in = 16;
+    constexpr std::size_t c_out = 8;
+    constexpr std::size_t kernel = 7;
+    constexpr std::size_t dilation = 3;
+    const Mat x = ramp(2000, c_in, 0.0011f, 0.5f);
+    const Mat w = ramp(c_out, c_in * kernel, 0.0009f, 0.2f);
+
+    const Mat got = conv1d_dense(x, w, c_out, kernel, {}, dilation, 3 * dilation);
+    const Mat want = ref_conv1d_dense(x, w, c_out, kernel, dilation, 3 * dilation);
+    REQUIRE(got.rows == want.rows);
+    REQUIRE(got.rows == 2000);
+    for (std::size_t i = 0; i < got.data.size(); ++i) {
+        REQUIRE(approx_rel(got.data[i], want.data[i]));
+    }
+}
+
+TEST_CASE("conv1d_dense handles OmniVoice's residual-unit shape", "[conv1d]") {
+    // acoustic_decoder.block.N.res_unitN.conv1: dense 7-tap, 512 channels.
+    // These run after the sequence has been upsampled, which is why the gemm
+    // path exists at all.
+    const Mat x = ramp(1024, 64, 0.0005f, 0.02f);
+    const Mat w = ramp(64, 64 * 7, 0.0003f, 0.01f);
+    const Mat out = conv1d_dense(x, w, 64, 7, {}, 1, 3);
+    REQUIRE(out.rows == 1024);
+    REQUIRE(out.cols == 64);
+    for (const float v : out.data) {
+        REQUIRE(std::isfinite(v));
     }
 }
