@@ -338,23 +338,23 @@ Cost is `steps * 2` full-sequence forward passes and nothing else, so it is
 almost exactly linear. Measured on an M3 Pro (18 GB, CPU build), synthesising
 4 s of Italian:
 
-| `--steps` | Realtime factor | Wall clock for 4 s |
-|---|---|---|
-| 8 | 1.30 | 5.2 s |
-| 12 | 1.96 | 7.9 s |
-| 16 | 2.46 | 9.8 s |
-| 32 | 5.17 | 20.7 s |
+| `--steps` | Realtime factor | Wall clock for 4 s | |
+|---|---|---|---|
+| 8 | 1.30 | 5.2 s | |
+| 12 | 1.96 | 7.9 s | **the default** |
+| 16 | 2.46 | 9.8 s | |
+| 32 | 5.17 | 20.7 s | the reference's |
 
 A reference clip adds its own frames to every forward pass, so cloning costs
 more per step: a 4 s reference roughly doubles the sequence and takes `--steps
 12` from a realtime factor of 1.96 to 3.4.
 
-The default stays at 32 because that is the reference's. Whether a lower one is
-free is a question about how it *sounds*, and none of the numbers this project
-prints can answer it — the waveform statistics look like speech across the whole
-range, and only stop doing so at the extreme, where a single step produces
-something the check flags and warns about. Picking a cheaper default needs a
-listening comparison that has not been done yet.
+The default is 12 rather than the reference's 32, which is three times faster
+and was judged indistinguishable by ear on Italian. That is a listening call
+and could not have been anything else: the waveform statistics look like speech
+across the whole range and only stop at the extreme, where a single step
+produces something the check flags and warns about. `--steps 32` restores the
+reference's setting.
 
 ### Length has to be decided in advance
 
@@ -550,7 +550,7 @@ Apache 2.0.
 | `--language NAME` | `None` | OmniVoice language hint, e.g. `Italian` |
 | `--instruct TEXT` | `None` | OmniVoice voice description, e.g. `a calm young woman` |
 | `--duration S` | 0 | OmniVoice audio seconds; 0 estimates from the text |
-| `--steps N` | 32 | OmniVoice unmasking steps — the quality/speed dial |
+| `--steps N` | 12 | OmniVoice unmasking steps — the quality/speed dial |
 | `--guidance G` | 2.0 | OmniVoice classifier-free guidance; 0 halves the work |
 | `--ref-audio PATH` | — | WAV of a voice for OmniVoice to clone |
 | `--ref-text TEXT` | — | What that WAV says; required alongside it |

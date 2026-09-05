@@ -162,7 +162,7 @@ struct CliArgs {
     /// --duration S : audio seconds to generate; 0 uses the length heuristic
     float duration = 0.0f;
     /// --steps N : OmniVoice unmasking steps
-    std::size_t steps = 32;
+    std::size_t steps = 12;
     /// --guidance G : classifier-free guidance scale; 0 disables it
     float guidance = 2.0f;
     /// --rope-interleaved : pair 2i with 2i+1 instead of i with i+head_dim/2
@@ -262,7 +262,7 @@ template <typename T>
         } else if (arg == "--duration") {
             if (const auto v = take(i)) a.duration = parse_or<float>(*v, 0.0f);
         } else if (arg == "--steps") {
-            if (const auto v = take(i)) a.steps = parse_or<std::size_t>(*v, 32);
+            if (const auto v = take(i)) a.steps = parse_or<std::size_t>(*v, 12);
         } else if (arg == "--guidance") {
             if (const auto v = take(i)) a.guidance = parse_or<float>(*v, 2.0f);
         } else if (arg == "--rope-interleaved") {
@@ -333,7 +333,7 @@ void print_help() {
     std::printf("  --ref-audio PATH         WAV of a voice to clone\n");
     std::printf("  --ref-text TEXT          What that WAV says (required with it)\n");
     std::printf("  --duration S             Audio seconds (0 = estimate)   [default: 0]\n");
-    std::printf("  --steps N                Unmasking steps                [default: 32]\n");
+    std::printf("  --steps N                Unmasking steps                [default: 12]\n");
     std::printf("  --guidance G             Guidance scale (0 = off)       [default: 2.0]\n");
     std::printf("  --rope-interleaved       Use interleaved RoPE pairing (debugging; the\n");
     std::printf("                           default half-split is the correct one)\n");

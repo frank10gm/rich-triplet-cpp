@@ -74,8 +74,13 @@ namespace rt {
 // =============================================================================
 
 struct OmniGenConfig {
-    /// Unmasking steps. The reference default.
-    std::size_t num_step = 32;
+    /// Unmasking steps.
+    ///
+    /// The reference ships 32. This is 12, which is three times faster and
+    /// was judged indistinguishable by ear on Italian -- a listening call,
+    /// since every number this project prints looks the same across the range.
+    /// `--steps 32` restores the reference's setting.
+    std::size_t num_step = 12;
     /// Classifier-free guidance strength; 0 disables the unconditional pass
     /// entirely and halves the work.
     float guidance_scale = 2.0f;
