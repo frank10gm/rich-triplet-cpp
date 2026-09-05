@@ -746,6 +746,13 @@ namespace {
 
 }  // namespace
 
+Result<std::vector<float>> gguf_tensor_to_f32(const GgufFile& gguf, std::size_t idx) {
+    if (idx >= gguf.tensor_info.size()) {
+        return err("gguf: tensor index out of range");
+    }
+    return tensor_to_f32(gguf, idx);
+}
+
 Result<std::vector<float>> load_gguf_vector(const GgufFile& gguf, const std::string& name) {
     RT_TRY(idx, find(gguf, name));
     return tensor_to_f32(gguf, idx);

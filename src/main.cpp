@@ -21,7 +21,9 @@
 #include <string>
 #include <vector>
 
+#include "rt/clip_text.hpp"
 #include "rt/dataset.hpp"
+#include "rt/flux.hpp"
 #include "rt/init_rng.hpp"
 #include "rt/tensor_node.hpp"
 #include "rt/tokenizer.hpp"
@@ -33,12 +35,16 @@
 #include "rt/transformer4.hpp"
 #include "rt/omnivoice.hpp"
 #if RT_FEATURE_METAL
+#include "rt/metal_flux.hpp"
 #include "rt/metal_omnivoice.hpp"
 #endif
 #include "rt/orpheus.hpp"
+#include "rt/png.hpp"
 #include "rt/snac.hpp"
+#include "rt/t5.hpp"
 #include "rt/transformer5.hpp"
 #include "rt/transformer_qwen35.hpp"
+#include "rt/vae.hpp"
 #include "rt/wav.hpp"
 
 using namespace rt;
@@ -164,8 +170,10 @@ struct CliArgs {
     std::optional<std::string> ref_text;
     /// --duration S : audio seconds to generate; 0 uses the length heuristic
     float duration = 0.0f;
-    /// --steps N : OmniVoice unmasking steps
+    /// --steps N : OmniVoice unmasking steps, or FLUX denoising steps
     std::size_t steps = 12;
+    /// Whether --steps was given, so each model can keep its own default.
+    bool steps_set = false;
     /// --guidance G : classifier-free guidance scale; 0 disables it
     float guidance = 2.0f;
     /// --chunk-seconds S : audio per chunk when splitting long text; 0 never splits
@@ -176,6 +184,23 @@ struct CliArgs {
     float chunk_gap = 0.3f;
     /// --rope-interleaved : pair 2i with 2i+1 instead of i with i+head_dim/2
     bool rope_interleaved = false;
+    /// --t5 PATH : T5-XXL encoder GGUF, for text-to-image
+    std::optional<std::string> t5;
+    /// --t5-tokenizer PATH : the encoder's SentencePiece `spiece.model`
+    std::optional<std::string> t5_tokenizer;
+    /// --clip PATH : CLIP-L text encoder safetensors
+    std::optional<std::string> clip;
+    /// --clip-tokenizer PATH : CLIP's `tokenizer.json`
+    std::optional<std::string> clip_tokenizer;
+    /// --vae PATH : image autoencoder safetensors
+    std::optional<std::string> vae;
+    /// --width / --height : image size in pixels
+    std::size_t width = 1024;
+    std::size_t height = 1024;
+    /// --tile N : VAE tile size in latent pixels; 0 decodes the image whole
+    std::size_t vae_tile = 0;
+    /// --cpu : run the diffusion transformer on the CPU even when Metal is on
+    bool force_cpu = false;
 };
 
 void print_help();
@@ -277,9 +302,30 @@ template <typename T>
         } else if (arg == "--duration") {
             if (const auto v = take(i)) a.duration = parse_or<float>(*v, 0.0f);
         } else if (arg == "--steps") {
-            if (const auto v = take(i)) a.steps = parse_or<std::size_t>(*v, 12);
+            if (const auto v = take(i)) {
+                a.steps = parse_or<std::size_t>(*v, 12);
+                a.steps_set = true;
+            }
         } else if (arg == "--guidance") {
             if (const auto v = take(i)) a.guidance = parse_or<float>(*v, 2.0f);
+        } else if (arg == "--t5") {
+            a.t5 = take(i);
+        } else if (arg == "--t5-tokenizer") {
+            a.t5_tokenizer = take(i);
+        } else if (arg == "--clip") {
+            a.clip = take(i);
+        } else if (arg == "--clip-tokenizer") {
+            a.clip_tokenizer = take(i);
+        } else if (arg == "--vae") {
+            a.vae = take(i);
+        } else if (arg == "--width") {
+            a.width = parse_or<std::size_t>(take(i).value_or(""), a.width);
+        } else if (arg == "--height") {
+            a.height = parse_or<std::size_t>(take(i).value_or(""), a.height);
+        } else if (arg == "--tile") {
+            a.vae_tile = parse_or<std::size_t>(take(i).value_or(""), a.vae_tile);
+        } else if (arg == "--cpu") {
+            a.force_cpu = true;
         } else if (arg == "--rope-interleaved") {
             a.rope_interleaved = true;
         } else if (arg == "--draft-len") {
@@ -342,6 +388,19 @@ void print_help() {
     std::printf("  --out PATH               Output WAV                  [default: out.wav]\n");
     std::printf("  --no-audio-mask          Allow sampling outside the audio token range\n");
     std::printf("  --no-leading-bos         Drop the leading BOS token from the prompt\n");
+    std::printf("\nFLUX text to image (--model flux-schnell, --model flux-dev):\n");
+    std::printf("  --weights PATH           Transformer GGUF (Q4_K_M recommended)\n");
+    std::printf("  --t5 PATH                T5-XXL encoder GGUF\n");
+    std::printf("  --t5-tokenizer PATH      The encoder's spiece.model\n");
+    std::printf("  --clip PATH              CLIP-L text encoder safetensors\n");
+    std::printf("  --clip-tokenizer PATH    CLIP's tokenizer.json\n");
+    std::printf("  --vae PATH               Autoencoder safetensors (ae.safetensors)\n");
+    std::printf("  --width N --height N     Image size; multiples of 16 (default 1024)\n");
+    std::printf("  --steps N                Denoising steps (schnell 4, dev 28)\n");
+    std::printf("  --seed N                 Noise seed\n");
+    std::printf("  --tile N                 VAE tile in latent pixels; 0 decodes whole\n");
+    std::printf("  --cpu                    Run the transformer on the CPU\n");
+    std::printf("  --out PATH               Where to write the PNG (default out.png)\n");
     std::printf("\nOmniVoice (--model omnivoice):\n");
     std::printf("  --language NAME          Language hint, e.g. Italian    [default: None]\n");
     std::printf("  --instruct TEXT          Voice description              [default: None]\n");
@@ -696,6 +755,188 @@ void run_omnivoice(const CliArgs& args, const std::string& prompt) {
 // =============================================================================
 // Generation mode -- Orpheus text to speech
 // =============================================================================
+
+// =============================================================================
+// FLUX -- text to image
+// =============================================================================
+
+/// Encode a prompt with CLIP-L, returning the pooled vector FLUX conditions on.
+///
+/// CLIP wants the sequence bracketed by BOS and EOT and padded to 77 with more
+/// EOT. The padding matters: the pooled vector is read at the *first* EOT, so
+/// padding with anything else would work equally well here -- but the model was
+/// trained with EOT padding, and the per-token states the pooling reads through
+/// depend on it.
+[[nodiscard]] Result<std::vector<float>> encode_clip(const std::string& weights,
+                                                     const std::string& tokenizer_path,
+                                                     const std::string& prompt) {
+    RT_TRY(tok, HfBpeTokenizer::from_json_file(tokenizer_path));
+    const ClipTextConfig cfg = ClipTextConfig::large();
+
+    constexpr std::uint32_t kBos = 49406;
+    const std::uint32_t eot = cfg.eot_token_id;
+    std::vector<std::uint32_t> ids{kBos};
+    for (const std::uint32_t id : tok.encode(prompt)) {
+        if (ids.size() + 1 >= cfg.max_position_embeddings) {
+            break;  // leave room for the EOT
+        }
+        ids.push_back(id);
+    }
+    ids.push_back(eot);
+    ids.resize(cfg.max_position_embeddings, eot);
+
+    RT_TRY(model, ClipTextEncoder::load(weights, cfg));
+    RT_TRY(out, model.forward(ids));
+    return out.pooled;
+}
+
+/// Encode a prompt with T5-XXL, returning the `[seq_len, 4096]` sequence.
+///
+/// schnell truncates or pads to 256. T5 appends `</s>` and has no BOS, and the
+/// padding is id 0 -- the model was trained with an attention mask that hides
+/// it, which this implementation does not have, so the padded positions do
+/// contribute. They contribute what the reference implementation's unmasked
+/// path would contribute, which is what matters for matching it.
+[[nodiscard]] Result<Mat> encode_t5(const std::string& weights,
+                                    const std::string& tokenizer_path,
+                                    const std::string& prompt, std::size_t seq_len) {
+    RT_TRY(tok, SentencePieceTokenizer::from_model_file(tokenizer_path));
+    constexpr std::uint32_t kEos = 1;
+    constexpr std::uint32_t kPad = 0;
+
+    std::vector<std::uint32_t> ids = tok.encode(prompt);
+    if (ids.size() + 1 > seq_len) {
+        ids.resize(seq_len - 1);
+    }
+    ids.push_back(kEos);
+    ids.resize(seq_len, kPad);
+
+    RT_TRY(model, T5Encoder::load_gguf(weights, T5Config::xxl()));
+    std::fprintf(stderr, "[ FLUX ] T5-XXL: %.2f B parameters\n",
+                 static_cast<double>(model.parameter_count()) / 1e9);
+    RT_TRY(seq, model.forward(ids));
+    model.free_weights();
+    return seq;
+}
+
+void run_flux(const CliArgs& args, const std::string& prompt) {
+    if (!args.weights) {
+        die("--model flux-schnell needs --weights pointing at the transformer GGUF");
+    }
+    const auto require = [](const std::optional<std::string>& v, const char* flag) {
+        if (!v) {
+            die(std::string("--model flux-schnell needs ") + flag);
+        }
+        return *v;
+    };
+    const std::string t5_path = require(args.t5, "--t5");
+    const std::string t5_tok = require(args.t5_tokenizer, "--t5-tokenizer");
+    const std::string clip_path = require(args.clip, "--clip");
+    const std::string clip_tok = require(args.clip_tokenizer, "--clip-tokenizer");
+    const std::string vae_path = require(args.vae, "--vae");
+    const std::string out_path = args.out.value_or("out.png");
+
+    const bool is_dev = args.model && args.model->contains("dev");
+    FluxConfig cfg = is_dev ? FluxConfig::dev() : FluxConfig::schnell();
+    // schnell is distilled to four steps; dev wants nearer thirty.
+    const std::size_t steps = args.steps_set ? args.steps : (is_dev ? 28 : 4);
+
+    constexpr std::size_t kVaeFactor = 8;
+    const std::size_t align = kVaeFactor * cfg.patch_size;
+    if (args.width % align != 0 || args.height % align != 0) {
+        die("--width and --height must be multiples of " + std::to_string(align));
+    }
+
+    // Text first, and both encoders are released before the transformer is
+    // loaded. T5-XXL is 2.8 GB at Q4_K and the transformer is 6.7 GB; holding
+    // both at once is the difference between fitting in 18 GB and not.
+    std::fprintf(stderr, "[ FLUX ] Encoding the prompt with CLIP-L...\n");
+    const Result<std::vector<float>> pooled = encode_clip(clip_path, clip_tok, prompt);
+    if (!pooled) {
+        die("CLIP encoding failed: " + pooled.error());
+    }
+
+    std::fprintf(stderr, "[ FLUX ] Encoding the prompt with T5-XXL...\n");
+    const Result<Mat> context = encode_t5(t5_path, t5_tok, prompt, 256);
+    if (!context) {
+        die("T5 encoding failed: " + context.error());
+    }
+
+    std::fprintf(stderr, "[ FLUX ] Loading the transformer from %s...\n", args.weights->c_str());
+    Result<FluxModel> model = FluxModel::load_gguf(*args.weights, cfg);
+    if (!model) {
+        die("failed to load the transformer: " + model.error());
+    }
+    std::fprintf(stderr, "[ FLUX ] %.2f B parameters, %.2f GB of weights\n",
+                 static_cast<double>(model->parameter_count()) / 1e9,
+                 static_cast<double>(model->weight_bytes()) / 1e9);
+
+    FluxSampleParams params;
+    params.width = args.width;
+    params.height = args.height;
+    params.steps = steps;
+    params.seed = args.seed;
+    params.guidance = args.guidance;
+    // schnell's scheduler does not shift; dev's does, as a function of the
+    // sequence length. 1.0 is the identity either way for the four-step path.
+    params.shift = is_dev ? 1.15f : 1.0f;
+
+    std::fprintf(stderr, "[ FLUX ] Sampling %zux%zu in %zu steps (seed %llu)...\n", args.width,
+                 args.height, steps, static_cast<unsigned long long>(args.seed));
+    const auto started = std::chrono::steady_clock::now();
+
+    Result<Mat> latent = err("unreachable");
+#if RT_FEATURE_METAL
+    if (!args.force_cpu) {
+        Result<std::unique_ptr<MetalFluxContext>> engine = MetalFluxContext::create(
+            *model, args.height / kVaeFactor, args.width / kVaeFactor, context->rows);
+        if (!engine) {
+            die("failed to build the Metal engine: " + engine.error());
+        }
+        std::fprintf(stderr, "[ FLUX ] Metal: %.2f GB on the GPU\n",
+                     static_cast<double>((*engine)->device_bytes()) / 1e9);
+        latent = flux_sample_metal(**engine, cfg, *context, *pooled, params);
+    } else {
+        latent = flux_sample(*model, *context, *pooled, params);
+    }
+#else
+    latent = flux_sample(*model, *context, *pooled, params);
+#endif
+    if (!latent) {
+        die("sampling failed: " + latent.error());
+    }
+    const auto sampled = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[ FLUX ] Sampled in %.1f s\n",
+                 std::chrono::duration<double>(sampled - started).count());
+
+    std::fprintf(stderr, "[ FLUX ] Decoding the latent...\n");
+    Result<VaeDecoder> vae = VaeDecoder::load(vae_path, VaeConfig::flux());
+    if (!vae) {
+        die("failed to load the autoencoder: " + vae.error());
+    }
+
+    const std::size_t lat_h = args.height / kVaeFactor;
+    const std::size_t lat_w = args.width / kVaeFactor;
+    // The last decoder level runs 128 channels at full resolution, which is
+    // half a gigabyte per activation at 1024x1024. Tiling caps that.
+    const std::size_t tile = args.vae_tile != 0 ? args.vae_tile
+                             : (lat_h * lat_w > 64 * 64 ? 64 : 0);
+    const Result<Mat> pixels = tile != 0 ? vae->decode_tiled(*latent, lat_h, lat_w, tile, tile / 4)
+                                         : vae->decode(*latent, lat_h, lat_w);
+    if (!pixels) {
+        die("decoding failed: " + pixels.error());
+    }
+
+    const ImageStats stats = image_stats(*pixels, args.width, args.height);
+    std::fprintf(stderr, "[ FLUX ] %s\n", stats.describe().c_str());
+
+    if (const Result<void> ok = write_png(out_path, *pixels, args.width, args.height); !ok) {
+        die("failed to write the image: " + ok.error());
+    }
+    std::fprintf(stderr, "[ FLUX ] Wrote %s in %.1f s total\n", out_path.c_str(),
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
+                     .count());
+}
 
 void run_orpheus(const CliArgs& args, const std::string& prompt) {
     const std::string& weights_path = *args.weights;
@@ -1182,6 +1423,7 @@ int main(int argc, char** argv) {
     // Generation mode
     // -------------------------------------------------------------------------
     if (args.prompt) {
+        const bool is_flux = args.model && args.model->starts_with("flux");
         const bool is_omnivoice = args.model && args.model->starts_with("omnivoice");
         const bool is_orpheus = args.model && args.model->starts_with("orpheus");
         const bool is_qwen35 = args.model && args.model->starts_with("qwen35");
@@ -1189,9 +1431,11 @@ int main(int argc, char** argv) {
         // only architecture this CLI ever loaded from GGUF first.
         const bool is_gemma3 = args.tokenizer_model.has_value() ||
                                (args.model && args.model->starts_with("gemma3")) ||
-                               (!is_qwen35 && !is_orpheus && !is_omnivoice && args.weights &&
-                                args.weights->ends_with(".gguf"));
-        if (is_omnivoice) {
+                               (!is_qwen35 && !is_orpheus && !is_omnivoice && !is_flux &&
+                                args.weights && args.weights->ends_with(".gguf"));
+        if (is_flux) {
+            run_flux(args, *args.prompt);
+        } else if (is_omnivoice) {
             run_omnivoice(args, *args.prompt);
         } else if (is_orpheus) {
             if (!args.weights) {

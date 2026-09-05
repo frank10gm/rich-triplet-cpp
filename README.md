@@ -6,11 +6,13 @@ This is a port of [the Rust original](../rich-triplet), kept numerically identic
 
 Supports **Gemma 3** and **Qwen 3.5** text inference on Apple Silicon with Q4_K_M / Q4_0 GGUF weights and full-graph Metal GPU decode, plus two complete text-to-speech stacks — text in, WAV out, neural audio codecs included: **Orpheus**, an autoregressive Llama 3.2 emitting SNAC codes, and **OmniVoice**, a masked-diffusion Qwen3 that unmasks eight codebooks in parallel and clones a voice from a few seconds of reference audio.
 
+It also carries a text-to-image stack: **FLUX.1-schnell**, a 12B rectified-flow transformer with its T5-XXL and CLIP-L text encoders and a 16-channel autoencoder, text in and PNG out, with a full-graph Metal engine that keeps the transformer quantized on the GPU and widens each weight only as it is used. The design and its build log are in [docs/text-to-image.md](docs/text-to-image.md) — including [what is not yet verified](docs/text-to-image.md#what-is-not-verified), which is that it has never been run against the real checkpoints.
+
 ---
 
 ## What this project is
 
-Eight transformer implementations (GPT-2 scalar, GPT-2 tensor, GPT-OSS, Gemma 3, Qwen 3.5, Llama 3.2, a bidirectional Qwen3 used as a diffusion model, and HuBERT reading raw audio), two neural audio codec decoders and one encoder, a tensor autodiff engine, Apple Metal GPU acceleration, Flash Attention, GGUF / safetensors / torch-pickle weight loading, and a CLI for inference, training and speech synthesis.
+Eleven transformer implementations (GPT-2 scalar, GPT-2 tensor, GPT-OSS, Gemma 3, Qwen 3.5, Llama 3.2, a bidirectional Qwen3 used as a diffusion model, HuBERT reading raw audio, a T5 encoder, a CLIP text tower, and FLUX's two-stream MMDiT), two neural audio codec decoders and one encoder, an image autoencoder, a tensor autodiff engine, Apple Metal GPU acceleration, Flash Attention, GGUF / safetensors / torch-pickle weight loading, and a CLI for inference, training, speech synthesis and image generation.
 
 | File | What you understand after writing it |
 |---|---|
@@ -30,15 +32,22 @@ Eight transformer implementations (GPT-2 scalar, GPT-2 tensor, GPT-OSS, Gemma 3,
 | `orpheus.cpp` | Audio tokens: slot offsets, frame de-interleaving, resynchronisation |
 | `omnivoice.cpp` | Masked diffusion decoding: confidence unmasking, classifier-free guidance |
 | `omnivoice_codec.cpp` | Dense residual convolution, and why im2col earns its memory |
+| `conv2d.cpp` | The same operator one dimension up, and why the layout follows from it |
+| `vae.cpp` | GroupNorm's statistics span space, and what a latent is scaled by |
+| `t5.cpp` | An encoder with no positional embedding, and no attention scaling either |
+| `clip_text.cpp` | Why a text encoder is causal, and where its pooled vector comes from |
+| `flux.cpp` | Two stream types, adaptive layer norm, and three-axis RoPE |
 | `duration.cpp` | That Unicode has opinions about how long a character takes to say |
 | `resample.cpp` | Polyphase rate conversion, and why the filter has to be *that* filter |
 | `torch_pickle.cpp` | ZIP central directories, and just enough pickle to be safe |
 | `wav.cpp` | RIFF in both directions, and how to tell speech from noise without listening |
+| `png.cpp` | That DEFLATE has a mode needing no compressor, and CRC-32 either way |
 | `gguf.cpp` | GGUF file format: Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, BF16, F16, F32 |
 | `tokenizer.cpp` | Character, BPE, SentencePiece and HuggingFace BPE tokenizers |
 | `metal_ops.mm` | Metal GPU tiled matmul, Q4_K/BF16 GEMV kernels |
 | `metal_decode.mm` | Full-graph Metal decode: ~717 dispatches per token in one command buffer |
 | `metal_omnivoice.mm` | A GPU GEMM worth writing, and how to know a second implementation agrees |
+| `metal_flux.mm` | Keeping 12B quantized at rest, and streaming softmax past the threadgroup limit |
 | `train.cpp` / `train2.cpp` | AdamW, gradient clipping, autoregressive generation |
 
 ---
@@ -675,12 +684,110 @@ Apache 2.0.
 
 ---
 
+## FLUX text to image
+
+A 12B rectified-flow transformer, its two text encoders and a 16-channel
+autoencoder. Text in, PNG out.
+
+```bash
+./build-metal/rich-triplet \
+  --model flux-schnell \
+  --prompt "a photograph of a harbour at dawn, long exposure" \
+  --weights models/flux1-schnell-Q4_K_M.gguf \
+  --t5 models/t5-v1_1-xxl-encoder-Q4_K.gguf \
+  --t5-tokenizer models/spiece.model \
+  --clip models/clip_l.safetensors \
+  --clip-tokenizer models/clip_tokenizer.json \
+  --vae models/ae.safetensors \
+  --width 1024 --height 1024 --steps 4 --seed 42 \
+  --out harbour.png
+```
+
+### What it is
+
+FLUX is not a UNet. It is 19 **double-stream** blocks, where image and text are
+separate residual streams with separate weights but a single joint attention
+over the concatenation of both, followed by 38 **single-stream** blocks over
+that concatenation — with attention and MLP computed in parallel from the same
+modulated input and joined before one output projection, rather than run in
+sequence.
+
+There is no cross-attention anywhere. The prompt enters as tokens in the text
+stream; the timestep and the pooled CLIP vector enter through adaptive layer
+norm, which is why every LayerNorm in the model is affine-free. Position is
+three-axis RoPE over `(t, h, w)` with per-axis head dimensions 16, 56 and 56 —
+image tokens carry their patch-grid coordinates and text tokens carry zeros,
+which makes their rotation the identity.
+
+schnell is distilled to four steps **and** guidance-distilled, so there is no
+classifier-free guidance and one forward pass per step.
+
+### Memory, on an 18 GB M3 Pro
+
+```
+FLUX transformer   11.9B   Q4_K_M    ~6.7 GB
+T5-XXL encoder      4.7B   Q4_K      ~2.8 GB   released after encoding
+CLIP-L text          123M  F16       ~0.25 GB
+VAE decoder           84M  F32       ~0.34 GB
+```
+
+The two text encoders run first and are released before the transformer loads;
+holding T5 and the transformer at once is the difference between fitting and
+not. The autoencoder's last level runs 128 channels at full resolution — half a
+gigabyte per activation at 1024x1024 — so `--tile` decodes in overlapping tiles
+and blends the seams.
+
+### The Metal engine
+
+Weights stay quantized at rest and are widened per use: before each GEMM, one
+dispatch dequantizes that weight into a shared bfloat scratch buffer. This
+sounds wasteful and is not — the largest weight is a single-stream block's
+fused `linear1` at 3072 → 21504, which is 66 M elements to widen against
+575 GFLOP of GEMM to follow, and the scratch buffer is 132 MB reused by every
+projection in the model. Widening all 12B at rest would need 24 GB.
+
+The attention kernel is a streaming online softmax rather than the
+score-row-in-threadgroup-memory approach the OmniVoice engine uses, which caps
+out at 2048 keys; FLUX runs 4352 at 1024x1024.
+
+GPU and CPU agree to **0.5–0.7% RMS-relative**, flat in the number of blocks —
+the flatness being what identifies the residual as bfloat rounding in the
+matrix unit rather than a structural disagreement, which would compound with
+depth.
+
+`--cpu` runs the transformer on the CPU instead, which is correct and slow.
+
+### Weights
+
+| Component | Source |
+|---|---|
+| Transformer | `city96/FLUX.1-schnell-gguf` (Q4_K_M) |
+| T5-XXL encoder | `city96/t5-v1_1-xxl-encoder-gguf` (Q4_K) |
+| CLIP-L | `comfyanonymous/flux_text_encoders` |
+| VAE, tokenizers | `black-forest-labs/FLUX.1-schnell` |
+
+FLUX.1-schnell is Apache 2.0. `--model flux-dev` runs the dev config — same
+architecture plus a distilled-guidance embedding, 28 steps, non-commercial
+licence.
+
+### Status
+
+**This has not been run against the real checkpoints.** All 112 tests across the
+image stack build their weights synthetically: they verify that each piece
+agrees with its own reference implementation and that the GPU path agrees with
+the CPU path. They do not verify that the tensor names in the GGUF are the ones
+the loader asks for, or that the result is a picture.
+[docs/text-to-image.md](docs/text-to-image.md) has the full design, the build
+log, and the list of what remains unverified.
+
+---
+
 ## CLI options
 
 | Flag | Default | Description |
 |---|---|---|
 | `--prompt TEXT` | — | Text to complete |
-| `--model NAME` | — | `gpt-oss`, `gemma3-1b`, `gemma3-4b`, `qwen35-0.8b`, `qwen35-4b`, `qwen35-9b`, `orpheus-3b`, `omnivoice` |
+| `--model NAME` | — | `gpt-oss`, `gemma3-1b`, `gemma3-4b`, `qwen35-0.8b`, `qwen35-4b`, `qwen35-9b`, `orpheus-3b`, `omnivoice`, `flux-schnell`, `flux-dev` |
 | `--weights PATH` | — | GGUF file or safetensors directory |
 | `--tokenizer-dir DIR` | — | Directory containing `tokenizer.json` |
 | `--vocab PATH` / `--merges PATH` | — | BPE files, for GPT-OSS |
@@ -719,8 +826,8 @@ Apache 2.0.
 ## Running tests
 
 ```bash
-./build/tests/rt_tests          # 518 cases
-./build-metal/tests/rt_tests    # 530 cases, including the GPU kernels
+./build/tests/rt_tests          # 623 cases
+./build-metal/tests/rt_tests    # 642 cases, including the GPU kernels
 ```
 
 Covers matrix ops, gradient correctness against finite differences, attention
@@ -729,6 +836,13 @@ torch-pickle parsing, all four tokenizers, every architecture, 1-D convolution
 against reference loops, both codec decoders and the OmniVoice encoder, RIFF in
 both directions, resampling against the reference filter, the duration
 estimator's character classes, the Metal kernels, and the weight-loading paths.
+
+The image stack adds 112: 2-D convolution and GroupNorm against index-by-index
+references, the autoencoder's block algebra and tile blending, PNG containers
+checked chunk by chunk with a stored-block inflater, the T5 relative-position
+bucketing and its unscaled attention, CLIP's causal mask and argmax pooling,
+FLUX's patch order and three-axis RoPE, and the Metal engine against the CPU
+forward pass.
 
 A further 32 cases are hidden by default because they need downloaded weights
 (36 on the Metal build, which also checks the GPU engine against the CPU one):
@@ -833,11 +947,20 @@ src/
 ├── torch_pickle.cpp    PyTorch .bin reader: ZIP container + pickle manifest
 ├── wav.cpp             RIFF reading and writing, and waveform statistics
 │
+├── conv2d.cpp          2-D convolution, nearest upsampling, GroupNorm
+├── vae.cpp             16-channel AutoencoderKL decoder, whole and tiled
+├── qlinear.cpp         Inference-only linear over f32 / BF16 / Q4_K weights
+├── t5.cpp              T5 v1.1 encoder: relative position bias, gated GELU
+├── clip_text.cpp       CLIP-L text tower and its pooled output
+├── flux.cpp            FLUX MMDiT, three-axis RoPE, rectified-flow sampler
+├── png.cpp             PNG writing with stored DEFLATE blocks, image statistics
+│
 ├── gguf.cpp            GGUF parser and every quantized tensor decoder
 ├── metal_ops.mm        Metal GPU kernels (tiled matmul, per-dispatch GEMV)
 ├── metal_decode.mm     Full-graph Metal decode for Gemma 3
 ├── metal_decode_qwen35.mm       Full-graph Metal decode for Qwen 3.5
 ├── metal_omnivoice.mm           Full-graph Metal forward pass for OmniVoice
+├── metal_flux.mm                Full-graph Metal forward pass for FLUX
 ├── shaders/*.msl       The MSL kernel sources, embedded at build time
 │
 ├── train.cpp           Scalar AdamW + generation
@@ -1048,11 +1171,12 @@ world's scripts.
 
 ## Stats
 
-- ~33,500 lines of C++, Objective-C++ and MSL, plus ~12,500 of tests
-- 530 test cases with Metal, 518 without, plus 32 that need downloaded weights
+- ~39,000 lines of C++, Objective-C++ and MSL, plus ~15,000 of tests
+- 642 test cases with Metal, 623 without, plus 32 that need downloaded weights
   (36 with Metal)
 - Zero ML dependencies (Accelerate and Metal are system frameworks)
 - Every published weight format read from scratch: GGUF, safetensors, and
   PyTorch's ZIP-plus-pickle `.bin`
 - The ported modules are bit-exact against the Rust reference, module by
-  module; both text-to-speech stacks have no Rust counterpart and are new here
+  module; both text-to-speech stacks and the text-to-image stack have no Rust
+  counterpart and are new here

@@ -77,12 +77,16 @@ if(RT_METAL)
                   ${RT_SHADER_DIR}/decode_qwen35_msl.hpp kDecodeQwen35Msl)
   rt_embed_shader(${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/omnivoice.msl
                   ${RT_SHADER_DIR}/omnivoice_msl.hpp kOmnivoiceMsl)
+  rt_embed_shader(${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/flux.msl
+                  ${RT_SHADER_DIR}/flux_msl.hpp kFluxMsl)
   target_include_directories(rt_core PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
   target_sources(rt_core PRIVATE src/metal_ops.mm src/metal_decode.mm
-                                 src/metal_decode_qwen35.mm src/metal_omnivoice.mm)
+                                 src/metal_decode_qwen35.mm src/metal_omnivoice.mm
+                                 src/metal_flux.mm)
   set_source_files_properties(src/metal_ops.mm src/metal_decode.mm
                               src/metal_decode_qwen35.mm src/metal_omnivoice.mm
+                              src/metal_flux.mm
                               PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 endif()
 

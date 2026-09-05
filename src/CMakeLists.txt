@@ -1,6 +1,13 @@
 target_sources(rt_core PRIVATE
   mat.cpp
   conv1d.cpp
+  conv2d.cpp
+  qlinear.cpp
+  t5.cpp
+  clip_text.cpp
+  flux.cpp
+  png.cpp
+  vae.cpp
   quant_q4.cpp
   quant_q4k.cpp
   gguf.cpp

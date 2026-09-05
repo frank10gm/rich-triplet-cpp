@@ -248,4 +248,12 @@ void gguf_get_scale_min(const std::uint8_t* sc, std::size_t j, float& scale, flo
 /// Read an f32/f16 tensor as a flat vector, for biases.
 [[nodiscard]] Result<std::vector<float>> load_gguf_vector(const GgufFile& gguf,
                                                           const std::string& name);
+
+/// Decode any supported tensor to f32 by header index.
+///
+/// The by-name helpers above all route through this. Callers that have already
+/// looked up the index -- because they need the tensor's type to decide whether
+/// to keep it packed -- want it directly.
+[[nodiscard]] Result<std::vector<float>> gguf_tensor_to_f32(const GgufFile& gguf,
+                                                            std::size_t idx);
 }  // namespace rt

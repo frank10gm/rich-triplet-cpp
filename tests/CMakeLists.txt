@@ -2,6 +2,11 @@ add_executable(rt_tests
   test_bf16.cpp
   test_mat.cpp
   test_conv1d.cpp
+  test_conv2d.cpp
+  test_png.cpp
+  test_vae.cpp
+  test_text_encoders.cpp
+  test_flux.cpp
   test_quant.cpp
   test_gguf.cpp
   test_torch_pickle.cpp
@@ -29,6 +34,7 @@ add_executable(rt_tests
   test_metal_decode.cpp
   test_metal_decode_qwen35.cpp
   test_metal_omnivoice.cpp
+  test_metal_flux.cpp
 )
 target_link_libraries(rt_tests PRIVATE rt_core Catch2::Catch2WithMain)
 catch_discover_tests(rt_tests)
