@@ -219,3 +219,133 @@ TEST_CASE("wave_stats handles an empty waveform", "[wav]") {
     REQUIRE(!s.in_range());
     REQUIRE(!s.looks_like_speech());
 }
+
+// =============================================================================
+// Reading
+// =============================================================================
+
+TEST_CASE("decode_wav round-trips what encode_wav writes", "[wav]") {
+    const std::vector<float> samples = tone(2400, 220.0f, 0.5f);
+    const std::vector<std::uint8_t> bytes = encode_wav(samples, 24000, 1);
+
+    const Result<WavFile> got = decode_wav(bytes);
+    REQUIRE(got.has_value());
+    REQUIRE(got->sample_rate == 24000);
+    REQUIRE(got->channels == 1);
+    REQUIRE(got->samples.size() == samples.size());
+    // 16-bit PCM quantizes to steps of 1/32767, so the round trip is lossy by
+    // half a step and no more.
+    for (std::size_t i = 0; i < samples.size(); ++i) {
+        REQUIRE(std::fabs(got->samples[i] - samples[i]) < 1.0f / 32000.0f);
+    }
+}
+
+TEST_CASE("decode_wav keeps stereo interleaved and averages it on request", "[wav]") {
+    // Left is a constant +0.5, right a constant -0.25.
+    std::vector<float> stereo;
+    for (std::size_t i = 0; i < 100; ++i) {
+        stereo.push_back(0.5f);
+        stereo.push_back(-0.25f);
+    }
+    const Result<WavFile> got = decode_wav(encode_wav(stereo, 48000, 2));
+    REQUIRE(got.has_value());
+    REQUIRE(got->channels == 2);
+    REQUIRE(got->frames() == 100);
+    REQUIRE(got->samples.size() == 200);
+
+    const std::vector<float> mono = got->mono();
+    REQUIRE(mono.size() == 100);
+    for (const float v : mono) {
+        REQUIRE(approx(v, 0.125f));
+    }
+}
+
+TEST_CASE("decode_wav skips chunks it does not know", "[wav]") {
+    // Real encoders write LIST/INFO metadata between fmt and data. A reader
+    // that assumes the 44-byte header this module writes would reject them.
+    std::vector<std::uint8_t> bytes = encode_wav(tone(240, 220.0f, 0.3f), 24000, 1);
+    const std::vector<std::uint8_t> junk{'L', 'I', 'S', 'T', 6, 0, 0, 0, 'I', 'N', 'F', 'O', 'x', 'y'};
+
+    std::vector<std::uint8_t> spliced(bytes.begin(), bytes.begin() + 36);
+    spliced.insert(spliced.end(), junk.begin(), junk.end());
+    spliced.insert(spliced.end(), bytes.begin() + 36, bytes.end());
+    // The RIFF size field covers everything after itself.
+    const std::uint32_t riff = static_cast<std::uint32_t>(spliced.size() - 8);
+    for (std::size_t i = 0; i < 4; ++i) {
+        spliced[4 + i] = static_cast<std::uint8_t>((riff >> (8 * i)) & 0xff);
+    }
+
+    const Result<WavFile> got = decode_wav(spliced);
+    REQUIRE(got.has_value());
+    REQUIRE(got->samples.size() == 240);
+}
+
+TEST_CASE("decode_wav reads 8, 24 and 32-bit PCM and float", "[wav]") {
+    // Build each format by hand around the same one-sample payload.
+    const auto make = [](std::uint16_t format, std::uint16_t bits,
+                         const std::vector<std::uint8_t>& payload) {
+        std::vector<std::uint8_t> b;
+        const auto tag = [&b](const char* t) {
+            for (std::size_t i = 0; i < 4; ++i) b.push_back(static_cast<std::uint8_t>(t[i]));
+        };
+        const auto u32 = [&b](std::uint32_t v) {
+            for (std::size_t i = 0; i < 4; ++i) b.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
+        };
+        const auto u16 = [&b](std::uint16_t v) {
+            for (std::size_t i = 0; i < 2; ++i)
+                b.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
+        };
+        tag("RIFF");
+        u32(static_cast<std::uint32_t>(36 + payload.size()));
+        tag("WAVE");
+        tag("fmt ");
+        u32(16);
+        u16(format);
+        u16(1);
+        u32(24000);
+        u32(24000);
+        u16(static_cast<std::uint16_t>(bits / 8));
+        u16(bits);
+        tag("data");
+        u32(static_cast<std::uint32_t>(payload.size()));
+        b.insert(b.end(), payload.begin(), payload.end());
+        return b;
+    };
+
+    // 8-bit is unsigned and centred on 128, unlike every other integer depth.
+    const Result<WavFile> u8 = decode_wav(make(1, 8, {192}));
+    REQUIRE(u8.has_value());
+    REQUIRE(approx(u8->samples[0], 0.5f));
+
+    // 24-bit: 0x400000 is a quarter of full scale, and must sign-extend.
+    const Result<WavFile> s24 = decode_wav(make(1, 24, {0x00, 0x00, 0x40}));
+    REQUIRE(s24.has_value());
+    REQUIRE(approx(s24->samples[0], 0.5f));
+    const Result<WavFile> neg24 = decode_wav(make(1, 24, {0x00, 0x00, 0xC0}));
+    REQUIRE(neg24.has_value());
+    REQUIRE(approx(neg24->samples[0], -0.5f));
+
+    const Result<WavFile> s32 = decode_wav(make(1, 32, {0x00, 0x00, 0x00, 0x40}));
+    REQUIRE(s32.has_value());
+    REQUIRE(approx(s32->samples[0], 0.5f));
+
+    // Format 3 is IEEE float, already in [-1, 1].
+    const Result<WavFile> f32 = decode_wav(make(3, 32, {0x00, 0x00, 0x00, 0xBF}));
+    REQUIRE(f32.has_value());
+    REQUIRE(approx(f32->samples[0], -0.5f));
+}
+
+TEST_CASE("decode_wav rejects what it cannot read", "[wav]") {
+    REQUIRE_FALSE(decode_wav(std::vector<std::uint8_t>{}).has_value());
+    REQUIRE_FALSE(decode_wav(std::vector<std::uint8_t>(64, 0)).has_value());
+
+    // A valid header with a compressed format is a clear error rather than a
+    // silent misread of the bytes.
+    std::vector<std::uint8_t> bytes = encode_wav(tone(240, 220.0f, 0.3f), 24000, 1);
+    bytes[20] = 2;  // WAVE_FORMAT_ADPCM
+    REQUIRE_FALSE(decode_wav(bytes).has_value());
+}
+
+TEST_CASE("read_wav reports a missing file", "[wav]") {
+    REQUIRE_FALSE(read_wav("/nonexistent/path/to/nothing.wav").has_value());
+}

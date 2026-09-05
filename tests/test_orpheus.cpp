@@ -556,7 +556,8 @@ TEST_CASE("prefill and incremental decode agree", "[orpheus][.e2e]") {
 
     LlamaKvCache split(model.config, 64);
     const std::vector<std::size_t> head(ids.begin(), ids.end() - 1);
-    model.forward_cached(head, split);
+    // Only the cache it leaves behind matters here.
+    (void)model.forward_cached(head, split);
     const Mat incremental = model.forward_cached({ids.back()}, split);
 
     REQUIRE(all_at_once.cols == incremental.cols);

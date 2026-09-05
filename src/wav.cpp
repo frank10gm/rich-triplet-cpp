@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 
 namespace rt {
@@ -97,6 +98,201 @@ Result<void> write_wav(const std::string& path, std::span<const float> samples,
         return err("wav: short write to " + path);
     }
     return {};
+}
+
+// ---------------------------------------------------------------------------
+// Reading
+// ---------------------------------------------------------------------------
+
+namespace {
+
+[[nodiscard]] std::uint16_t read_u16(std::span<const std::uint8_t> b, std::size_t off) {
+    return static_cast<std::uint16_t>(b[off]) |
+           static_cast<std::uint16_t>(static_cast<std::uint16_t>(b[off + 1]) << 8);
+}
+
+[[nodiscard]] std::uint32_t read_u32(std::span<const std::uint8_t> b, std::size_t off) {
+    return static_cast<std::uint32_t>(b[off]) | (static_cast<std::uint32_t>(b[off + 1]) << 8) |
+           (static_cast<std::uint32_t>(b[off + 2]) << 16) |
+           (static_cast<std::uint32_t>(b[off + 3]) << 24);
+}
+
+[[nodiscard]] bool tag_is(std::span<const std::uint8_t> b, std::size_t off, const char* tag) {
+    for (std::size_t i = 0; i < 4; ++i) {
+        if (b[off + i] != static_cast<std::uint8_t>(tag[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Reassemble a 32-bit float from its little-endian bytes.
+[[nodiscard]] float bits_to_f32(std::uint32_t bits) {
+    float out = 0.0f;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+}  // namespace
+
+std::vector<float> WavFile::mono() const {
+    if (channels <= 1) {
+        return samples;
+    }
+    const std::size_t n = frames();
+    std::vector<float> out(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        float sum = 0.0f;
+        for (std::size_t c = 0; c < channels; ++c) {
+            sum += samples[i * channels + c];
+        }
+        out[i] = sum / static_cast<float>(channels);
+    }
+    return out;
+}
+
+Result<WavFile> decode_wav(std::span<const std::uint8_t> bytes) {
+    if (bytes.size() < 12) {
+        return err("wav: file is too short to be RIFF");
+    }
+    if (!tag_is(bytes, 0, "RIFF") || !tag_is(bytes, 8, "WAVE")) {
+        return err("wav: not a RIFF/WAVE file");
+    }
+
+    std::uint16_t format = 0;
+    std::uint16_t channels = 0;
+    std::uint32_t sample_rate = 0;
+    std::uint16_t bits = 0;
+    bool have_fmt = false;
+    std::span<const std::uint8_t> data;
+    bool have_data = false;
+
+    // Walk the chunk list. Anything that is not fmt or data -- LIST, INFO,
+    // fact, a trailing ID3 tag -- is skipped rather than rejected, since almost
+    // no encoder writes the bare 44-byte header this module does.
+    std::size_t off = 12;
+    while (off + 8 <= bytes.size()) {
+        const std::uint32_t size = read_u32(bytes, off + 4);
+        const std::size_t body = off + 8;
+        // A chunk claiming more than the file holds is truncation, not a
+        // reason to lose what came before it.
+        const std::size_t avail = std::min<std::size_t>(size, bytes.size() - body);
+
+        if (tag_is(bytes, off, "fmt ") && avail >= 16) {
+            format = read_u16(bytes, body);
+            channels = read_u16(bytes, body + 2);
+            sample_rate = read_u32(bytes, body + 4);
+            bits = read_u16(bytes, body + 14);
+            // WAVE_FORMAT_EXTENSIBLE hides the real format in the first two
+            // bytes of its extension block; the rest of the GUID is fixed.
+            if (format == 0xFFFE && avail >= 26) {
+                format = read_u16(bytes, body + 24);
+            }
+            have_fmt = true;
+        } else if (tag_is(bytes, off, "data")) {
+            data = bytes.subspan(body, avail);
+            have_data = true;
+        }
+
+        // Chunks are word-aligned: an odd size is followed by a pad byte.
+        off = body + avail + (avail % 2);
+    }
+
+    if (!have_fmt) {
+        return err("wav: no fmt chunk");
+    }
+    if (!have_data) {
+        return err("wav: no data chunk");
+    }
+    if (channels == 0) {
+        return err("wav: zero channels");
+    }
+    if (sample_rate == 0) {
+        return err("wav: zero sample rate");
+    }
+
+    WavFile out;
+    out.sample_rate = sample_rate;
+    out.channels = channels;
+
+    const auto scale_int = [](std::int64_t v, std::int64_t peak) {
+        return static_cast<float>(static_cast<double>(v) / static_cast<double>(peak));
+    };
+
+    if (format == 1 && bits == 16) {
+        out.samples.reserve(data.size() / 2);
+        for (std::size_t i = 0; i + 1 < data.size(); i += 2) {
+            out.samples.push_back(
+                scale_int(static_cast<std::int16_t>(read_u16(data, i)), 32768));
+        }
+    } else if (format == 1 && bits == 8) {
+        // 8-bit PCM is the odd one out: unsigned, centred on 128.
+        out.samples.reserve(data.size());
+        for (const std::uint8_t v : data) {
+            out.samples.push_back((static_cast<float>(v) - 128.0f) / 128.0f);
+        }
+    } else if (format == 1 && bits == 24) {
+        out.samples.reserve(data.size() / 3);
+        for (std::size_t i = 0; i + 2 < data.size(); i += 3) {
+            const std::uint32_t raw = static_cast<std::uint32_t>(data[i]) |
+                                      (static_cast<std::uint32_t>(data[i + 1]) << 8) |
+                                      (static_cast<std::uint32_t>(data[i + 2]) << 16);
+            // Sign-extend from 24 bits.
+            const std::int32_t v = static_cast<std::int32_t>(raw << 8) >> 8;
+            out.samples.push_back(scale_int(v, 8388608));
+        }
+    } else if (format == 1 && bits == 32) {
+        out.samples.reserve(data.size() / 4);
+        for (std::size_t i = 0; i + 3 < data.size(); i += 4) {
+            out.samples.push_back(
+                scale_int(static_cast<std::int32_t>(read_u32(data, i)), 2147483648LL));
+        }
+    } else if (format == 3 && bits == 32) {
+        out.samples.reserve(data.size() / 4);
+        for (std::size_t i = 0; i + 3 < data.size(); i += 4) {
+            out.samples.push_back(bits_to_f32(read_u32(data, i)));
+        }
+    } else if (format == 3 && bits == 64) {
+        out.samples.reserve(data.size() / 8);
+        for (std::size_t i = 0; i + 7 < data.size(); i += 8) {
+            std::uint64_t raw = 0;
+            for (std::size_t b = 0; b < 8; ++b) {
+                raw |= static_cast<std::uint64_t>(data[i + b]) << (8 * b);
+            }
+            double v = 0.0;
+            std::memcpy(&v, &raw, sizeof(v));
+            out.samples.push_back(static_cast<float>(v));
+        }
+    } else {
+        return err("wav: unsupported format " + std::to_string(format) + " at " +
+                   std::to_string(bits) + " bits");
+    }
+
+    // A truncated final frame would leave the channels out of phase for every
+    // consumer downstream, so drop it rather than carry it.
+    out.samples.resize(out.frames() * channels);
+    if (out.samples.empty()) {
+        return err("wav: data chunk holds no whole frames");
+    }
+    return out;
+}
+
+Result<WavFile> read_wav(const std::string& path) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        return err("wav: cannot open " + path + " for reading");
+    }
+    std::vector<std::uint8_t> bytes;
+    std::uint8_t buf[64 * 1024];
+    while (const std::size_t n = std::fread(buf, 1, sizeof(buf), f)) {
+        bytes.insert(bytes.end(), buf, buf + n);
+    }
+    const bool failed = std::ferror(f) != 0;
+    std::fclose(f);
+    if (failed) {
+        return err("wav: read error on " + path);
+    }
+    return decode_wav(bytes);
 }
 
 // ---------------------------------------------------------------------------

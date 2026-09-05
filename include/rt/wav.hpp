@@ -45,6 +45,38 @@ namespace rt {
                                                    std::size_t channels = 1);
 
 // ---------------------------------------------------------------------------
+// Reading
+// ---------------------------------------------------------------------------
+
+/// A decoded WAV: samples in [-1, 1], interleaved if there is more than one
+/// channel.
+struct WavFile {
+    std::vector<float> samples;
+    std::size_t sample_rate = 0;
+    std::size_t channels = 1;
+
+    /// Average the channels down to one. Voice cloning wants mono, and every
+    /// analysis path downstream assumes it.
+    [[nodiscard]] std::vector<float> mono() const;
+
+    [[nodiscard]] std::size_t frames() const {
+        return channels == 0 ? 0 : samples.size() / channels;
+    }
+};
+
+/// Parse a RIFF/WAVE file from memory.
+///
+/// Accepts 8-bit unsigned, 16/24/32-bit signed PCM (format 1) and 32/64-bit
+/// float (format 3), plus WAVE_FORMAT_EXTENSIBLE (0xFFFE), whose real format
+/// lives in the first two bytes of its extension. Chunks other than `fmt ` and
+/// `data` are skipped, which is what makes files written by anything other
+/// than this module readable -- `LIST`/`INFO` metadata is near universal.
+[[nodiscard]] Result<WavFile> decode_wav(std::span<const std::uint8_t> bytes);
+
+/// Read and parse a WAV file from disk.
+[[nodiscard]] Result<WavFile> read_wav(const std::string& path);
+
+// ---------------------------------------------------------------------------
 // Signal checks
 // ---------------------------------------------------------------------------
 

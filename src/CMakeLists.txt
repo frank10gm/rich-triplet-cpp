@@ -8,6 +8,7 @@ target_sources(rt_core PRIVATE
   snac.cpp
   wav.cpp
   duration.cpp
+  resample.cpp
   ndarray.cpp
   tensor_node.cpp
   nn2.cpp
