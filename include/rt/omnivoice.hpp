@@ -299,6 +299,11 @@ struct OmniReference {
 /// The reference fades a tenth of a second, which is long enough to ramp the
 /// last syllable of a chunk to nothing when the estimate was tight -- and it
 /// usually is.
+///
+/// Both departures are confirmed by listening, not only by the measurements
+/// above. That matters here for the same reason it matters for the RoPE
+/// pairing: the numbers can show a pause is uneven or a fade lands on speech,
+/// but not that the result sounds better.
 [[nodiscard]] std::vector<float> omni_cross_fade(const std::vector<std::vector<float>>& chunks,
                                                  std::size_t sample_rate,
                                                  float gap_seconds = 0.3f);

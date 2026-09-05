@@ -498,7 +498,10 @@ utterances rather than one signal cut in two, so cross-fading them onto each
 other would sound like two people talking over one another.
 
 Two things about that join are worth more than they look, and both are
-departures from the reference, made after measuring what it produces.
+departures from the reference, made after measuring what it produces and then
+**confirmed by ear against the reference's own behaviour** — the same standard
+the RoPE pairing was settled by, and the only one that can settle a question
+about how something sounds.
 
 *Each piece is trimmed to what it actually says.* A chunk's length comes from a
 duration estimate, so it ends with however much silence the estimate overshot
