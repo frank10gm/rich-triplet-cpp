@@ -238,8 +238,13 @@ struct OmniReference {
                                                               std::size_t frames);
 
 /// Run the unmasking loop and decode the result.
+///
+/// `accel`, when given, runs the forward passes instead of `lm` -- the model is
+/// still needed for its config and its prompt layout. Passing a backend whose
+/// weights came from a different model is the caller's problem.
 [[nodiscard]] Result<OmniResult> omni_synthesize(const OmniLm& lm, const OmniCodecDecoder& codec,
                                                  const HfBpeTokenizer& tok,
-                                                 const OmniRequest& request);
+                                                 const OmniRequest& request,
+                                                 const OmniForward* accel = nullptr);
 
 }  // namespace rt

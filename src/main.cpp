@@ -32,6 +32,9 @@
 #include "rt/transformer3.hpp"
 #include "rt/transformer4.hpp"
 #include "rt/omnivoice.hpp"
+#if RT_FEATURE_METAL
+#include "rt/metal_omnivoice.hpp"
+#endif
 #include "rt/orpheus.hpp"
 #include "rt/snac.hpp"
 #include "rt/transformer5.hpp"
@@ -614,7 +617,32 @@ void run_omnivoice(const CliArgs& args, const std::string& prompt) {
                  request.ref_codes.empty() ? "off" : "on");
     std::fprintf(stderr, "[ OmniVoice ] Synthesising: \"%s\"\n", prompt.c_str());
 
-    const Result<OmniResult> result = omni_synthesize(*lm, *codec, *tok, request);
+    const OmniForward* accel = nullptr;
+#if RT_FEATURE_METAL
+    // The whole forward pass in one command buffer. Unlike the decode engines,
+    // this exists for the GEMMs rather than despite them: a diffusion step is a
+    // full-sequence pass over a few hundred positions, which is the shape the
+    // matrix units are for.
+    std::fprintf(stderr, "[ Metal ] Uploading weights...\n");
+    const auto t_upload = std::chrono::steady_clock::now();
+    std::unique_ptr<MetalOmniContext> metal_ctx =
+        MetalOmniContext::create(*lm, MetalOmniContext::kMaxTokens);
+    if (metal_ctx) {
+        std::fprintf(stderr, "[ Metal ] %.2f GB in GPU buffers, uploaded in %.1f s\n",
+                     static_cast<double>(metal_ctx->buffer_bytes()) / 1e9,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t_upload)
+                         .count());
+        release_memory_to_os();
+        print_rss("after the GPU upload");
+        accel = metal_ctx.get();
+    } else {
+        // create() frees the CPU weights as it goes, so a partial failure
+        // leaves nothing to fall back to.
+        die("the Metal engine failed to initialise");
+    }
+#endif
+
+    const Result<OmniResult> result = omni_synthesize(*lm, *codec, *tok, request, accel);
     if (!result) {
         die("synthesis failed: " + result.error());
     }

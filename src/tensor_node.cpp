@@ -628,7 +628,6 @@ TensorNode TensorNode::causal_attention(const TensorNode& q, const TensorNode& k
                                         const TensorNode& v, std::size_t d_head) {
     const Mat& q_d = q.data();
     const Mat& k_d = k.data();
-    const std::size_t t = q_d.rows;
     const float scale = 1.0f / std::sqrt(static_cast<float>(d_head));
 
     auto weights = std::make_shared<Mat>(

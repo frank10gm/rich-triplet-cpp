@@ -202,7 +202,26 @@ struct OmniToken {
     }
 };
 
-class OmniLm {
+// =============================================================================
+// Backends
+// =============================================================================
+
+/// Anything that can run one full-sequence forward pass.
+///
+/// `OmniLm` is one; `MetalOmniContext` is the other, and the diffusion loop
+/// does not need to know which it has. The interface is deliberately the whole
+/// pass rather than a layer at a time: a masked diffusion model caches nothing
+/// between steps, so there is no state for a backend to hold across calls and
+/// nothing finer worth abstracting.
+class OmniForward {
+   public:
+    virtual ~OmniForward() = default;
+
+    /// Audio logits for every position, `[T, codebooks * vocab]`.
+    [[nodiscard]] virtual Result<Mat> forward(const std::vector<OmniToken>& tokens) const = 0;
+};
+
+class OmniLm final : public OmniForward {
    public:
     Config6 config;
     /// [text_vocab_size, hidden_size]
@@ -230,7 +249,7 @@ class OmniLm {
     ///
     /// Column `i * audio_vocab_size + c` is the logit for code `c` of codebook
     /// `i` at that position.
-    [[nodiscard]] Result<Mat> forward(const std::vector<OmniToken>& tokens) const;
+    [[nodiscard]] Result<Mat> forward(const std::vector<OmniToken>& tokens) const override;
 
     [[nodiscard]] std::size_t weight_bytes() const;
 

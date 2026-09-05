@@ -38,6 +38,7 @@ Eight transformer implementations (GPT-2 scalar, GPT-2 tensor, GPT-OSS, Gemma 3,
 | `tokenizer.cpp` | Character, BPE, SentencePiece and HuggingFace BPE tokenizers |
 | `metal_ops.mm` | Metal GPU tiled matmul, Q4_K/BF16 GEMV kernels |
 | `metal_decode.mm` | Full-graph Metal decode: ~717 dispatches per token in one command buffer |
+| `metal_omnivoice.mm` | A GPU GEMM worth writing, and how to know a second implementation agrees |
 | `train.cpp` / `train2.cpp` | AdamW, gradient clipping, autoregressive generation |
 
 ---
@@ -224,12 +225,13 @@ and `Linear2` computes `input @ weight.T`.
 | Realtime factor | ~5.3 |
 | SNAC decode | ~0.1 s per second of audio |
 
-So a 4 s clip takes about 21 s. Decode runs on the CPU: there is no full-graph
-Metal path for Llama yet, and the Metal build measures the same, because
-per-token cost is Q4_K GEMV rather than the large matmuls `Mat::matmul` sends
-to the GPU. Two things would close most of the gap — a `metal_decode_llama.mm`
+So a 4 s clip takes about 21 s. Decode runs on the CPU and the Metal build
+measures the same, for a duller reason than it looks: with `RT_BLAS` on --
+which is the default -- `Mat::matmul` dispatches to Accelerate and never
+reaches the GPU at all, so a Metal build without a dedicated engine is a CPU
+build. Two things would close most of the gap — a `metal_decode_llama.mm`
 trimmed from the Gemma engine, and speculative decoding, which is already
-implemented for Gemma.
+implemented for Gemma. OmniVoice has such an engine; Orpheus does not yet.
 
 ### Diagnosing it
 
@@ -338,16 +340,17 @@ Cost is `steps * 2` full-sequence forward passes and nothing else, so it is
 almost exactly linear. Measured on an M3 Pro (18 GB, CPU build), synthesising
 4 s of Italian:
 
-| `--steps` | Realtime factor | Wall clock for 4 s | |
+| `--steps` | RTF, CPU | RTF, Metal | |
 |---|---|---|---|
-| 8 | 1.30 | 5.2 s | |
-| 12 | 1.96 | 7.9 s | **the default** |
-| 16 | 2.46 | 9.8 s | |
-| 32 | 5.17 | 20.7 s | the reference's |
+| 8 | 1.30 | 0.38 | |
+| 12 | 1.96 | **0.54** | the default |
+| 16 | 2.46 | 0.69 | |
+| 32 | 5.17 | 1.31 | the reference's |
 
-A reference clip adds its own frames to every forward pass, so cloning costs
-more per step: a 4 s reference roughly doubles the sequence and takes `--steps
-12` from a realtime factor of 1.96 to 3.4.
+On the GPU it synthesises faster than the audio plays at every setting up to
+16. A reference clip adds its own frames to every forward pass, so cloning
+costs more: a 4 s reference roughly doubles the sequence and takes `--steps 12`
+from 0.54 to 1.06.
 
 The default is 12 rather than the reference's 32, which is three times faster
 and was judged indistinguishable by ear on Italian. That is a listening call
@@ -355,6 +358,84 @@ and could not have been anything else: the waveform statistics look like speech
 across the whole range and only stop at the extreme, where a single step
 produces something the check flags and warns about. `--steps 32` restores the
 reference's setting.
+
+### The Metal path
+
+```bash
+cmake -S . -B build-metal -DRT_METAL=ON && cmake --build build-metal -j
+./build-metal/rich-triplet --model omnivoice --prompt "..." --language Italian
+```
+
+This is the first Metal engine here for a text-to-speech model and the first
+for a *prefill* shape rather than a decode one. The Gemma and Qwen engines
+exist because a decode step is a chain of GEMVs, memory-bound and too small to
+dispatch one at a time. This one exists for the opposite reason: OmniVoice has
+no KV cache, so every step is a full-sequence pass over a few hundred
+positions — large GEMMs, compute-bound, exactly what the matrix units are for.
+
+**It had to clear a high bar.** Accelerate's sgemm reaches about 1.0 TFLOP/s on
+an M3 Pro for these shapes. The tiled matmul in `metal_ops.mm` manages 250
+GF/s, so routing the GEMMs through it would have been a 4× regression. What
+clears the bar is `simdgroup_matrix`: a 64×64 tile per threadgroup built from
+sixteen 8×8 accumulators, which reaches 1.2–2.3 TFLOP/s depending on shape.
+Every 8×8 operand loaded from memory feeds four multiply-accumulates instead of
+one, and that register blocking is the whole difference.
+
+The GEMMs are only 40% of the CPU runtime, though, so moving them alone would
+have capped the win near 1.3×. Profiling said where the rest goes, and all of
+it is work the GPU does not have to do:
+
+| | Share of CPU runtime | On the GPU |
+|---|---|---|
+| sgemm | 40% | the matrix units |
+| BF16 dequantization | 12% | **gone** — `bfloat` is an operand type |
+| `bzero` in `Mat::zeros` | 8% | **gone** — scratch is allocated once |
+| attention, `expf`, norms, SiLU, RoPE | ~33% | kernels |
+
+The BF16 line is the one worth naming. The CPU path dequantizes every weight
+into an f32 scratch buffer on *every call* — 437 million conversions per
+forward pass, 28 billion for a four-second clip. A Metal kernel takes `bfloat`
+straight as a matrix operand, so the checkpoint's own storage format is read
+with no conversion pass at all.
+
+Measured on an M3 Pro, four seconds of Italian at the default 12 steps:
+
+| | CPU | Metal |
+|---|---|---|
+| Generate | 7.53 s | **1.88 s** |
+| Realtime factor | 1.96 | **0.54** |
+| Resident | 2.0 GB | **1.8 GB** |
+
+Four times faster, and *less* memory: the CPU weights are freed as they are
+uploaded, so nothing holds both copies. The remaining 0.26 s is the codec
+decode, which is still on the CPU and is now a fifth of the total.
+
+### Trusting a second implementation of the same model
+
+A GPU engine is a rewrite of the forward pass, and a wrong one produces audio
+that sounds plausible — the same trap as every other part of this pipeline.
+What makes it checkable is that the CPU path is still there.
+
+The test loads the checkpoint twice, uploads one copy, and compares. Logits
+agree to a relative 1e-5, which is f32 epsilon — BLAS chunks the weight while
+the GPU accumulates 8×8 tiles, so the two sum in different orders and could not
+agree further. The check that matters is not the logits but the **argmax per
+(position, codebook)**, which is what the sampler actually reads: those agree
+**exactly**, on every one of them.
+
+Over a full generation the two are not bit-identical, and the reason is worth
+knowing. Which positions get unmasked at each step comes from sorting
+confidence scores, and scores that differ in their last bits can sort
+differently. One such flip early on changes every decision after it. The
+waveforms still correlate at 0.9995 — the same utterance, decided in a
+marginally different order.
+
+Sequence length is padded to a multiple of 64 so the GEMM tiles divide evenly
+and the inner loop needs no bounds checks. Those padding rows are zeroed and
+carry through harmlessly, because every operator except attention is
+row-independent — and attention is dispatched over the true length, never the
+padded one. There is a test for exactly the lengths that are not multiples of
+64.
 
 ### Length has to be decided in advance
 
@@ -572,7 +653,8 @@ against reference loops, both codec decoders and the OmniVoice encoder, RIFF in
 both directions, resampling against the reference filter, the duration
 estimator's character classes, the Metal kernels, and the weight-loading paths.
 
-A further 32 cases are hidden by default because they need downloaded weights:
+A further 32 cases are hidden by default because they need downloaded weights
+(36 on the Metal build, which also checks the GPU engine against the CPU one):
 
 ```bash
 ./build/tests/rt_tests '[.integration]'   # real checkpoints, seconds
@@ -596,8 +678,9 @@ stride, the full chain by exactly 960, the unmask schedule accounts for every
 puts each script, category and boundary code point in the class the reference
 does. The cloning prompt is checked the same way, against a twenty-word
 tokenizer built inside the test, since what is under test is the layout and not
-the merges. What needs the checkpoint is the codec round trip, and that
-everything loads and is deterministic.
+the merges. What needs the checkpoint is the codec round trip, the Metal
+engine's agreement with the CPU one, and that everything loads and is
+deterministic.
 
 ---
 
@@ -677,6 +760,7 @@ src/
 ├── metal_ops.mm        Metal GPU kernels (tiled matmul, per-dispatch GEMV)
 ├── metal_decode.mm     Full-graph Metal decode for Gemma 3
 ├── metal_decode_qwen35.mm       Full-graph Metal decode for Qwen 3.5
+├── metal_omnivoice.mm           Full-graph Metal forward pass for OmniVoice
 ├── shaders/*.msl       The MSL kernel sources, embedded at build time
 │
 ├── train.cpp           Scalar AdamW + generation
@@ -826,6 +910,24 @@ out = S^T q
 
 so decode is O(1) in sequence length rather than O(T).
 
+### Two shapes of GPU work
+
+A decode step and a diffusion step want opposite things from a GPU, and this
+project now has an engine for each.
+
+An autoregressive decode is one token wide: every weight is read once and
+multiplied by a single vector. That is memory-bound, the arithmetic is trivial,
+and the enemy is dispatch overhead — hence `metal_decode.mm`, which encodes
+~717 GEMVs into one command buffer so the GPU is never idle between them.
+
+A masked diffusion step is the whole sequence wide, because there is no cache
+to shorten it. Every weight is read once and multiplied by a few hundred
+vectors, which is compute-bound and hands the matrix units exactly the shape
+they want. There the enemy is the kernel itself: a scalar tiled matmul loses to
+Accelerate by 4×, and only register blocking with `simdgroup_matrix` wins.
+
+Same hardware, same model family, opposite bottleneck.
+
 ### Masked diffusion decoding
 
 An autoregressive model spends its compute on one new position at a time and
@@ -869,8 +971,9 @@ world's scripts.
 
 ## Stats
 
-- ~32,200 lines of C++, Objective-C++ and MSL, plus ~12,200 of tests
+- ~33,000 lines of C++, Objective-C++ and MSL, plus ~12,400 of tests
 - 510 test cases with Metal, 498 without, plus 32 that need downloaded weights
+  (36 with Metal)
 - Zero ML dependencies (Accelerate and Metal are system frameworks)
 - Every published weight format read from scratch: GGUF, safetensors, and
   PyTorch's ZIP-plus-pickle `.bin`

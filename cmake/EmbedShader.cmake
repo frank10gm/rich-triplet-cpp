@@ -2,6 +2,10 @@
 # shaders stay editable as MSL (syntax highlighting, external validation) while
 # still compiling into the binary with no runtime file lookup.
 function(rt_embed_shader MSL_PATH OUT_HEADER SYMBOL)
+  # The read happens at configure time, so without this an edited .msl would
+  # build cleanly and change nothing -- the generated header would still hold
+  # the previous source. Listing it here makes CMake re-run on a change.
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MSL_PATH}")
   file(READ "${MSL_PATH}" _msl_source)
   # RT_MSL is an unlikely delimiter to appear in shader source, so the raw
   # string cannot be terminated early.

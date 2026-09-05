@@ -356,8 +356,12 @@ void log_softmax(std::span<float> row) {
 }  // namespace
 
 Result<OmniResult> omni_synthesize(const OmniLm& lm, const OmniCodecDecoder& codec,
-                                   const HfBpeTokenizer& tok, const OmniRequest& request) {
+                                   const HfBpeTokenizer& tok, const OmniRequest& request,
+                                   const OmniForward* accel) {
     const Config6& cfg = lm.config;
+    // The model still owns the config and the prompt layout; only the forward
+    // pass moves.
+    const OmniForward& fwd = accel != nullptr ? *accel : static_cast<const OmniForward&>(lm);
     const std::size_t codebooks = cfg.num_audio_codebook;
     const std::size_t vocab = cfg.audio_vocab_size;
 
@@ -410,11 +414,11 @@ Result<OmniResult> omni_synthesize(const OmniLm& lm, const OmniCodecDecoder& cod
             continue;
         }
 
-        RT_TRY(c_logits, lm.forward(cond_seq));
+        RT_TRY(c_logits, fwd.forward(cond_seq));
         ++passes;
         Mat u_logits;
         if (use_guidance) {
-            RT_TRY(u, lm.forward(uncond_seq));
+            RT_TRY(u, fwd.forward(uncond_seq));
             u_logits = std::move(u);
             ++passes;
         }
