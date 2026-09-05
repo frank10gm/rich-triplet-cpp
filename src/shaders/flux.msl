@@ -400,7 +400,16 @@ kernel void flux_gelu_tanh(
     uint i [[thread_position_in_grid]])
 {
     const float v = x[i];
-    const float inner = 0.7978845608028654f * (v + 0.044715f * v * v * v);
+    // The cubic term grows fast: an activation of 27 -- ordinary in a FLUX MLP
+    // -- puts the argument near 724, and Metal compiles `tanh` under fast-math
+    // into a form that evaluates exp(2x). At 724 that is inf, and inf/inf is
+    // NaN. One NaN in a residual stream poisons every later block, so it shows
+    // up as a fully black image and nothing more specific.
+    //
+    // tanh is saturated to within a float's resolution well before 10, so
+    // clamping the argument is exact rather than approximate.
+    const float inner =
+        clamp(0.7978845608028654f * (v + 0.044715f * v * v * v), -10.0f, 10.0f);
     x[i] = 0.5f * v * (1.0f + tanh(inner));
 }
 

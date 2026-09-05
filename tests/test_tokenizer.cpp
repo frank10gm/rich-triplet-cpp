@@ -468,3 +468,60 @@ TEST_CASE("gpt2 pretokenizer splits like the reference", "[tokenizer]") {
 
     REQUIRE(HfBpeTokenizer::gpt2_pretokenize("").empty());
 }
+
+// =============================================================================
+// CLIP pre-tokenization
+// =============================================================================
+//
+// CLIP is a different family from GPT-2 and Llama 3: the text is lowercased and
+// its whitespace collapsed before splitting, the split drops whitespace rather
+// than attaching it to the following word, and each word carries an explicit
+// `</w>` marker instead of a leading space.
+
+TEST_CASE("CLIP normalization lowercases and collapses whitespace", "[tokenizer][clip]") {
+    using PT = HfBpeTokenizer::PreTokenizer;
+    REQUIRE(HfBpeTokenizer::normalize("A  Photo\tOf\nThings", PT::Clip) == "a photo of things");
+    REQUIRE(HfBpeTokenizer::normalize("   leading and trailing   ", PT::Clip) ==
+            "leading and trailing");
+    // The other pre-tokenizers must be left exactly as they were: GPT-2 carries
+    // the space into the next token and depends on it surviving.
+    REQUIRE(HfBpeTokenizer::normalize("A  Photo", PT::Gpt2) == "A  Photo");
+    REQUIRE(HfBpeTokenizer::normalize("A  Photo", PT::Llama3) == "A  Photo");
+}
+
+TEST_CASE("CLIP pre-tokenization drops whitespace rather than attaching it",
+          "[tokenizer][clip]") {
+    const std::vector<std::string> words =
+        HfBpeTokenizer::clip_pretokenize("a photograph of a harbour at dawn");
+    REQUIRE(words == std::vector<std::string>{"a", "photograph", "of", "a", "harbour", "at",
+                                              "dawn"});
+    // GPT-2 keeps the space, which is exactly the difference.
+    const std::vector<std::string> gpt2 = HfBpeTokenizer::gpt2_pretokenize("a photograph");
+    REQUIRE(gpt2.size() == 2);
+    REQUIRE(gpt2[1] == " photograph");
+}
+
+TEST_CASE("CLIP pre-tokenization splits digits one at a time", "[tokenizer][clip]") {
+    // `[\p{N}]` with no repetition, unlike Llama 3's runs of up to three.
+    REQUIRE(HfBpeTokenizer::clip_pretokenize("2024") ==
+            std::vector<std::string>{"2", "0", "2", "4"});
+}
+
+TEST_CASE("CLIP pre-tokenization keeps contractions together", "[tokenizer][clip]") {
+    REQUIRE(HfBpeTokenizer::clip_pretokenize("it's") == std::vector<std::string>{"it", "'s"});
+    REQUIRE(HfBpeTokenizer::clip_pretokenize("they're") ==
+            std::vector<std::string>{"they", "'re"});
+    REQUIRE(HfBpeTokenizer::clip_pretokenize("we'll") == std::vector<std::string>{"we", "'ll"});
+    REQUIRE(HfBpeTokenizer::clip_pretokenize("i've") == std::vector<std::string>{"i", "'ve"});
+}
+
+TEST_CASE("CLIP pre-tokenization runs punctuation together", "[tokenizer][clip]") {
+    REQUIRE(HfBpeTokenizer::clip_pretokenize("wow!!! really?") ==
+            std::vector<std::string>{"wow", "!!!", "really", "?"});
+}
+
+TEST_CASE("CLIP pre-tokenization handles an empty and whitespace-only string",
+          "[tokenizer][clip]") {
+    REQUIRE(HfBpeTokenizer::clip_pretokenize("").empty());
+    REQUIRE(HfBpeTokenizer::clip_pretokenize("   \t\n ").empty());
+}

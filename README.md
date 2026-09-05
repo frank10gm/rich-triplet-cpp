@@ -6,7 +6,11 @@ This is a port of [the Rust original](../rich-triplet), kept numerically identic
 
 Supports **Gemma 3** and **Qwen 3.5** text inference on Apple Silicon with Q4_K_M / Q4_0 GGUF weights and full-graph Metal GPU decode, plus two complete text-to-speech stacks — text in, WAV out, neural audio codecs included: **Orpheus**, an autoregressive Llama 3.2 emitting SNAC codes, and **OmniVoice**, a masked-diffusion Qwen3 that unmasks eight codebooks in parallel and clones a voice from a few seconds of reference audio.
 
-It also carries a text-to-image stack: **FLUX.1-schnell**, a 12B rectified-flow transformer with its T5-XXL and CLIP-L text encoders and a 16-channel autoencoder, text in and PNG out, with a full-graph Metal engine that keeps the transformer quantized on the GPU and widens each weight only as it is used. The design and its build log are in [docs/text-to-image.md](docs/text-to-image.md) — including [what is not yet verified](docs/text-to-image.md#what-is-not-verified), which is that it has never been run against the real checkpoints.
+It also carries a text-to-image stack: **FLUX.1-schnell**, a 12B rectified-flow transformer with its T5-XXL and CLIP-L text encoders and a 16-channel autoencoder, text in and PNG out, with a full-graph Metal engine that keeps the transformer quantized on the GPU and widens each weight only as it is used. The design, the build log and the six bugs between passing tests and a working image are in [docs/text-to-image.md](docs/text-to-image.md).
+
+![a photograph of a harbour at dawn, long exposure](samples/flux_harbour_1024.png)
+
+*`--model flux-schnell`, 1024x1024, four steps, 11.5 minutes on an M3 Pro.*
 
 ---
 
@@ -693,15 +697,18 @@ autoencoder. Text in, PNG out.
 ./build-metal/rich-triplet \
   --model flux-schnell \
   --prompt "a photograph of a harbour at dawn, long exposure" \
-  --weights models/flux1-schnell-Q4_K_M.gguf \
-  --t5 models/t5-v1_1-xxl-encoder-Q4_K.gguf \
-  --t5-tokenizer models/spiece.model \
+  --weights models/flux1-schnell-Q4_K_S.gguf \
+  --t5 models/t5-v1_1-xxl-encoder-Q4_K_M.gguf \
   --clip models/clip_l.safetensors \
   --clip-tokenizer models/clip_tokenizer.json \
-  --vae models/ae.safetensors \
+  --vae models/flux_vae.safetensors \
   --width 1024 --height 1024 --steps 4 --seed 42 \
   --out harbour.png
 ```
+
+`--t5-tokenizer` is optional: the encoder GGUF carries its own SentencePiece
+vocabulary, so there is one fewer file to fetch and one fewer way to pair a
+checkpoint with the wrong tokenizer.
 
 ### What it is
 
@@ -759,26 +766,50 @@ depth.
 
 ### Weights
 
-| Component | Source |
-|---|---|
-| Transformer | `city96/FLUX.1-schnell-gguf` (Q4_K_M) |
-| T5-XXL encoder | `city96/t5-v1_1-xxl-encoder-gguf` (Q4_K) |
-| CLIP-L | `comfyanonymous/flux_text_encoders` |
-| VAE, tokenizers | `black-forest-labs/FLUX.1-schnell` |
+| Component | Source | Size |
+|---|---|---|
+| Transformer | `city96/FLUX.1-schnell-gguf` → `flux1-schnell-Q4_K_S.gguf` | 7.2 GB |
+| T5-XXL encoder | `city96/t5-v1_1-xxl-encoder-gguf` → `…-Q4_K_M.gguf` | 2.7 GB |
+| CLIP-L | `comfyanonymous/flux_text_encoders` → `clip_l.safetensors` | 235 MB |
+| CLIP tokenizer | `openai/clip-vit-large-patch14` → `tokenizer.json` | 2 MB |
+| Autoencoder | `John6666/flux1-schnell-fp8-flux` → `vae/diffusion_pytorch_model.safetensors` | 160 MB |
+
+`black-forest-labs/FLUX.1-schnell` is the canonical home of the autoencoder and
+the tokenizers, but it is gated, so the table points at ungated mirrors. Both
+autoencoder naming conventions load — see the design note for why that
+distinction is more than cosmetic.
 
 FLUX.1-schnell is Apache 2.0. `--model flux-dev` runs the dev config — same
 architecture plus a distilled-guidance embedding, 28 steps, non-commercial
-licence.
+licence — but its weights are gated and have not been tested.
+
+### Speed, measured on an 18 GB M3 Pro
+
+| Resolution | Tokens | Per step | 4 steps | Total incl. VAE decode |
+|---|---|---|---|---|
+| 256x256 | 512 | 6.2 s | 25 s | 27 s |
+| 512x512 | 1280 | 20.2 s | 81 s | 92 s |
+| 1024x1024 | 4352 | 156 s | 624 s | 688 s |
+
+Eight and a half times the tokens costs twenty-five times the time, because
+attention is `O(T^2)` while everything else is `O(T)`; at 4352 tokens it stops
+being a rounding error. The process sits at 13% CPU throughout, so this is
+GPU-bound. The attention kernel is the obvious thing to optimise first.
+
+T5 encoding is 6.7 s. The autoencoder decodes on the CPU.
 
 ### Status
 
-**This has not been run against the real checkpoints.** All 112 tests across the
-image stack build their weights synthetically: they verify that each piece
-agrees with its own reference implementation and that the GPU path agrees with
-the CPU path. They do not verify that the tensor names in the GGUF are the ones
-the loader asks for, or that the result is a picture.
+Working end to end against the real checkpoints — the image above is
+`--model flux-schnell` at 1024x1024 in four steps.
+
+What is *not* verified is numerical parity with diffusers: the output is a
+photograph of what was asked for, which rules out every bug that produces noise
+or the wrong subject, but it does not prove a given seed reproduces the
+reference implementation's exact image.
 [docs/text-to-image.md](docs/text-to-image.md) has the full design, the build
-log, and the list of what remains unverified.
+log, the six bugs that stood between passing tests and a working image, and the
+rest of what remains unverified.
 
 ---
 
@@ -826,8 +857,8 @@ log, and the list of what remains unverified.
 ## Running tests
 
 ```bash
-./build/tests/rt_tests          # 623 cases
-./build-metal/tests/rt_tests    # 642 cases, including the GPU kernels
+./build/tests/rt_tests          # 630 cases
+./build-metal/tests/rt_tests    # 650 cases, including the GPU kernels
 ```
 
 Covers matrix ops, gradient correctness against finite differences, attention
@@ -837,12 +868,12 @@ against reference loops, both codec decoders and the OmniVoice encoder, RIFF in
 both directions, resampling against the reference filter, the duration
 estimator's character classes, the Metal kernels, and the weight-loading paths.
 
-The image stack adds 112: 2-D convolution and GroupNorm against index-by-index
+The image stack adds 120: 2-D convolution and GroupNorm against index-by-index
 references, the autoencoder's block algebra and tile blending, PNG containers
 checked chunk by chunk with a stored-block inflater, the T5 relative-position
 bucketing and its unscaled attention, CLIP's causal mask and argmax pooling,
-FLUX's patch order and three-axis RoPE, and the Metal engine against the CPU
-forward pass.
+FLUX's patch order and three-axis RoPE, CLIP's `</w>` pre-tokenization, and
+the Metal engine against the CPU forward pass.
 
 A further 32 cases are hidden by default because they need downloaded weights
 (36 on the Metal build, which also checks the GPU engine against the CPU one):
@@ -1172,7 +1203,7 @@ world's scripts.
 ## Stats
 
 - ~39,000 lines of C++, Objective-C++ and MSL, plus ~15,000 of tests
-- 642 test cases with Metal, 623 without, plus 32 that need downloaded weights
+- 650 test cases with Metal, 630 without, plus 32 that need downloaded weights
   (36 with Metal)
 - Zero ML dependencies (Accelerate and Metal are system frameworks)
 - Every published weight format read from scratch: GGUF, safetensors, and

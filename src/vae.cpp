@@ -160,29 +160,73 @@ using TensorMap = std::unordered_map<std::string, SafeTensor>;
     return v;
 }
 
-/// The attention projections are `Linear` in current diffusers checkpoints and
-/// 1x1 `Conv2d` in older ones, under different names. Both flatten to [C, C].
-[[nodiscard]] Result<Mat> take_attn_mat(TensorMap& map, const std::string& prefix,
-                                        const std::string& modern, const std::string& legacy,
-                                        std::size_t c) {
-    if (map.contains(prefix + modern + ".weight")) {
-        return take_mat(map, prefix + modern + ".weight", c, c);
+/// Which naming convention a checkpoint uses.
+///
+/// Two are in wide circulation for the same weights. `black-forest-labs` ships
+/// `ae.safetensors` under the original LDM names -- `decoder.mid.block_1`,
+/// `decoder.up.0.block.0`, `nin_shortcut` -- and diffusers ships
+/// `vae/diffusion_pytorch_model.safetensors` under its own --
+/// `decoder.mid_block.resnets.0`, `decoder.up_blocks.0.resnets.0`,
+/// `conv_shortcut`. Repackaged files put either under either path, so the
+/// convention is detected from the tensors present rather than from the
+/// filename.
+///
+/// The difference that matters is not the spelling. **The two number the
+/// upsampling levels in opposite directions**: diffusers' `up_blocks.0` is the
+/// coarsest and the original's `up.0` is the finest. Loading one as the other
+/// lines up for the two 512-channel levels and then fails the channel count on
+/// the third -- which is the good case, because reversing the resnets without
+/// reversing the upsamplers produces a blurred image and no error at all.
+struct VaeNames {
+    bool original = false;
+
+    [[nodiscard]] std::string mid_resnet(std::size_t which) const {
+        return original ? "decoder.mid.block_" + std::to_string(which + 1) + "."
+                        : "decoder.mid_block.resnets." + std::to_string(which) + ".";
     }
-    return take_mat(map, prefix + legacy + ".weight", c, c);
+    [[nodiscard]] std::string mid_attn() const {
+        return original ? "decoder.mid.attn_1." : "decoder.mid_block.attentions.0.";
+    }
+    [[nodiscard]] const char* attn_norm() const { return original ? "norm" : "group_norm"; }
+    [[nodiscard]] const char* attn_q() const { return original ? "q" : "to_q"; }
+    [[nodiscard]] const char* attn_k() const { return original ? "k" : "to_k"; }
+    [[nodiscard]] const char* attn_v() const { return original ? "v" : "to_v"; }
+    [[nodiscard]] const char* attn_out() const { return original ? "proj_out" : "to_out.0"; }
+
+    /// `exec` counts from the coarsest level, which is the order the decoder
+    /// runs them in. The original convention stores them the other way round.
+    [[nodiscard]] std::string level(std::size_t exec, std::size_t n_levels) const {
+        return original ? "decoder.up." + std::to_string(n_levels - 1 - exec) + "."
+                        : "decoder.up_blocks." + std::to_string(exec) + ".";
+    }
+    [[nodiscard]] std::string resnet(const std::string& level, std::size_t r) const {
+        return level + (original ? "block." : "resnets.") + std::to_string(r) + ".";
+    }
+    [[nodiscard]] const char* shortcut() const {
+        return original ? "nin_shortcut" : "conv_shortcut";
+    }
+    [[nodiscard]] std::string upsample(const std::string& level) const {
+        return level + (original ? "upsample.conv" : "upsamplers.0.conv");
+    }
+    [[nodiscard]] const char* norm_out() const {
+        return original ? "decoder.norm_out" : "decoder.conv_norm_out";
+    }
+};
+
+/// One of the attention projections, under whichever name this file uses.
+[[nodiscard]] Result<Mat> take_attn_mat(TensorMap& map, const std::string& prefix,
+                                        const char* name, std::size_t c) {
+    return take_mat(map, prefix + name + ".weight", c, c);
 }
 
 [[nodiscard]] Result<std::vector<float>> take_attn_vec(TensorMap& map, const std::string& prefix,
-                                                       const std::string& modern,
-                                                       const std::string& legacy,
-                                                       std::size_t c) {
-    if (map.contains(prefix + modern + ".bias")) {
-        return take_vec(map, prefix + modern + ".bias", c);
-    }
-    return take_vec(map, prefix + legacy + ".bias", c);
+                                                       const char* name, std::size_t c) {
+    return take_vec(map, prefix + name + ".bias", c);
 }
 
-[[nodiscard]] Result<VaeResnetBlock> load_resnet(TensorMap& map, const std::string& prefix,
-                                                 std::size_t c_in, std::size_t c_out) {
+[[nodiscard]] Result<VaeResnetBlock> load_resnet(TensorMap& map, const VaeNames& names,
+                                                 const std::string& prefix, std::size_t c_in,
+                                                 std::size_t c_out) {
     VaeResnetBlock b;
     b.in_channels = c_in;
     b.out_channels = c_out;
@@ -206,8 +250,8 @@ using TensorMap = std::unordered_map<std::string, SafeTensor>;
     b.conv2_bias = std::move(c2b);
 
     if (c_in != c_out) {
-        RT_TRY(sw, take_mat(map, prefix + "conv_shortcut.weight", c_out, c_in));
-        RT_TRY(sb, take_vec(map, prefix + "conv_shortcut.bias", c_out));
+        RT_TRY(sw, take_mat(map, prefix + names.shortcut() + ".weight", c_out, c_in));
+        RT_TRY(sb, take_vec(map, prefix + names.shortcut() + ".bias", c_out));
         b.shortcut_weight = std::move(sw);
         b.shortcut_bias = std::move(sb);
     }
@@ -242,6 +286,9 @@ Result<VaeDecoder> VaeDecoder::load(const std::string& path, VaeConfig cfg) {
     VaeDecoder d;
     d.cfg = cfg;
 
+    VaeNames names;
+    names.original = map.contains("decoder.mid.block_1.conv1.weight");
+
     const std::size_t n_levels = cfg.block_out_channels.size();
     const std::size_t c_coarse = cfg.block_out_channels.back();
     const std::size_t c_fine = cfg.block_out_channels.front();
@@ -251,25 +298,25 @@ Result<VaeDecoder> VaeDecoder::load(const std::string& path, VaeConfig cfg) {
     d.conv_in_weight = std::move(ciw);
     d.conv_in_bias = std::move(cib);
 
-    RT_TRY(mid1, load_resnet(map, "decoder.mid_block.resnets.0.", c_coarse, c_coarse));
-    RT_TRY(mid2, load_resnet(map, "decoder.mid_block.resnets.1.", c_coarse, c_coarse));
+    RT_TRY(mid1, load_resnet(map, names, names.mid_resnet(0), c_coarse, c_coarse));
+    RT_TRY(mid2, load_resnet(map, names, names.mid_resnet(1), c_coarse, c_coarse));
     d.mid_resnet1 = std::move(mid1);
     d.mid_resnet2 = std::move(mid2);
 
     {
-        const std::string p = "decoder.mid_block.attentions.0.";
+        const std::string p = names.mid_attn();
         VaeAttentionBlock a;
         a.channels = c_coarse;
-        RT_TRY(nw, take_vec(map, p + "group_norm.weight", c_coarse));
-        RT_TRY(nb, take_vec(map, p + "group_norm.bias", c_coarse));
-        RT_TRY(qw, take_attn_mat(map, p, "to_q", "query", c_coarse));
-        RT_TRY(qb, take_attn_vec(map, p, "to_q", "query", c_coarse));
-        RT_TRY(kw, take_attn_mat(map, p, "to_k", "key", c_coarse));
-        RT_TRY(kb, take_attn_vec(map, p, "to_k", "key", c_coarse));
-        RT_TRY(vw, take_attn_mat(map, p, "to_v", "value", c_coarse));
-        RT_TRY(vb, take_attn_vec(map, p, "to_v", "value", c_coarse));
-        RT_TRY(ow, take_attn_mat(map, p, "to_out.0", "proj_attn", c_coarse));
-        RT_TRY(ob, take_attn_vec(map, p, "to_out.0", "proj_attn", c_coarse));
+        RT_TRY(nw, take_vec(map, p + names.attn_norm() + ".weight", c_coarse));
+        RT_TRY(nb, take_vec(map, p + names.attn_norm() + ".bias", c_coarse));
+        RT_TRY(qw, take_attn_mat(map, p, names.attn_q(), c_coarse));
+        RT_TRY(qb, take_attn_vec(map, p, names.attn_q(), c_coarse));
+        RT_TRY(kw, take_attn_mat(map, p, names.attn_k(), c_coarse));
+        RT_TRY(kb, take_attn_vec(map, p, names.attn_k(), c_coarse));
+        RT_TRY(vw, take_attn_mat(map, p, names.attn_v(), c_coarse));
+        RT_TRY(vb, take_attn_vec(map, p, names.attn_v(), c_coarse));
+        RT_TRY(ow, take_attn_mat(map, p, names.attn_out(), c_coarse));
+        RT_TRY(ob, take_attn_vec(map, p, names.attn_out(), c_coarse));
         a.norm_weight = std::move(nw);
         a.norm_bias = std::move(nb);
         a.q_weight = std::move(qw);
@@ -283,26 +330,26 @@ Result<VaeDecoder> VaeDecoder::load(const std::string& path, VaeConfig cfg) {
         d.mid_attn = std::move(a);
     }
 
-    // diffusers indexes up blocks finest-last: `up_blocks.0` is the coarsest in
-    // the *decoder*'s file order and the widest level. Walk them in file order,
-    // which is coarse to fine, and that is also the execution order.
+    // Walk the levels in execution order -- coarsest first -- and let `names`
+    // work out which index that is in this file's convention.
     std::size_t c_prev = c_coarse;
     for (std::size_t i = 0; i < n_levels; ++i) {
-        // File index `i` corresponds to level `n_levels - 1 - i` of the
-        // finest-first `block_out_channels`.
+        // Execution index `i` is level `n_levels - 1 - i` of the finest-first
+        // `block_out_channels`.
         const std::size_t c_out = cfg.block_out_channels[n_levels - 1 - i];
-        const std::string p = "decoder.up_blocks." + std::to_string(i) + ".";
+        const std::string p = names.level(i, n_levels);
 
         VaeUpBlock block;
         for (std::size_t r = 0; r <= cfg.layers_per_block; ++r) {
             const std::size_t c_in = (r == 0) ? c_prev : c_out;
-            RT_TRY(res, load_resnet(map, p + "resnets." + std::to_string(r) + ".", c_in, c_out));
+            RT_TRY(res, load_resnet(map, names, names.resnet(p, r), c_in, c_out));
             block.resnets.push_back(std::move(res));
         }
         // Every level upsamples except the finest, which is the last one.
         if (i + 1 < n_levels) {
-            RT_TRY(uw, take_mat(map, p + "upsamplers.0.conv.weight", c_out, c_out * 9));
-            RT_TRY(ub, take_vec(map, p + "upsamplers.0.conv.bias", c_out));
+            const std::string u = names.upsample(p);
+            RT_TRY(uw, take_mat(map, u + ".weight", c_out, c_out * 9));
+            RT_TRY(ub, take_vec(map, u + ".bias", c_out));
             block.upsample_weight = std::move(uw);
             block.upsample_bias = std::move(ub);
         }
@@ -310,8 +357,8 @@ Result<VaeDecoder> VaeDecoder::load(const std::string& path, VaeConfig cfg) {
         c_prev = c_out;
     }
 
-    RT_TRY(onw, take_vec(map, "decoder.conv_norm_out.weight", c_fine));
-    RT_TRY(onb, take_vec(map, "decoder.conv_norm_out.bias", c_fine));
+    RT_TRY(onw, take_vec(map, std::string(names.norm_out()) + ".weight", c_fine));
+    RT_TRY(onb, take_vec(map, std::string(names.norm_out()) + ".bias", c_fine));
     RT_TRY(ow2, take_mat(map, "decoder.conv_out.weight", 3, c_fine * 9));
     RT_TRY(ob2, take_vec(map, "decoder.conv_out.bias", 3));
     d.conv_out_norm_weight = std::move(onw);

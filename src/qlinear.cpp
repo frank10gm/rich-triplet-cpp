@@ -57,7 +57,16 @@ Mat QLinear::forward(const Mat& x) const {
 
     // Priority matches the memory cost of the format: whichever compact form
     // was loaded is the one that exists, and f32 is the fallback.
-    Mat out = q4k.has_value()   ? q4k->matmul_q4k_t(x)
+    //
+    // Q4_K takes the *BLAS* variant, not `matmul_q4k_t`. That one has a fused
+    // NEON path for the single row a decode step asks for and a plain triple
+    // loop for everything else, which is the right trade for a language model
+    // and the wrong one here: this stack never has a batch of one. A 256-token
+    // T5 prompt through 24 layers is a couple of teraflops, and the scalar loop
+    // turns a minute of work into an hour of it. `matmul_q4k_t_blas`
+    // dequantizes a chunk of weight rows at a time and hands each chunk to
+    // sgemm, for about 8 MB of scratch.
+    Mat out = q4k.has_value()    ? q4k->matmul_q4k_t_blas(x)
               : bf16.has_value() ? bf16->matmul_by_t(x)
                                  : x.matmul_bt(f32);
     add_bias_rows(out, bias);

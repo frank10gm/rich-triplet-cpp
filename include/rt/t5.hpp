@@ -57,7 +57,9 @@
 
 #include "rt/mat.hpp"
 #include "rt/qlinear.hpp"
+#include "rt/gguf.hpp"
 #include "rt/result.hpp"
+#include "rt/tokenizer.hpp"
 
 namespace rt {
 
@@ -179,5 +181,13 @@ class T5Encoder {
 
 /// RMSNorm with no bias and no mean subtraction, accumulating in f64.
 [[nodiscard]] Mat t5_rms_norm(const Mat& x, std::span<const float> weight, float eps);
+
+/// Build the unigram tokenizer out of the checkpoint's own metadata.
+///
+/// The distributed encoder GGUFs carry `tokenizer.ggml.tokens` and
+/// `tokenizer.ggml.scores`, which is a complete SentencePiece vocabulary. Using
+/// it saves asking for a `spiece.model` that is already on disk in another
+/// form -- and saves the chance of pairing a checkpoint with the wrong one.
+[[nodiscard]] Result<SentencePieceTokenizer> load_t5_gguf_tokenizer(const GgufFile& gguf);
 
 }  // namespace rt

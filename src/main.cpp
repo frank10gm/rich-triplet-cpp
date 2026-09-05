@@ -391,7 +391,7 @@ void print_help() {
     std::printf("\nFLUX text to image (--model flux-schnell, --model flux-dev):\n");
     std::printf("  --weights PATH           Transformer GGUF (Q4_K_M recommended)\n");
     std::printf("  --t5 PATH                T5-XXL encoder GGUF\n");
-    std::printf("  --t5-tokenizer PATH      The encoder's spiece.model\n");
+    std::printf("  --t5-tokenizer PATH      spiece.model (optional; the GGUF carries one)\n");
     std::printf("  --clip PATH              CLIP-L text encoder safetensors\n");
     std::printf("  --clip-tokenizer PATH    CLIP's tokenizer.json\n");
     std::printf("  --vae PATH               Autoencoder safetensors (ae.safetensors)\n");
@@ -797,14 +797,24 @@ void run_omnivoice(const CliArgs& args, const std::string& prompt) {
 /// it, which this implementation does not have, so the padded positions do
 /// contribute. They contribute what the reference implementation's unmasked
 /// path would contribute, which is what matters for matching it.
+///
+/// `tokenizer_path` is optional: the distributed encoder GGUFs carry their own
+/// unigram vocabulary, which is both one fewer download and one fewer way to
+/// pair a checkpoint with the wrong tokenizer.
 [[nodiscard]] Result<Mat> encode_t5(const std::string& weights,
-                                    const std::string& tokenizer_path,
+                                    const std::optional<std::string>& tokenizer_path,
                                     const std::string& prompt, std::size_t seq_len) {
-    RT_TRY(tok, SentencePieceTokenizer::from_model_file(tokenizer_path));
+    RT_TRY(gguf, GgufFile::open(weights));
+    const Result<SentencePieceTokenizer> tok =
+        tokenizer_path ? SentencePieceTokenizer::from_model_file(*tokenizer_path)
+                       : load_t5_gguf_tokenizer(gguf);
+    if (!tok) {
+        return err("t5 tokenizer: " + tok.error());
+    }
+
     constexpr std::uint32_t kEos = 1;
     constexpr std::uint32_t kPad = 0;
-
-    std::vector<std::uint32_t> ids = tok.encode(prompt);
+    std::vector<std::uint32_t> ids = tok->encode(prompt);
     if (ids.size() + 1 > seq_len) {
         ids.resize(seq_len - 1);
     }
@@ -830,7 +840,6 @@ void run_flux(const CliArgs& args, const std::string& prompt) {
         return *v;
     };
     const std::string t5_path = require(args.t5, "--t5");
-    const std::string t5_tok = require(args.t5_tokenizer, "--t5-tokenizer");
     const std::string clip_path = require(args.clip, "--clip");
     const std::string clip_tok = require(args.clip_tokenizer, "--clip-tokenizer");
     const std::string vae_path = require(args.vae, "--vae");
@@ -857,7 +866,7 @@ void run_flux(const CliArgs& args, const std::string& prompt) {
     }
 
     std::fprintf(stderr, "[ FLUX ] Encoding the prompt with T5-XXL...\n");
-    const Result<Mat> context = encode_t5(t5_path, t5_tok, prompt, 256);
+    const Result<Mat> context = encode_t5(t5_path, args.t5_tokenizer, prompt, 256);
     if (!context) {
         die("T5 encoding failed: " + context.error());
     }

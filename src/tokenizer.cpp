@@ -738,6 +738,23 @@ Result<SentencePieceTokenizer> SentencePieceTokenizer::from_model_file(const std
     return from_model_bytes(bytes);
 }
 
+Result<SentencePieceTokenizer> SentencePieceTokenizer::from_tokens_and_scores(
+    std::vector<std::string> tokens, const std::vector<float>& scores) {
+    if (tokens.empty()) {
+        return err("sentencepiece: empty vocabulary");
+    }
+    if (tokens.size() != scores.size()) {
+        return err("sentencepiece: " + std::to_string(tokens.size()) + " tokens but " +
+                   std::to_string(scores.size()) + " scores");
+    }
+    std::vector<SentencePiece> pieces(tokens.size());
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        pieces[i].text = std::move(tokens[i]);
+        pieces[i].log_prob = scores[i];
+    }
+    return from_pieces(std::move(pieces));
+}
+
 SentencePieceTokenizer SentencePieceTokenizer::from_pieces(std::vector<SentencePiece> pieces) {
     SentencePieceTokenizer tok;
     for (std::size_t i = 0; i < pieces.size(); ++i) {
@@ -1244,6 +1261,21 @@ Result<HfBpeTokenizer> HfBpeTokenizer::from_json_str(std::string_view s) {
     tok.unk_id_ = unk != vocab_map.end() ? unk->second : 0;
     // A ByteLevel pre-tokenizer in the file selects the GPT-2 byte encoding.
     tok.byte_level_ = s.find("\"ByteLevel\"") != std::string_view::npos;
+
+    // `end_of_word_suffix` is the discriminator that matters: it is what makes
+    // the merge sequence a different algorithm rather than a different regex,
+    // and CLIP is the model in this family that declares one.
+    if (const std::size_t at = s.find("\"end_of_word_suffix\""); at != std::string_view::npos) {
+        const std::size_t open = s.find('"', s.find(':', at) + 1);
+        const std::size_t close = open != std::string_view::npos ? s.find('"', open + 1)
+                                                                 : std::string_view::npos;
+        if (open != std::string_view::npos && close != std::string_view::npos) {
+            tok.end_of_word_suffix_ = std::string(s.substr(open + 1, close - open - 1));
+        }
+    }
+    if (!tok.end_of_word_suffix_.empty()) {
+        tok.pre_ = PreTokenizer::Clip;
+    }
     tok.token_to_id_ = std::move(vocab_map);
 
     return tok;
@@ -1262,7 +1294,106 @@ std::vector<std::string> HfBpeTokenizer::gpt2_pretokenize(std::string_view text)
     return pretokenize(text, PreTokenizer::Gpt2);
 }
 
+std::string HfBpeTokenizer::normalize(std::string_view text, PreTokenizer kind) {
+    if (kind != PreTokenizer::Clip) {
+        return std::string(text);
+    }
+    // Collapse every whitespace run to one space, then lowercase. NFC
+    // composition is part of CLIP's normalizer too and is not done here: it
+    // matters only for text that carries combining marks, and getting it wrong
+    // costs a token boundary rather than a wrong word.
+    std::string out;
+    out.reserve(text.size());
+    bool in_space = false;
+    for (char32_t cp : utf8::decode(text)) {
+        if (utf8::is_whitespace(cp)) {
+            in_space = true;
+            continue;
+        }
+        if (in_space && !out.empty()) {
+            out.push_back(' ');
+        }
+        in_space = false;
+        utf8::encode_into(out, utf8::to_ascii_lowercase(cp));
+    }
+    return out;
+}
+
+std::vector<std::string> HfBpeTokenizer::clip_pretokenize(std::string_view text) {
+    // CLIP's regex, directly:
+    //   's|'t|'re|'ve|'m|'ll|'d | [\p{L}]+ | [\p{N}] | [^\s\p{L}\p{N}]+
+    // with whitespace matching nothing and therefore dropped.
+    std::vector<std::string> words;
+    const auto chars = utf8::decode_indices(text);
+    std::size_t i = 0;
+
+    const auto byte_end_at = [&](std::size_t idx) {
+        return idx < chars.size() ? chars[idx].first : text.size();
+    };
+    const auto push = [&](std::size_t start_byte, std::size_t end_byte) {
+        words.emplace_back(text.substr(start_byte, end_byte - start_byte));
+    };
+
+    while (i < chars.size()) {
+        const auto [byte_start, ch] = chars[i];
+
+        if (utf8::is_whitespace(ch)) {
+            ++i;
+            continue;
+        }
+
+        if (ch == U'\'' && i + 1 < chars.size()) {
+            const char32_t n1 = utf8::to_ascii_lowercase(chars[i + 1].second);
+            if (n1 == U's' || n1 == U't' || n1 == U'm' || n1 == U'd') {
+                push(byte_start, byte_end_at(i + 2));
+                i += 2;
+                continue;
+            }
+            if (i + 2 < chars.size()) {
+                const char32_t n2 = utf8::to_ascii_lowercase(chars[i + 2].second);
+                if ((n1 == U'r' && n2 == U'e') || (n1 == U'v' && n2 == U'e') ||
+                    (n1 == U'l' && n2 == U'l')) {
+                    push(byte_start, byte_end_at(i + 3));
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+
+        if (utf8::is_alphabetic(ch)) {
+            std::size_t j = i + 1;
+            while (j < chars.size() && utf8::is_alphabetic(chars[j].second)) {
+                ++j;
+            }
+            push(byte_start, byte_end_at(j));
+            i = j;
+            continue;
+        }
+
+        // `[\p{N}]` with no repetition: one digit per token, always.
+        if (utf8::is_ascii_digit(ch)) {
+            push(byte_start, byte_end_at(i + 1));
+            ++i;
+            continue;
+        }
+
+        std::size_t j = i + 1;
+        while (j < chars.size() && !utf8::is_whitespace(chars[j].second) &&
+               !utf8::is_alphabetic(chars[j].second) &&
+               !utf8::is_ascii_digit(chars[j].second)) {
+            ++j;
+        }
+        push(byte_start, byte_end_at(j));
+        i = j;
+    }
+
+    return words;
+}
+
 std::vector<std::string> HfBpeTokenizer::pretokenize(std::string_view text, PreTokenizer kind) {
+    if (kind == PreTokenizer::Clip) {
+        return clip_pretokenize(text);
+    }
     std::vector<std::string> words;
     const auto chars = utf8::decode_indices(text);
     std::size_t i = 0;
@@ -1382,7 +1513,8 @@ std::vector<std::string> HfBpeTokenizer::pretokenize(std::string_view text, PreT
     return words;
 }
 
-std::vector<std::uint32_t> HfBpeTokenizer::bpe_encode_word(std::string_view word) const {
+std::vector<std::uint32_t> HfBpeTokenizer::bpe_encode_word(std::string_view word,
+                                                           std::string_view end_suffix) const {
     if (word.empty()) {
         return {};
     }
@@ -1391,6 +1523,12 @@ std::vector<std::uint32_t> HfBpeTokenizer::bpe_encode_word(std::string_view word
     std::vector<std::string> symbols;
     for (char32_t cp : utf8::decode(word)) {
         symbols.push_back(utf8::encode(cp));
+    }
+    // The end-of-word marker rides on the *last* symbol rather than becoming a
+    // symbol of its own. That is what makes `a</w>` reachable as a single
+    // vocabulary entry while `a` stays available mid-word.
+    if (!end_suffix.empty() && !symbols.empty()) {
+        symbols.back() += std::string(end_suffix);
     }
     std::vector<bool> live(symbols.size(), true);
 
@@ -1436,14 +1574,16 @@ std::vector<std::uint32_t> HfBpeTokenizer::bpe_encode_word(std::string_view word
 
 std::vector<std::uint32_t> HfBpeTokenizer::encode_byte_level(std::string_view text) const {
     static const std::array<char32_t, 256> b2u = gpt2_bytes_to_unicode();
+    const std::string normalized = normalize(text, pre_);
     std::vector<std::uint32_t> ids;
-    for (const std::string& word : pretokenize(text, pre_)) {
+    for (const std::string& word : pretokenize(normalized, pre_)) {
         // Map each raw byte through the GPT-2 unicode table before merging.
         std::string unicode_word;
         for (char c : word) {
             utf8::encode_into(unicode_word, b2u[static_cast<std::uint8_t>(c)]);
         }
-        const std::vector<std::uint32_t> word_ids = bpe_encode_word(unicode_word);
+        const std::vector<std::uint32_t> word_ids =
+            bpe_encode_word(unicode_word, end_of_word_suffix_);
         ids.insert(ids.end(), word_ids.begin(), word_ids.end());
     }
     return ids;
@@ -1503,7 +1643,7 @@ std::vector<std::uint32_t> HfBpeTokenizer::encode(std::string_view text) const {
 
     std::vector<std::uint32_t> ids;
     for (const std::string& word : words) {
-        const std::vector<std::uint32_t> word_ids = bpe_encode_word(word);
+        const std::vector<std::uint32_t> word_ids = bpe_encode_word(word, end_of_word_suffix_);
         ids.insert(ids.end(), word_ids.begin(), word_ids.end());
     }
     return ids;

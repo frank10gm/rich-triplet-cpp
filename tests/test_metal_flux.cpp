@@ -246,6 +246,42 @@ TEST_CASE("MetalFluxContext follows the guidance embedding when the config has o
     REQUIRE_FALSE(other->data == got->data);
 }
 
+TEST_CASE("MetalFluxContext survives activations large enough to saturate tanh",
+          "[metal][flux]") {
+    // The GELU's cubic term grows fast: a pre-activation of 27 -- ordinary in a
+    // real FLUX MLP -- puts the tanh argument near 724, and Metal's fast-math
+    // tanh evaluates exp(2x), which is inf there. inf/inf is NaN, one NaN in a
+    // residual stream poisons every later block, and the image comes out black.
+    //
+    // The synthetic weights the other cases use never reach that magnitude, so
+    // this one drives the activations up on purpose.
+    const FluxConfig cfg = gpu_config();
+    FluxModel gpu_model = make_model(cfg);
+    const FluxModel cpu_model = make_model(cfg);
+
+    const std::size_t lat_h = 4;
+    const std::size_t lat_w = 4;
+    const std::size_t n_txt = 3;
+    Mat z = spread(lat_h * lat_w, cfg.in_channels, 40.0f, 600);
+    const Mat ctx = spread(n_txt, cfg.context_dim, 40.0f, 601);
+    std::vector<float> pooled = spread_vec(cfg.pooled_dim, 40.0f, 602);
+
+    auto engine = MetalFluxContext::create(gpu_model, lat_h, lat_w, n_txt);
+    REQUIRE(engine.has_value());
+
+    const auto expected = cpu_model.forward(z, lat_h, lat_w, ctx, pooled, 0.5f);
+    const auto got = (*engine)->forward(z, lat_h, lat_w, ctx, pooled, 0.5f);
+    REQUIRE(expected.has_value());
+    REQUIRE(got.has_value());
+
+    for (const float v : got->data) {
+        REQUIRE(std::isfinite(v));
+    }
+    const Deviation d = compare(*expected, *got);
+    INFO("max abs " << d.max_abs << ", rel rms " << d.rel_rms);
+    REQUIRE(d.rel_rms < kBf16Tolerance);
+}
+
 TEST_CASE("MetalFluxContext rejects work it has no scratch for", "[metal][flux]") {
     const FluxConfig cfg = gpu_config();
     FluxModel model = make_model(cfg);

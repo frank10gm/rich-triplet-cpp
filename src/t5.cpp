@@ -13,6 +13,7 @@
 #include "rt/mat.hpp"
 #include "rt/qlinear.hpp"
 #include "rt/result.hpp"
+#include "rt/tokenizer.hpp"
 
 namespace rt {
 
@@ -192,6 +193,17 @@ Mat T5Block::forward(const Mat& x, const Mat& bias, float eps) const {
 
 namespace {
 
+[[nodiscard]] std::string join_names(const std::vector<std::string>& names) {
+    std::string out;
+    for (const std::string& n : names) {
+        if (!out.empty()) {
+            out += ", ";
+        }
+        out += n;
+    }
+    return out;
+}
+
 /// GGUF stores a 2-D tensor's dimensions fastest-varying first, so a
 /// `[out, in]` PyTorch weight has `ne = {in, out}`. Everything here wants the
 /// PyTorch reading.
@@ -257,8 +269,53 @@ namespace {
     return Mat(std::move(v), rows, cols);
 }
 
-/// The encoder GGUFs keep the original T5 parameter names. A block's prefix.
-[[nodiscard]] std::string block_prefix(std::size_t i) {
+/// Resolve a tensor by trying each name in turn.
+///
+/// Two naming conventions are in the wild for the same weights. The
+/// distributed encoder GGUFs are converted by llama.cpp, which normalises
+/// everything to its own scheme -- `enc.blk.3.attn_q.weight`. A file converted
+/// straight from the HuggingFace checkpoint keeps T5's own names --
+/// `encoder.block.3.layer.0.SelfAttention.q.weight`. Both are accepted, and
+/// the error names every candidate so a third convention is easy to add.
+[[nodiscard]] Result<QLinear> load_linear_any(const GgufFile& gguf,
+                                              const std::vector<std::string>& names,
+                                              std::size_t out_features,
+                                              std::size_t in_features) {
+    for (const std::string& n : names) {
+        if (gguf.find_tensor(n)) {
+            return load_linear(gguf, n, out_features, in_features);
+        }
+    }
+    return err("t5: none of these tensors exist: " + join_names(names));
+}
+
+[[nodiscard]] Result<std::vector<float>> load_vec_any(const GgufFile& gguf,
+                                                      const std::vector<std::string>& names,
+                                                      std::size_t len) {
+    for (const std::string& n : names) {
+        if (gguf.find_tensor(n)) {
+            return load_vec(gguf, n, len);
+        }
+    }
+    return err("t5: none of these tensors exist: " + join_names(names));
+}
+
+[[nodiscard]] Result<Mat> load_mat_any(const GgufFile& gguf,
+                                       const std::vector<std::string>& names, std::size_t rows,
+                                       std::size_t cols) {
+    for (const std::string& n : names) {
+        if (gguf.find_tensor(n)) {
+            return load_mat(gguf, n, rows, cols);
+        }
+    }
+    return err("t5: none of these tensors exist: " + join_names(names));
+}
+
+/// llama.cpp's prefix for block `i`, and T5's own.
+[[nodiscard]] std::string llama_prefix(std::size_t i) {
+    return "enc.blk." + std::to_string(i) + ".";
+}
+[[nodiscard]] std::string hf_prefix(std::size_t i) {
     return "encoder.block." + std::to_string(i) + ".layer.";
 }
 
@@ -270,27 +327,39 @@ Result<T5Encoder> T5Encoder::load_gguf(const std::string& path, T5Config cfg) {
     T5Encoder e;
     e.cfg = cfg;
 
-    RT_TRY(emb, load_mat(gguf, "shared.weight", cfg.vocab_size, cfg.d_model));
+    RT_TRY(emb, load_mat_any(gguf, {"token_embd.weight", "shared.weight"}, cfg.vocab_size,
+                             cfg.d_model));
     e.token_embedding = std::move(emb);
 
-    RT_TRY(rel, load_mat(gguf,
-                         "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight",
-                         cfg.rel_attn_buckets, cfg.n_heads));
+    // The bias table is stored [buckets, n_heads] -- an nn.Embedding whose rows
+    // are the buckets. GGUF lists that as ne = {n_heads, buckets}; the flat
+    // buffer is the same either way.
+    RT_TRY(rel, load_mat_any(
+                    gguf,
+                    {"enc.blk.0.attn_rel_b.weight",
+                     "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight"},
+                    cfg.rel_attn_buckets, cfg.n_heads));
     e.rel_bias_table = std::move(rel);
 
     const std::size_t inner = cfg.n_heads * cfg.d_kv;
     e.blocks.reserve(cfg.n_layers);
     for (std::size_t i = 0; i < cfg.n_layers; ++i) {
-        const std::string p = block_prefix(i);
+        const std::string lp = llama_prefix(i);
+        const std::string hp = hf_prefix(i);
         T5Block b;
 
-        RT_TRY(n1, load_vec(gguf, p + "0.layer_norm.weight", cfg.d_model));
+        RT_TRY(n1, load_vec_any(gguf, {lp + "attn_norm.weight", hp + "0.layer_norm.weight"},
+                                cfg.d_model));
         b.norm1 = std::move(n1);
 
-        RT_TRY(q, load_linear(gguf, p + "0.SelfAttention.q.weight", inner, cfg.d_model));
-        RT_TRY(k, load_linear(gguf, p + "0.SelfAttention.k.weight", inner, cfg.d_model));
-        RT_TRY(v, load_linear(gguf, p + "0.SelfAttention.v.weight", inner, cfg.d_model));
-        RT_TRY(o, load_linear(gguf, p + "0.SelfAttention.o.weight", cfg.d_model, inner));
+        RT_TRY(q, load_linear_any(gguf, {lp + "attn_q.weight", hp + "0.SelfAttention.q.weight"},
+                                  inner, cfg.d_model));
+        RT_TRY(k, load_linear_any(gguf, {lp + "attn_k.weight", hp + "0.SelfAttention.k.weight"},
+                                  inner, cfg.d_model));
+        RT_TRY(v, load_linear_any(gguf, {lp + "attn_v.weight", hp + "0.SelfAttention.v.weight"},
+                                  inner, cfg.d_model));
+        RT_TRY(o, load_linear_any(gguf, {lp + "attn_o.weight", hp + "0.SelfAttention.o.weight"},
+                                  cfg.d_model, inner));
         b.attn.q = std::move(q);
         b.attn.k = std::move(k);
         b.attn.v = std::move(v);
@@ -298,14 +367,25 @@ Result<T5Encoder> T5Encoder::load_gguf(const std::string& path, T5Config cfg) {
         b.attn.n_heads = cfg.n_heads;
         b.attn.d_kv = cfg.d_kv;
 
-        RT_TRY(n2, load_vec(gguf, p + "1.layer_norm.weight", cfg.d_model));
+        RT_TRY(n2, load_vec_any(gguf, {lp + "ffn_norm.weight", hp + "1.layer_norm.weight"},
+                                cfg.d_model));
         b.norm2 = std::move(n2);
 
-        // v1.1's gated pair. A v1.0 checkpoint has a single `DenseReluDense.wi`
-        // and fails here, which is the outcome worth having.
-        RT_TRY(wi0, load_linear(gguf, p + "1.DenseReluDense.wi_0.weight", cfg.d_ff, cfg.d_model));
-        RT_TRY(wi1, load_linear(gguf, p + "1.DenseReluDense.wi_1.weight", cfg.d_ff, cfg.d_model));
-        RT_TRY(wo, load_linear(gguf, p + "1.DenseReluDense.wo.weight", cfg.d_model, cfg.d_ff));
+        // v1.1's gated pair. llama.cpp calls the gated half `ffn_gate` and the
+        // ungated one `ffn_up`, which is `wi_0` and `wi_1` in that order -- and
+        // the order matters, because only the gate takes the GELU. A v1.0
+        // checkpoint has a single `wi` and fails here, which is the outcome
+        // worth having.
+        RT_TRY(wi0, load_linear_any(gguf,
+                                    {lp + "ffn_gate.weight",
+                                     hp + "1.DenseReluDense.wi_0.weight"},
+                                    cfg.d_ff, cfg.d_model));
+        RT_TRY(wi1, load_linear_any(gguf,
+                                    {lp + "ffn_up.weight", hp + "1.DenseReluDense.wi_1.weight"},
+                                    cfg.d_ff, cfg.d_model));
+        RT_TRY(wo, load_linear_any(gguf,
+                                   {lp + "ffn_down.weight", hp + "1.DenseReluDense.wo.weight"},
+                                   cfg.d_model, cfg.d_ff));
         b.ff.wi_0 = std::move(wi0);
         b.ff.wi_1 = std::move(wi1);
         b.ff.wo = std::move(wo);
@@ -313,10 +393,40 @@ Result<T5Encoder> T5Encoder::load_gguf(const std::string& path, T5Config cfg) {
         e.blocks.push_back(std::move(b));
     }
 
-    RT_TRY(fn, load_vec(gguf, "encoder.final_layer_norm.weight", cfg.d_model));
+    RT_TRY(fn, load_vec_any(gguf, {"enc.output_norm.weight", "encoder.final_layer_norm.weight"},
+                            cfg.d_model));
     e.final_norm = std::move(fn);
 
     return e;
+}
+
+Result<SentencePieceTokenizer> load_t5_gguf_tokenizer(const GgufFile& gguf) {
+    const auto tokens_it = gguf.metadata.find("tokenizer.ggml.tokens");
+    const auto scores_it = gguf.metadata.find("tokenizer.ggml.scores");
+    if (tokens_it == gguf.metadata.end() || scores_it == gguf.metadata.end()) {
+        return err("t5: the checkpoint carries no embedded tokenizer");
+    }
+    const std::vector<GgufMetaValue>* tok_arr = tokens_it->second.as_array();
+    const std::vector<GgufMetaValue>* score_arr = scores_it->second.as_array();
+    if (tok_arr == nullptr || score_arr == nullptr) {
+        return err("t5: the embedded tokenizer is not stored as arrays");
+    }
+
+    std::vector<std::string> tokens;
+    tokens.reserve(tok_arr->size());
+    for (const GgufMetaValue& v : *tok_arr) {
+        const std::optional<std::string_view> s = v.as_str();
+        if (!s) {
+            return err("t5: a tokenizer entry is not a string");
+        }
+        tokens.emplace_back(*s);
+    }
+    std::vector<float> scores;
+    scores.reserve(score_arr->size());
+    for (const GgufMetaValue& v : *score_arr) {
+        scores.push_back(v.as_f32().value_or(0.0f));
+    }
+    return SentencePieceTokenizer::from_tokens_and_scores(std::move(tokens), scores);
 }
 
 // =============================================================================

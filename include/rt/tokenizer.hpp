@@ -216,6 +216,16 @@ class SentencePieceTokenizer final : public Tokenizer {
         return it != piece_to_id_.end() ? std::optional{it->second} : std::nullopt;
     }
 
+    /// Build directly from a vocabulary and its log-probabilities, as GGUF
+    /// stores them in `tokenizer.ggml.tokens` and `tokenizer.ggml.scores`.
+    ///
+    /// The counterpart of `HfBpeTokenizer::from_vocab_and_merges`, and it
+    /// exists for the same reason: a GGUF file already carries a complete
+    /// tokenizer, so requiring a separate `spiece.model` alongside it is asking
+    /// for a second download of something already on disk.
+    [[nodiscard]] static Result<SentencePieceTokenizer> from_tokens_and_scores(
+        std::vector<std::string> tokens, const std::vector<float>& scores);
+
    private:
     /// A single node in the piece trie.
     struct TrieNode {
@@ -264,6 +274,15 @@ class HfBpeTokenizer final : public Tokenizer {
     enum class PreTokenizer {
         Gpt2,
         Llama3,
+        /// CLIP. A different family: the text is lowercased and its whitespace
+        /// collapsed first, the split keeps only the matches (whitespace is
+        /// dropped rather than attached to the following word), and each word
+        /// carries an explicit `</w>` end-of-word marker instead of a leading
+        /// space. Feeding CLIP text through the GPT-2 splitter produces ids
+        /// that are individually valid and collectively meaningless -- every
+        /// space becomes its own token and no word ever matches its `</w>`
+        /// vocabulary entry.
+        Clip,
     };
 
     [[nodiscard]] static Result<HfBpeTokenizer> from_json_bytes(
@@ -284,6 +303,21 @@ class HfBpeTokenizer final : public Tokenizer {
 
     /// Look up an id by exact token string.
     [[nodiscard]] std::optional<std::uint32_t> token_id(const std::string& token) const;
+
+    /// Split text the way CLIP does: contraction suffixes, letter runs, single
+    /// digits, and runs of everything that is neither whitespace nor
+    /// alphanumeric. Whitespace is dropped.
+    ///
+    /// The caller is expected to have normalized already -- see `normalize`.
+    [[nodiscard]] static std::vector<std::string> clip_pretokenize(std::string_view text);
+
+    /// Collapse whitespace runs to a single space and lowercase, which is
+    /// CLIP's normalizer. A no-op for the other pre-tokenizers.
+    [[nodiscard]] static std::string normalize(std::string_view text, PreTokenizer kind);
+
+    /// The end-of-word marker merged onto the last symbol of every word, empty
+    /// unless the file declared one.
+    [[nodiscard]] std::string_view end_of_word_suffix() const { return end_of_word_suffix_; }
 
     /// Split text the way the GPT-2 pre-tokenizer does: contraction suffixes,
     /// letter runs (with an optional leading non-alphanumeric), single digits,
@@ -321,7 +355,8 @@ class HfBpeTokenizer final : public Tokenizer {
     [[nodiscard]] std::vector<std::uint32_t> encode_byte_level(std::string_view text) const;
     [[nodiscard]] std::string decode_byte_level(const std::vector<std::uint32_t>& ids) const;
     /// BPE-merge one pre-tokenized word into token ids.
-    [[nodiscard]] std::vector<std::uint32_t> bpe_encode_word(std::string_view word) const;
+    [[nodiscard]] std::vector<std::uint32_t> bpe_encode_word(std::string_view word,
+                                                             std::string_view end_suffix) const;
 
     /// id -> token string
     std::vector<std::string> id_to_token_;
@@ -334,6 +369,7 @@ class HfBpeTokenizer final : public Tokenizer {
     /// encoding (Gemma) when false.
     bool byte_level_ = false;
     PreTokenizer pre_ = PreTokenizer::Gpt2;
+    std::string end_of_word_suffix_;
 };
 
 // =============================================================================

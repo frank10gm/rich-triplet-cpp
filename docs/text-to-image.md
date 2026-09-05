@@ -7,15 +7,18 @@ code landed.
 
 ## Status
 
-Everything below is implemented: `conv2d.cpp`, `png.cpp`, `vae.cpp`, `t5.cpp`,
-`clip_text.cpp`, `flux.cpp`, `metal_flux.mm` and `shaders/flux.msl`, with 112
-test cases across them and a `--model flux-schnell` entry point.
+Working end to end against the real checkpoints. `--model flux-schnell` takes a
+prompt and writes a PNG, on the GPU or the CPU.
 
-**It has not been run against the real checkpoints.** Every test builds its
-weights synthetically, so what is verified is that the pieces agree with their
-own references and that the GPU path agrees with the CPU path -- not that the
-tensor names in `city96`'s GGUF are the ones `load_gguf` asks for, and not that
-the output is a picture. See [What is not verified](#what-is-not-verified).
+Everything below is implemented: `conv2d.cpp`, `png.cpp`, `vae.cpp`, `t5.cpp`,
+`clip_text.cpp`, `flux.cpp`, `metal_flux.mm` and `shaders/flux.msl`, with 120
+test cases across them.
+
+Getting from "the tests pass" to "it draws a harbour" took six more bugs, all
+of them in the seam between this code and the real files rather than in the
+architecture. They are recorded under
+[Meeting the real checkpoints](#meeting-the-real-checkpoints), because that
+seam is where the next port will lose its time too.
 
 ---
 
@@ -92,20 +95,30 @@ assumed for 1024x1024. At 512x512 it is a non-issue.
 ### Speed
 
 Per denoise step at 1024x1024: 4096 image tokens + 256 text tokens, 11.9B
-parameters, so `2 * 11.9e9 * 4352` ~ **104 TFLOP**.
+parameters, so `2 * 11.9e9 * 4352` ~ **104 TFLOP**. The estimate below that was
+~45 s/step, from assuming 2-3 TFLOPS through the GEMM. Measured, on an M3 Pro:
 
-| Resolution | Tokens | Per step | 4 steps |
-|---|---|---|---|
-| 1024x1024 | 4096 | ~45 s | ~3 min |
-| 768x768 | 2304 | ~25 s | ~1.7 min |
-| 512x512 | 1024 | ~15 s | ~1 min |
+| Resolution | Tokens (img + txt) | Per step | 4 steps | Total incl. VAE |
+|---|---|---|---|---|
+| 256x256 | 256 + 256 | 6.2 s | 25 s | 27 s |
+| 512x512 | 1024 + 256 | 20.2 s | 81 s | 92 s |
+| 1024x1024 | 4096 + 256 | 156 s | 624 s | 688 s |
 
-At an achievable 2-3 TFLOPS through a `simdgroup_matrix` half-precision GEMM.
-T5 encoding is `2 * 4.7e9 * 256` ~ 2.4 TFLOP, a one-off second or two. VAE
-decode is a few hundred GFLOP.
+So the estimate was low by 3.5x at full resolution, and the scaling is worse
+than the parameter count predicts: from 256x256 to 1024x1024 the token count
+grows 8.5x and the time 25x. That gap is attention, which is `O(T^2)` while
+everything else is `O(T)` -- at 4352 tokens it stops being a rounding error and
+starts being the bill.
 
-These are honest numbers, not aspirational ones. Text-to-image on this Mac is a
-minutes-per-image experience at full resolution.
+The process sits at 13% CPU throughout, so this is GPU-bound, which is the
+right place for it to be. What it is *not* is optimised: the attention kernel
+streams keys in tiles of 64 with a single thread doing each tile's softmax
+bookkeeping, and that is the obvious thing to fix first.
+
+T5 encoding is 6.7 s. VAE decode at 1024x1024 is ~60 s tiled, on the CPU.
+
+Text-to-image on this Mac is a ten-minute-per-image experience at full
+resolution and a half-minute one at 256x256.
 
 ---
 
@@ -509,8 +522,9 @@ three of the four were the kind that produce finite, plausible numbers.
 | M1 VAE, PNG | `vae.{hpp,cpp}`, `png.{hpp,cpp}` | 32 |
 | M2 text encoders | `t5.{hpp,cpp}`, `clip_text.{hpp,cpp}`, `qlinear.{hpp,cpp}` | 21 |
 | M3 MMDiT, sampler | `flux.{hpp,cpp}` | 29 |
-| M4 Metal | `metal_flux.{hpp,mm}`, `shaders/flux.msl` | 7 |
-| | | **112** |
+| M4 Metal | `metal_flux.{hpp,mm}`, `shaders/flux.msl` | 8 |
+| Real checkpoints | tokenizer, loader and overflow fixes | 8 |
+| | | **120** |
 
 ### Four bugs worth recording
 
@@ -552,24 +566,121 @@ tile silently rather than faulting, so `MetalFluxContext::create` checks.
 
 ---
 
+## Meeting the real checkpoints
+
+The 112 tests passed and the model still produced a black image. Everything
+that stood between the two was in the seam: naming, packaging, and two
+performance cliffs. None of it was the architecture.
+
+### 1. The T5 checkpoint is named by llama.cpp, not by HuggingFace
+
+The loader asked for `encoder.block.3.layer.0.SelfAttention.q.weight`. The file
+that people actually distribute is converted by llama.cpp, which normalises
+everything to its own scheme: `enc.blk.3.attn_q.weight`, `ffn_gate`, `ffn_up`,
+`ffn_down`, `enc.output_norm`. Both conventions are now accepted, and the error
+names every candidate it tried.
+
+`ffn_gate` is `wi_0` and `ffn_up` is `wi_1`, in that order -- and the order
+matters, because only the gate takes the GELU.
+
+### 2. The T5 checkpoint carries its own tokenizer
+
+`tokenizer.ggml.tokens` and `tokenizer.ggml.scores` are a complete
+SentencePiece unigram vocabulary. `--t5-tokenizer` is now optional: without it,
+the tokenizer is built from the checkpoint itself, which is one fewer download
+and one fewer way to pair a checkpoint with the wrong vocabulary.
+
+### 3. The autoencoder ships under two conventions that number levels backwards
+
+`black-forest-labs` ships `ae.safetensors` under the original LDM names --
+`decoder.mid.block_1`, `decoder.up.0.block.0`, `nin_shortcut` -- and diffusers
+ships `vae/diffusion_pytorch_model.safetensors` under its own. Repackaged
+mirrors put either naming under either path, so the convention has to be
+detected from the tensors present.
+
+The spelling is the easy half. **The two number the upsampling levels in
+opposite directions**: diffusers' `up_blocks.0` is the coarsest level and the
+original's `up.0` is the finest. Loading one as the other lines up for the two
+512-channel levels and then fails the channel count on the third -- which is
+the good case, because reversing the resnets without reversing the upsamplers
+would have produced a blurred image and no error at all.
+
+### 4. CLIP's tokenizer is not GPT-2's
+
+This one produced correct-looking nonsense. `HfBpeTokenizer` implements
+byte-level BPE the way GPT-2 and Llama 3 do it, and it happily loaded CLIP's
+49408-entry vocabulary and returned ids. They were wrong:
+
+```
+a photograph of a harbour at dawn
+  as GPT-2:  64 220 1688 220 684 220 64 220 35430 220 527 220 30590
+  as CLIP:   320 8853 539 320 10011 536 7689
+```
+
+Token 220 is a space. CLIP is a different family: the text is lowercased and
+its whitespace collapsed first, the split *drops* whitespace rather than
+attaching it to the following word, and each word carries an explicit `</w>`
+marker instead of a leading space. `PreTokenizer::Clip` and an
+`end_of_word_suffix` that merges onto the last symbol of each word fix it; the
+suffix's presence in `tokenizer.json` is what selects the mode.
+
+Nothing about this fails loudly. The prompt still encodes, the model still
+draws, and the image is merely unrelated to what was asked for.
+
+### 5. `matmul_q4k_t` is a scalar triple loop above batch one
+
+The first real T5 encode did not finish in ten minutes. `Q4KMat::matmul_q4k_t`
+has a fused NEON path for the single row a decode step asks for and a plain
+triple loop for everything else -- the right trade for a language model and the
+wrong one for a stack that never has a batch of one. Switching `QLinear` to
+`matmul_q4k_t_blas`, which dequantizes a chunk of weight rows at a time and
+hands each chunk to sgemm:
+
+| | before | after |
+|---|---|---|
+| T5-XXL, 256 tokens | > 10 min | **6.7 s** |
+
+### 6. Metal's fast-math `tanh` overflows, and one NaN is enough
+
+With everything else fixed, the GPU produced a uniformly NaN image while the
+CPU produced a picture. Instrumenting the forward pass stage by stage put the
+first NaN in the *text* stream of the *first* double block -- the image stream
+beside it was clean -- and then in its GELU specifically: 277 non-finite values
+out of 3.1 M, from a finite input whose largest magnitude was 27.
+
+The cubic term is why. At `v = 27` the tanh argument is near 724, and Metal
+compiles `tanh` under fast-math into a form that evaluates `exp(2x)`. At 724
+that is `inf`, and `inf/inf` is `NaN`. Clamping the argument to ±10 is exact --
+tanh is saturated to within a float's resolution long before there.
+
+The failure mode is worth remembering: 277 poisoned values out of three million
+became a fully black image, because a NaN in a residual stream reaches
+everything downstream of it and there are 56 blocks downstream.
+
+Two regression tests now cover it, one on each side, both driving activations
+past the point where the synthetic weights never went.
+
+---
+
 ## What is not verified
 
-The honest list, because none of it is covered by the 112 tests:
+Shorter than it was, but not empty:
 
-1. **Tensor names.** `FluxModel::load_gguf` and `VaeDecoder::load` ask for the
-   names the reference implementations use. Nothing here has opened a real
-   checkpoint, so a renamed or restructured tensor fails at load -- loudly,
-   which is the good case, but it has not happened yet.
-2. **That the output is a picture.** Every test builds its weights
-   synthetically. The pieces agree with their own references and the GPU agrees
-   with the CPU; whether the whole thing draws a cat is untested.
-3. **The performance estimates.** The 45 s/step figure is arithmetic on the
-   FLOP count and an assumed 2-3 TFLOPS, not a measurement.
-4. **Tiled VAE decode seams at 1024x1024.** The blend is verified to cover
-   every pixel exactly once; whether the overlap is wide enough to hide the
-   GroupNorm discontinuity across an edge wants an actual image.
-
-The next step is to fetch the four checkpoints and run it.
+1. **Numerical parity with diffusers.** The output is a photograph of what was
+   asked for, which rules out the whole class of bugs that produce noise or the
+   wrong subject. It does not prove that a given seed produces the *same*
+   photograph the reference implementation would. Checking that needs a
+   step-by-step latent comparison against a diffusers run.
+2. **`--model flux-dev`.** The config, the guidance embedding and the shifted
+   schedule are implemented and tested against the CPU path, but dev's weights
+   are behind a gated repository and have never been loaded.
+3. **Prompts with combining marks.** CLIP's normalizer includes NFC
+   composition, which `normalize` does not do -- it lowercases and collapses
+   whitespace only. It costs a token boundary on text carrying combining
+   characters, and nothing at all on the Latin text prompts are usually in.
+4. **Resolutions other than the three that were run.** 256x256, 512x512 and
+   1024x1024 all work. Non-square sizes are handled in the code and covered by
+   the shape tests, but no non-square image has been generated.
 
 ---
 

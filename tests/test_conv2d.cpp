@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <vector>
@@ -475,4 +476,25 @@ TEST_CASE("quick_gelu is not interchangeable with gelu_tanh", "[conv2d][activati
     quick_gelu_inplace(a);
     gelu_tanh_inplace(b);
     REQUIRE(std::fabs(a.data[0] - b.data[0]) > 1e-3f);
+}
+
+TEST_CASE("gelu_tanh stays finite where the cubic term explodes", "[conv2d][activation]") {
+    // `x^3` at x = 27 puts the tanh argument near 724. The CPU's `std::tanh`
+    // saturates there correctly; the GPU kernel has to clamp to get the same
+    // answer, and this pins what that answer is.
+    Mat m = Mat::from_fn(1, 5, [](std::size_t, std::size_t c) {
+        return std::array<float, 5>{-40.0f, -27.0f, 0.0f, 27.0f, 40.0f}[c];
+    });
+    const Mat before = m;
+    gelu_tanh_inplace(m);
+    for (const float v : m.data) {
+        REQUIRE(std::isfinite(v));
+    }
+    // Far from zero GELU is the identity on the positive side and zero on the
+    // negative one, to well within a float.
+    REQUIRE(approx(m.at(0, 0), 0.0f, 1e-6f));
+    REQUIRE(approx(m.at(0, 1), 0.0f, 1e-6f));
+    REQUIRE(approx(m.at(0, 2), 0.0f, 1e-6f));
+    REQUIRE(approx(m.at(0, 3), before.at(0, 3), 1e-4f));
+    REQUIRE(approx(m.at(0, 4), before.at(0, 4), 1e-4f));
 }
