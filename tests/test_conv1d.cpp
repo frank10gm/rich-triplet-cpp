@@ -541,3 +541,151 @@ TEST_CASE("conv1d_dense handles OmniVoice's residual-unit shape", "[conv1d]") {
         REQUIRE(std::isfinite(v));
     }
 }
+
+// =============================================================================
+// Stride and groups
+// =============================================================================
+
+namespace {
+
+/// Reference strided grouped convolution, written the obvious way.
+[[nodiscard]] Mat ref_conv1d_grouped(const Mat& x, const Mat& w, std::size_t c_out,
+                                     std::size_t kernel, std::size_t groups,
+                                     std::size_t dilation, std::size_t padding,
+                                     std::size_t stride) {
+    const std::size_t in_per = x.cols / groups;
+    const std::size_t out_per = c_out / groups;
+    const std::size_t reach = dilation * (kernel - 1);
+    const std::size_t t_out = (x.rows + 2 * padding - reach - 1) / stride + 1;
+    Mat out = Mat::zeros(t_out, c_out);
+    for (std::size_t t = 0; t < t_out; ++t) {
+        for (std::size_t co = 0; co < c_out; ++co) {
+            const std::size_t g = co / out_per;
+            float acc = 0.0f;
+            for (std::size_t ci = 0; ci < in_per; ++ci) {
+                for (std::size_t k = 0; k < kernel; ++k) {
+                    const long src = static_cast<long>(t * stride + k * dilation) -
+                                     static_cast<long>(padding);
+                    if (src < 0 || src >= static_cast<long>(x.rows)) {
+                        continue;
+                    }
+                    acc += x.at(static_cast<std::size_t>(src), g * in_per + ci) *
+                           w.at(co, ci * kernel + k);
+                }
+            }
+            out.at_mut(t, co) = acc;
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("conv1d_out_len follows PyTorch when strided", "[conv1d]") {
+    // floor((T + 2p - d*(k-1) - 1) / s) + 1.
+    REQUIRE(conv1d_out_len(100, 7, 1, 3, 1) == 100);
+    REQUIRE(conv1d_out_len(100, 4, 1, 1, 2) == 50);
+    REQUIRE(conv1d_out_len(100, 16, 1, 4, 8) == 12);
+    // A stride of 1 has to stay what it always was.
+    REQUIRE(conv1d_out_len(100, 7, 1, 3) == conv1d_out_len(100, 7, 1, 3, 1));
+    // The odd-stride case the codec's last encoder block hits: kernel 6,
+    // stride 3, padding 2 turns 3n samples into exactly n.
+    REQUIRE(conv1d_out_len(30, 6, 1, 2, 3) == 10);
+    REQUIRE(conv1d_out_len(300, 6, 1, 2, 3) == 100);
+}
+
+TEST_CASE("conv1d_dense strides without changing the arithmetic", "[conv1d]") {
+    const Mat x = ramp(200, 12, 0.003f, 0.4f);
+    const Mat w = ramp(20, 12 * 5, 0.001f, 0.2f);
+    for (const std::size_t stride : {1u, 2u, 3u, 5u}) {
+        const Mat got = conv1d_dense(x, w, 20, 5, {}, 1, 2, stride);
+        const Mat want = ref_conv1d_grouped(x, w, 20, 5, 1, 1, 2, stride);
+        REQUIRE(got.rows == want.rows);
+        for (std::size_t i = 0; i < got.data.size(); ++i) {
+            REQUIRE(approx(got.data[i], want.data[i]));
+        }
+    }
+}
+
+TEST_CASE("a strided convolution is a subsample of an unstrided one", "[conv1d]") {
+    // Nothing about the dot products changes with stride; only how many of
+    // them are evaluated. This catches an off-by-one in the input offset that
+    // a same-shape comparison would not.
+    const Mat x = ramp(120, 8, 0.005f, 0.3f);
+    const Mat w = ramp(6, 8 * 3, 0.002f, 0.1f);
+    const Mat full = conv1d_dense(x, w, 6, 3, {}, 1, 1, 1);
+    const Mat strided = conv1d_dense(x, w, 6, 3, {}, 1, 1, 4);
+    for (std::size_t t = 0; t < strided.rows; ++t) {
+        for (std::size_t c = 0; c < 6; ++c) {
+            REQUIRE(approx(strided.at(t, c), full.at(t * 4, c)));
+        }
+    }
+}
+
+TEST_CASE("conv1d_grouped matches a reference loop", "[conv1d]") {
+    const std::size_t groups = 4;
+    const Mat x = ramp(80, 16, 0.004f, 0.35f);
+    const Mat w = ramp(24, (16 / groups) * 3, 0.0015f, 0.12f);
+    std::vector<float> bias(24);
+    for (std::size_t i = 0; i < bias.size(); ++i) {
+        bias[i] = 0.01f * static_cast<float>(i) - 0.1f;
+    }
+
+    const Mat got = conv1d_grouped(x, w, 24, 3, bias, groups, 1, 1, 2);
+    Mat want = ref_conv1d_grouped(x, w, 24, 3, groups, 1, 1, 2);
+    for (std::size_t r = 0; r < want.rows; ++r) {
+        for (std::size_t c = 0; c < want.cols; ++c) {
+            want.at_mut(r, c) += bias[c];
+        }
+    }
+    REQUIRE(got.rows == want.rows);
+    for (std::size_t i = 0; i < got.data.size(); ++i) {
+        REQUIRE(approx(got.data[i], want.data[i]));
+    }
+}
+
+TEST_CASE("conv1d_grouped degenerates to the two special cases", "[conv1d]") {
+    const Mat x = ramp(60, 8, 0.004f, 0.3f);
+
+    // groups == 1 is a dense convolution.
+    const Mat dense_w = ramp(8, 8 * 3, 0.002f, 0.1f);
+    const Mat a = conv1d_grouped(x, dense_w, 8, 3, {}, 1, 1, 1);
+    const Mat b = conv1d_dense(x, dense_w, 8, 3, {}, 1, 1);
+    REQUIRE(a.data.size() == b.data.size());
+    for (std::size_t i = 0; i < a.data.size(); ++i) {
+        REQUIRE(approx(a.data[i], b.data[i]));
+    }
+
+    // groups == channels is a depthwise one. `conv1d_depthwise` stores [C, K],
+    // which is the same buffer a grouped weight of [C, 1 * K] holds.
+    const Mat dw = ramp(8, 3, 0.003f, 0.2f);
+    const Mat c = conv1d_grouped(x, dw, 8, 3, {}, 8, 1, 1);
+    const Mat d = conv1d_depthwise(x, dw, {}, 1, 1);
+    REQUIRE(c.data.size() == d.data.size());
+    for (std::size_t i = 0; i < c.data.size(); ++i) {
+        REQUIRE(approx(c.data[i], d.data[i]));
+    }
+}
+
+TEST_CASE("conv1d_grouped keeps the groups apart", "[conv1d]") {
+    // The point of grouping: changing an input channel must not move an output
+    // channel in another group. A dense convolution would fail this.
+    const std::size_t groups = 2;
+    Mat x = ramp(40, 4, 0.01f, 0.5f);
+    const Mat w = ramp(4, (4 / groups) * 3, 0.005f, 0.25f);
+
+    const Mat before = conv1d_grouped(x, w, 4, 3, {}, groups, 1, 1);
+    x.at_mut(20, 0) += 1.0f;  // group 0's input
+    const Mat after = conv1d_grouped(x, w, 4, 3, {}, groups, 1, 1);
+
+    bool group0_moved = false;
+    for (std::size_t t = 0; t < before.rows; ++t) {
+        for (std::size_t c = 0; c < 2; ++c) {
+            group0_moved = group0_moved || before.at(t, c) != after.at(t, c);
+        }
+        for (std::size_t c = 2; c < 4; ++c) {
+            REQUIRE(before.at(t, c) == after.at(t, c));
+        }
+    }
+    REQUIRE(group0_moved);
+}

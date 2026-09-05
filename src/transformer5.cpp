@@ -139,9 +139,11 @@ LlamaAttention::LlamaAttention(const Config5& cfg)
       n_q_heads(cfg.num_attention_heads),
       n_kv_heads(cfg.num_key_value_heads),
       head_dim(cfg.head_dim),
-      rope_pairing(cfg.rope_pairing),
       // Plain 1/sqrt(head_dim) -- Gemma's query_pre_attn_scalar has no analogue.
-      attn_scale(1.0f / std::sqrt(static_cast<float>(cfg.head_dim))) {}
+      attn_scale(1.0f / std::sqrt(static_cast<float>(cfg.head_dim))),
+      // Declaration order, not written order, is what runs. Keeping the two in
+      // step is the only way this stays readable.
+      rope_pairing(cfg.rope_pairing) {}
 
 LlamaAttention LlamaAttention::new_for_inference(const Config5& cfg) {
     return LlamaAttention(cfg);
@@ -217,9 +219,12 @@ Mat LlamaBlock::forward_cached(const Mat& x, LlamaLayerKvCache& cache) const {
 // =============================================================================
 
 LlamaModel::LlamaModel(Config5 cfg)
-    : norm(cfg.hidden_size, cfg.rms_norm_eps),
-      lm_head(Linear2::new_no_bias_zeros(cfg.hidden_size, cfg.vocab_size)),
-      config(std::move(cfg)) {
+    // `config` is declared first, so it is initialized first whatever order
+    // this list is written in -- which means the two members after it have to
+    // read from `config` and not from the moved-from parameter.
+    : config(std::move(cfg)),
+      norm(config.hidden_size, config.rms_norm_eps),
+      lm_head(Linear2::new_no_bias_zeros(config.hidden_size, config.vocab_size)) {
     layers.reserve(config.num_hidden_layers);
     for (std::size_t i = 0; i < config.num_hidden_layers; ++i) {
         layers.push_back(LlamaBlock::new_for_inference(config));

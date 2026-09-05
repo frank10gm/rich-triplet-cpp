@@ -182,33 +182,4 @@ class OmniCodecDecoder {
     [[nodiscard]] std::size_t parameter_count() const;
 };
 
-// =============================================================================
-// Helpers (exposed for testing)
-// =============================================================================
-
-/// Read a convolution weight out of GGUF into `conv1d.hpp`'s layout.
-///
-/// GGUF *lists* dimensions in reverse of PyTorch but stores the same flat
-/// buffer, so no transpose is needed -- a `Conv1d` weight listed as
-/// `[K, Cin, Cout]` is still `[Cout][Cin][K]` row-major in memory, which is
-/// exactly the `[Cout, Cin * K]` matrix the convolution routines want. Only
-/// the row and column counts have to be worked out.
-///
-/// Those are derived from `out_channels` rather than from the shape, because
-/// GGUF elides trailing dimensions of length 1: the decoder's final
-/// `[1, 32, 7]` projection is listed as a two-dimensional `[7, 32]`, and there
-/// is no way to tell that from a genuinely two-dimensional weight. Passing the
-/// expected output width sidesteps the ambiguity and validates the tensor at
-/// the same time.
-[[nodiscard]] Result<Mat> load_gguf_conv_weight(const GgufFile& gguf, const std::string& name,
-                                                std::size_t out_channels);
-
-/// Read a `[1, C]` Snake alpha as a flat vector.
-[[nodiscard]] Result<std::vector<float>> load_gguf_alpha(const GgufFile& gguf,
-                                                         const std::string& name);
-
-/// Read an f32/f16 tensor as a flat vector, for biases.
-[[nodiscard]] Result<std::vector<float>> load_gguf_vector(const GgufFile& gguf,
-                                                          const std::string& name);
-
 }  // namespace rt

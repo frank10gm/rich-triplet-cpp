@@ -66,7 +66,8 @@ namespace rt {
 /// Output length of a 1-D convolution. Returns 0 when the kernel does not fit,
 /// which callers should treat as an error rather than an empty result.
 [[nodiscard]] std::size_t conv1d_out_len(std::size_t t_in, std::size_t kernel,
-                                         std::size_t dilation, std::size_t padding);
+                                         std::size_t dilation, std::size_t padding,
+                                         std::size_t stride = 1);
 
 /// Output length of a 1-D transposed convolution.
 [[nodiscard]] std::size_t conv_transpose1d_out_len(std::size_t t_in, std::size_t kernel,
@@ -123,10 +124,34 @@ namespace rt {
 /// matrix would be `T_out * Cin * K` floats -- hundreds of megabytes at those
 /// shapes.
 ///
+/// `stride` skips output positions -- an encoder downsamples with it, and it is
+/// free, since a strided convolution simply evaluates fewer of the same dot
+/// products.
+///
 /// `bias` may be empty, meaning no bias.
 [[nodiscard]] Mat conv1d_dense(const Mat& x, const Mat& weight, std::size_t out_channels,
                                std::size_t kernel, std::span<const float> bias,
-                               std::size_t dilation, std::size_t padding);
+                               std::size_t dilation, std::size_t padding,
+                               std::size_t stride = 1);
+
+/// Grouped convolution -- the general case between dense and depthwise.
+///
+/// `x` is [T, Cin], `weight` is [Cout, (Cin / groups) * K], output is
+/// [T_out, Cout]. Group `g` maps its slice of the input channels to its slice
+/// of the output ones and to nothing else, so `groups == 1` is
+/// `conv1d_dense` and `groups == Cin == Cout` is `conv1d_depthwise`.
+///
+/// This exists for exactly one layer: HuBERT's positional convolution is
+/// `Conv1d(768, 768, kernel=128, groups=16)`, which is neither of the two
+/// special cases. It runs each group through `conv1d_dense`, which is the
+/// right trade at 16 groups and the wrong one at 768 -- hence keeping the
+/// depthwise routine.
+///
+/// `bias` may be empty, meaning no bias.
+[[nodiscard]] Mat conv1d_grouped(const Mat& x, const Mat& weight, std::size_t out_channels,
+                                 std::size_t kernel, std::span<const float> bias,
+                                 std::size_t groups, std::size_t dilation, std::size_t padding,
+                                 std::size_t stride = 1);
 
 /// Transposed (fractionally-strided) convolution -- the upsampling operator.
 ///

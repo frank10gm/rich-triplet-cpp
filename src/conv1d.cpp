@@ -34,13 +34,14 @@ void add_bias_rows(Mat& out, std::span<const float> bias) {
 // =============================================================================
 
 std::size_t conv1d_out_len(std::size_t t_in, std::size_t kernel, std::size_t dilation,
-                           std::size_t padding) {
+                           std::size_t padding, std::size_t stride) {
     assert(kernel >= 1 && "conv1d_out_len: kernel must be >= 1");
     assert(dilation >= 1 && "conv1d_out_len: dilation must be >= 1");
-    // PyTorch's formula at stride 1: T + 2p - d*(k-1).
+    assert(stride >= 1 && "conv1d_out_len: stride must be >= 1");
+    // PyTorch's formula: floor((T + 2p - d*(k-1) - 1) / s) + 1.
     const std::size_t reach = dilation * (kernel - 1);
     const std::size_t padded = t_in + 2 * padding;
-    return padded > reach ? padded - reach : 0;
+    return padded > reach ? (padded - reach - 1) / stride + 1 : 0;
 }
 
 std::size_t conv_transpose1d_out_len(std::size_t t_in, std::size_t kernel, std::size_t stride,
@@ -108,16 +109,17 @@ Mat conv1d_depthwise(const Mat& x, const Mat& weight, std::span<const float> bia
 }
 
 Mat conv1d_dense(const Mat& x, const Mat& weight, std::size_t out_channels, std::size_t kernel,
-                 std::span<const float> bias, std::size_t dilation, std::size_t padding) {
+                 std::span<const float> bias, std::size_t dilation, std::size_t padding,
+                 std::size_t stride) {
     assert(weight.rows == out_channels && "conv1d_dense: weight.rows != out_channels");
     assert(weight.cols == x.cols * kernel && "conv1d_dense: weight.cols != Cin * kernel");
 
-    if (kernel == 1 && dilation == 1 && padding == 0) {
+    if (kernel == 1 && dilation == 1 && padding == 0 && stride == 1) {
         return conv1d_pointwise(x, weight, bias);
     }
 
     const std::size_t c_in = x.cols;
-    const std::size_t t_out = conv1d_out_len(x.rows, kernel, dilation, padding);
+    const std::size_t t_out = conv1d_out_len(x.rows, kernel, dilation, padding, stride);
 
     // im2col + gemm once the problem is big enough to pay for the scratch
     // buffer. The threshold is deliberately low: below it the direct loop is
@@ -142,7 +144,7 @@ Mat conv1d_dense(const Mat& x, const Mat& weight, std::size_t out_channels, std:
             for (std::size_t r = 0; r < rows; ++r) {
                 float* crow = cols.row_mut(r).data();
                 for (std::size_t k = 0; k < kernel; ++k) {
-                    const std::size_t shifted = base + r + k * dilation;
+                    const std::size_t shifted = (base + r) * stride + k * dilation;
                     if (shifted < padding) {
                         continue;
                     }
@@ -172,7 +174,7 @@ Mat conv1d_dense(const Mat& x, const Mat& weight, std::size_t out_channels, std:
     for (std::size_t t = 0; t < t_out; ++t) {
         float* orow = out.row_mut(t).data();
         for (std::size_t k = 0; k < kernel; ++k) {
-            const std::size_t shifted = t + k * dilation;
+            const std::size_t shifted = t * stride + k * dilation;
             if (shifted < padding) {
                 continue;
             }
@@ -188,6 +190,48 @@ Mat conv1d_dense(const Mat& x, const Mat& weight, std::size_t out_channels, std:
                     acc += xrow[ci] * wrow[ci * kernel + k];
                 }
                 orow[co] += acc;
+            }
+        }
+    }
+
+    add_bias_rows(out, bias);
+    return out;
+}
+
+Mat conv1d_grouped(const Mat& x, const Mat& weight, std::size_t out_channels,
+                   std::size_t kernel, std::span<const float> bias, std::size_t groups,
+                   std::size_t dilation, std::size_t padding, std::size_t stride) {
+    assert(groups >= 1 && "conv1d_grouped: groups must be >= 1");
+    assert(x.cols % groups == 0 && "conv1d_grouped: groups must divide Cin");
+    assert(out_channels % groups == 0 && "conv1d_grouped: groups must divide Cout");
+    assert(weight.rows == out_channels && "conv1d_grouped: weight.rows != out_channels");
+    assert(weight.cols == (x.cols / groups) * kernel &&
+           "conv1d_grouped: weight.cols != (Cin / groups) * kernel");
+
+    if (groups == 1) {
+        return conv1d_dense(x, weight, out_channels, kernel, bias, dilation, padding, stride);
+    }
+
+    const std::size_t in_per = x.cols / groups;
+    const std::size_t out_per = out_channels / groups;
+    const std::size_t t_out = conv1d_out_len(x.rows, kernel, dilation, padding, stride);
+    Mat out = Mat::zeros(t_out, out_channels);
+
+    // Each group is an independent dense convolution over its own channel
+    // slice, so gather the slice, convolve, and scatter the result back. The
+    // gathers are what a native grouped kernel would avoid, and at 16 groups
+    // they are a rounding error against the gemm.
+    for (std::size_t g = 0; g < groups; ++g) {
+        const Mat xg = Mat::from_fn(x.rows, in_per, [&](std::size_t r, std::size_t c) {
+            return x.at(r, g * in_per + c);
+        });
+        const Mat wg = Mat::from_fn(out_per, weight.cols, [&](std::size_t r, std::size_t c) {
+            return weight.at(g * out_per + r, c);
+        });
+        const Mat og = conv1d_dense(xg, wg, out_per, kernel, {}, dilation, padding, stride);
+        for (std::size_t r = 0; r < t_out; ++r) {
+            for (std::size_t c = 0; c < out_per; ++c) {
+                out.at_mut(r, g * out_per + c) = og.at(r, c);
             }
         }
     }
