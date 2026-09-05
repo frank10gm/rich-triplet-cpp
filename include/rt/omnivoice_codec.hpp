@@ -48,10 +48,14 @@
 #include <vector>
 
 #include "rt/gguf.hpp"
+#include "rt/hubert.hpp"
 #include "rt/mat.hpp"
 #include "rt/result.hpp"
 
 namespace rt {
+
+/// The rate the semantic model runs at, whatever the codec's own is.
+inline constexpr std::size_t kSemanticSampleRate = 16000;
 
 // =============================================================================
 // Config
@@ -65,7 +69,11 @@ struct OmniCodecConfig {
     std::size_t latent_dim = 1024;
     /// Channels entering the first upsampling block; halves each block.
     std::size_t decoder_dim = 1024;
-    /// The decoder's input width after `fc2`.
+    /// Channels leaving the encoder's input convolution; doubles each block.
+    std::size_t encoder_dim = 64;
+    /// The decoder's input width after `fc2`, and the acoustic encoder's
+    /// output width -- the same number because they are the two ends of one
+    /// bottleneck.
     std::size_t decoder_in_dim = 256;
     /// Coarsest first.
     std::vector<std::size_t> upsampling_ratios{8, 5, 4, 2, 3};
@@ -77,6 +85,12 @@ struct OmniCodecConfig {
 
     /// Product of `upsampling_ratios`; must equal `hop_length`.
     [[nodiscard]] std::size_t upsample_factor() const;
+
+    /// The semantic path's width: whatever the acoustic path does not fill of
+    /// the quantizer's input.
+    [[nodiscard]] std::size_t semantic_dim() const {
+        return latent_dim > decoder_in_dim ? latent_dim - decoder_in_dim : 0;
+    }
 };
 
 // =============================================================================
@@ -132,6 +146,10 @@ struct OmniQuantizer {
         /// [latent_dim, codebook_dim] pointwise.
         Mat project_out_weight;
         std::vector<float> project_out_bias;
+        /// [codebook_dim, latent_dim] pointwise. Empty in a decoder-only load;
+        /// analysis needs it to get *into* the codebook's space.
+        Mat project_in_weight;
+        std::vector<float> project_in_bias;
     };
     std::vector<Level> levels;
     std::size_t latent_dim = 0;
@@ -140,6 +158,17 @@ struct OmniQuantizer {
     /// Returns [T, latent_dim].
     [[nodiscard]] Result<Mat> from_codes(
         const std::vector<std::vector<std::uint32_t>>& codes) const;
+
+    /// The analysis direction: latents to codes, one vector per codebook.
+    ///
+    /// Residual quantization is greedy and sequential. Level 0 picks the
+    /// nearest entry to the latent, its reconstruction is subtracted, and
+    /// level 1 codes what is left. So the codebooks are not independent and
+    /// cannot be searched in parallel -- each one only ever sees the error the
+    /// ones before it could not represent, which is why the later codebooks
+    /// carry finer detail and why unmasking them last is the right order.
+    [[nodiscard]] Result<std::vector<std::vector<std::uint32_t>>> to_codes(
+        const Mat& latents) const;
 };
 
 // =============================================================================
@@ -178,6 +207,133 @@ class OmniCodecDecoder {
     /// no noise injection anywhere in this decoder.
     [[nodiscard]] Result<std::vector<float>> decode(
         const std::vector<std::vector<std::uint32_t>>& codes) const;
+
+    [[nodiscard]] std::size_t parameter_count() const;
+};
+
+
+// =============================================================================
+// Analysis
+// =============================================================================
+//
+// The mirror of the decoder, and the half voice cloning needs: a waveform in,
+// eight streams of codebook indices out. It is not a mirror of one stack but of
+// two -- the codec quantizes the concatenation of an *acoustic* path and a
+// *semantic* one, so that a code carries both how a voice sounds and what it
+// said.
+//
+//   24 kHz samples --> acoustic encoder (DAC) ------> [T, 256] --+
+//                  \                                             |--> fc --> RVQ
+//                   -> 16 kHz --> HuBERT --> conv stack --> [T, 768] --+
+//
+// Both arrive at the same 25 Hz frame rate by different arithmetic, and that
+// they agree is the load-bearing invariant: the acoustic path divides 24 kHz by
+// 960, while the semantic path divides 16 kHz by 320 for 50 Hz and then keeps
+// every other frame.
+
+/// One downsampling stage: three residual units, Snake, then a strided
+/// convolution that halves the length by `stride` and doubles the channels.
+///
+/// The residual units run *before* the downsample here, where the decoder runs
+/// them after its upsample. That is not symmetry for its own sake -- it keeps
+/// the expensive dilated convolutions on the shorter side of the stride in
+/// both directions.
+struct OmniEncoderBlock {
+    std::vector<OmniResidualUnit> units;
+    std::vector<float> alpha;
+    /// [Cout, Cin * K]
+    Mat down_weight;
+    std::vector<float> down_bias;
+    std::size_t out_channels = 0;
+    std::size_t kernel = 0;
+    std::size_t stride = 1;
+    std::size_t padding = 0;
+
+    [[nodiscard]] Mat forward(const Mat& x) const;
+};
+
+/// The acoustic half: raw 24 kHz samples to `hidden_size`-wide frames.
+struct OmniAcousticEncoder {
+    /// `acoustic_encoder.conv1`: [encoder_dim, 1 * 7].
+    Mat in_weight;
+    std::vector<float> in_bias;
+    std::vector<OmniEncoderBlock> blocks;
+    std::vector<float> out_alpha;
+    /// `acoustic_encoder.conv2`: [acoustic_dim, C * 3].
+    Mat out_weight;
+    std::vector<float> out_bias;
+
+    /// [T] samples to [T / hop_length, acoustic_dim].
+    [[nodiscard]] Result<Mat> forward(std::span<const float> samples,
+                                      std::size_t hop_length) const;
+};
+
+/// A residual unit in the semantic stack.
+///
+/// Same shape as the acoustic one and none of the same details: ELU rather
+/// than Snake, kernel 3 rather than 7, and no biases at all.
+struct OmniSemanticResidualUnit {
+    /// [C, C * 3]
+    Mat conv1_weight;
+    /// [C, C]
+    Mat conv2_weight;
+    std::size_t dilation = 1;
+
+    [[nodiscard]] Mat forward(const Mat& x) const;
+};
+
+/// Residual units, then a convolution. Both of OmniVoice's blocks run at
+/// stride 1, so this stack reshapes the features without resampling them.
+struct OmniSemanticBlock {
+    std::vector<OmniSemanticResidualUnit> units;
+    /// [Cout, Cin * K]
+    Mat conv_weight;
+    std::vector<float> conv_bias;
+    std::size_t out_channels = 0;
+    std::size_t kernel = 3;
+    std::size_t stride = 1;
+    std::size_t padding = 1;
+
+    [[nodiscard]] Mat forward(const Mat& x) const;
+};
+
+/// The convolutional adapter between HuBERT's features and the quantizer.
+struct OmniSemanticEncoder {
+    /// `encoder_semantic.conv`: [C, C * 3], no bias.
+    Mat in_weight;
+    std::vector<OmniSemanticBlock> blocks;
+
+    [[nodiscard]] Mat forward(const Mat& x) const;
+};
+
+/// Waveform to codes.
+class OmniCodecEncoder {
+   public:
+    OmniCodecConfig config;
+    HubertModel semantic;
+    OmniSemanticEncoder semantic_adapter;
+    OmniAcousticEncoder acoustic;
+
+    /// `fc`: the concatenated [acoustic | semantic] width, mixed in place.
+    Mat fc_weight;
+    std::vector<float> fc_bias;
+
+    OmniQuantizer quantizer;
+
+    /// Load the analysis-side tensors from an `omnivoice-tokenizer` GGUF.
+    ///
+    /// Roughly the complement of what `OmniCodecDecoder::load` reads, plus the
+    /// codebooks, which both halves need.
+    [[nodiscard]] static Result<OmniCodecEncoder> load(const std::string& path,
+                                                       OmniCodecConfig cfg);
+
+    /// Mono 24 kHz samples to `n_codebooks` streams of indices.
+    ///
+    /// Trailing samples that do not complete a frame are dropped, which is
+    /// what the reference does: a partial frame would put the two paths'
+    /// lengths out of step and force a padding branch.
+    [[nodiscard]] Result<std::vector<std::vector<std::uint32_t>>> encode(
+        std::span<const float> samples) const;
 
     [[nodiscard]] std::size_t parameter_count() const;
 };

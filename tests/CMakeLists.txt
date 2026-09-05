@@ -13,6 +13,7 @@ add_executable(rt_tests
   test_wav.cpp
   test_duration.cpp
   test_resample.cpp
+  test_hubert.cpp
   test_ndarray.cpp
   test_tensor_node.cpp
   test_nn2.cpp

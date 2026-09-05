@@ -3,9 +3,11 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <utility>
 
 #include "rt/conv1d.hpp"
+#include "rt/resample.hpp"
 
 namespace rt {
 
@@ -107,6 +109,168 @@ Result<Mat> OmniQuantizer::from_codes(
     }
 
     return z;
+}
+
+
+// =============================================================================
+// Quantizer -- analysis
+// =============================================================================
+
+Result<std::vector<std::vector<std::uint32_t>>> OmniQuantizer::to_codes(const Mat& latents) const {
+    if (levels.empty()) {
+        return err("omnivoice codec: the quantizer has no levels");
+    }
+    if (latents.cols != latent_dim) {
+        return err("omnivoice codec: latents are " + std::to_string(latents.cols) +
+                   " wide, expected " + std::to_string(latent_dim));
+    }
+    for (const Level& level : levels) {
+        if (level.project_in_weight.rows == 0) {
+            return err(
+                "omnivoice codec: this quantizer was loaded for synthesis only and has no "
+                "project_in");
+        }
+    }
+
+    std::vector<std::vector<std::uint32_t>> codes;
+    codes.reserve(levels.size());
+
+    Mat residual = latents;
+    for (const Level& level : levels) {
+        const std::size_t dim = level.codebook.cols;
+        const Mat projected =
+            conv1d_pointwise(residual, level.project_in_weight, level.project_in_bias);
+
+        // Nearest entry by Euclidean distance. ||x||^2 is the same for every
+        // candidate, so only -2 x.e + ||e||^2 decides -- which turns the search
+        // into one gemm against the codebook plus a precomputed norm.
+        std::vector<float> code_norm(level.codebook.rows, 0.0f);
+        for (std::size_t e = 0; e < level.codebook.rows; ++e) {
+            float sum = 0.0f;
+            for (std::size_t d = 0; d < dim; ++d) {
+                const float v = level.codebook.at(e, d);
+                sum += v * v;
+            }
+            code_norm[e] = sum;
+        }
+        const Mat dots = projected.matmul_bt(level.codebook);
+
+        std::vector<std::uint32_t> chosen(latents.rows, 0);
+        for (std::size_t t = 0; t < latents.rows; ++t) {
+            const float* row = dots.row(t).data();
+            float best = std::numeric_limits<float>::infinity();
+            std::uint32_t best_e = 0;
+            for (std::size_t e = 0; e < level.codebook.rows; ++e) {
+                const float d = code_norm[e] - 2.0f * row[e];
+                if (d < best) {
+                    best = d;
+                    best_e = static_cast<std::uint32_t>(e);
+                }
+            }
+            chosen[t] = best_e;
+        }
+
+        // Subtract what this level can represent, so the next one codes the
+        // error rather than the signal again.
+        Mat picked = Mat::zeros(latents.rows, dim);
+        for (std::size_t t = 0; t < latents.rows; ++t) {
+            for (std::size_t d = 0; d < dim; ++d) {
+                picked.at_mut(t, d) = level.codebook.at(chosen[t], d);
+            }
+        }
+        const Mat reconstructed =
+            conv1d_pointwise(picked, level.project_out_weight, level.project_out_bias);
+        for (std::size_t i = 0; i < residual.data.size(); ++i) {
+            residual.data[i] -= reconstructed.data[i];
+        }
+
+        codes.push_back(std::move(chosen));
+    }
+    return codes;
+}
+
+// =============================================================================
+// Acoustic encoder
+// =============================================================================
+
+Mat OmniEncoderBlock::forward(const Mat& x) const {
+    Mat h = x;
+    for (const OmniResidualUnit& unit : units) {
+        h = unit.forward(h);
+    }
+    snake1d_inplace(h, alpha);
+    h = conv1d_dense(h, down_weight, out_channels, kernel, down_bias, 1, padding, stride);
+    return h;
+}
+
+Result<Mat> OmniAcousticEncoder::forward(std::span<const float> samples,
+                                         std::size_t hop_length) const {
+    if (hop_length == 0 || samples.size() % hop_length != 0) {
+        return err("omnivoice codec: " + std::to_string(samples.size()) +
+                   " samples do not divide into frames of " + std::to_string(hop_length));
+    }
+    const std::size_t frames = samples.size() / hop_length;
+    if (frames == 0) {
+        return err("omnivoice codec: the reference clip is shorter than one frame");
+    }
+
+    Mat h(std::vector<float>(samples.begin(), samples.end()), samples.size(), 1);
+    h = conv1d_dense(h, in_weight, in_weight.rows, 7, in_bias, 1, 3);
+    assert(h.rows == samples.size() && "omnivoice codec: the input convolution changed the length");
+
+    for (const OmniEncoderBlock& block : blocks) {
+        h = block.forward(h);
+    }
+    if (h.rows != frames) {
+        return err("omnivoice codec: the acoustic encoder produced " + std::to_string(h.rows) +
+                   " frames from " + std::to_string(samples.size()) + " samples, expected " +
+                   std::to_string(frames));
+    }
+
+    snake1d_inplace(h, out_alpha);
+    return conv1d_dense(h, out_weight, out_weight.rows, 3, out_bias, 1, 1);
+}
+
+// =============================================================================
+// Semantic encoder
+// =============================================================================
+
+namespace {
+
+/// ELU at alpha 1, the semantic stack's activation.
+void elu_inplace(Mat& x) {
+    for (float& v : x.data) {
+        v = v > 0.0f ? v : std::expm1(v);
+    }
+}
+
+}  // namespace
+
+Mat OmniSemanticResidualUnit::forward(const Mat& x) const {
+    Mat h = x;
+    elu_inplace(h);
+    h = conv1d_dense(h, conv1_weight, conv1_weight.rows, 3, {}, dilation, dilation);
+    assert(h.rows == x.rows && "omnivoice codec: semantic residual unit changed the length");
+    elu_inplace(h);
+    h = conv1d_pointwise(h, conv2_weight, {});
+    h.add_assign(x);
+    return h;
+}
+
+Mat OmniSemanticBlock::forward(const Mat& x) const {
+    Mat h = x;
+    for (const OmniSemanticResidualUnit& unit : units) {
+        h = unit.forward(h);
+    }
+    return conv1d_dense(h, conv_weight, out_channels, kernel, conv_bias, 1, padding, stride);
+}
+
+Mat OmniSemanticEncoder::forward(const Mat& x) const {
+    Mat h = conv1d_dense(x, in_weight, in_weight.rows, 3, {}, 1, 1);
+    for (const OmniSemanticBlock& block : blocks) {
+        h = block.forward(h);
+    }
+    return h;
 }
 
 // =============================================================================
@@ -346,6 +510,326 @@ Result<std::vector<float>> OmniCodecDecoder::decode(
         samples[t] = std::tanh(mono.at(t, 0));
     }
     return samples;
+}
+
+
+// =============================================================================
+// Loading -- analysis
+// =============================================================================
+
+Result<OmniCodecEncoder> OmniCodecEncoder::load(const std::string& path, OmniCodecConfig cfg) {
+    RT_TRY(gguf, GgufFile::open(path));
+
+    const auto arch = gguf.metadata.find("general.architecture");
+    if (arch != gguf.metadata.end()) {
+        const std::optional<std::string_view> name = arch->second.as_str();
+        if (name && *name != "omnivoice-tokenizer") {
+            return err("omnivoice codec: GGUF declares architecture '" + std::string(*name) +
+                       "', expected 'omnivoice-tokenizer'");
+        }
+    }
+
+    OmniCodecEncoder e;
+    e.config = std::move(cfg);
+    const OmniCodecConfig& c = e.config;
+
+    if (c.upsample_factor() != c.hop_length) {
+        return err("omnivoice codec: upsampling ratios multiply to " +
+                   std::to_string(c.upsample_factor()) + " but hop_length is " +
+                   std::to_string(c.hop_length));
+    }
+
+    // ---- quantizer: codebooks plus both projections ----
+    e.quantizer.latent_dim = c.latent_dim;
+    for (std::size_t i = 0; i < c.n_codebooks; ++i) {
+        const std::string base = "quantizer.quantizers." + std::to_string(i);
+        OmniQuantizer::Level level;
+
+        RT_TRY(embed, load_gguf_conv_weight(gguf, base + ".codebook.embed", c.codebook_size));
+        if (embed.cols != c.codebook_dim) {
+            return err("omnivoice codec: codebook " + std::to_string(i) + " is " +
+                       std::to_string(embed.rows) + "x" + std::to_string(embed.cols));
+        }
+        level.codebook = std::move(embed);
+
+        RT_TRY(pin, load_gguf_conv_weight(gguf, base + ".project_in.weight", c.codebook_dim));
+        if (pin.cols != c.latent_dim) {
+            return err("omnivoice codec: codebook " + std::to_string(i) + " project_in is " +
+                       std::to_string(pin.rows) + "x" + std::to_string(pin.cols));
+        }
+        level.project_in_weight = std::move(pin);
+        RT_TRY(pin_b, load_gguf_vector(gguf, base + ".project_in.bias"));
+        level.project_in_bias = std::move(pin_b);
+
+        RT_TRY(pout, load_gguf_conv_weight(gguf, base + ".project_out.weight", c.latent_dim));
+        level.project_out_weight = std::move(pout);
+        RT_TRY(pout_b, load_gguf_vector(gguf, base + ".project_out.bias"));
+        level.project_out_bias = std::move(pout_b);
+
+        e.quantizer.levels.push_back(std::move(level));
+    }
+
+    // ---- acoustic encoder ----
+    RT_TRY(in_w, load_gguf_conv_weight(gguf, "acoustic_encoder.conv1.weight", c.encoder_dim));
+    if (in_w.cols != 7) {
+        return err("omnivoice codec: acoustic_encoder.conv1 has " + std::to_string(in_w.cols) +
+                   " taps, expected 7 over one input channel");
+    }
+    e.acoustic.in_weight = std::move(in_w);
+    RT_TRY(in_b, load_gguf_vector(gguf, "acoustic_encoder.conv1.bias"));
+    e.acoustic.in_bias = std::move(in_b);
+
+    std::size_t channels = c.encoder_dim;
+    for (std::size_t i = 0; i < c.upsampling_ratios.size(); ++i) {
+        const std::string base = "acoustic_encoder.block." + std::to_string(i);
+        const std::size_t stride = c.upsampling_ratios[i];
+        OmniEncoderBlock block;
+
+        // Three residual units at dilations 1, 3 and 9, all on the block's
+        // *input* width -- they run before the downsample.
+        for (std::size_t u = 0; u < 3; ++u) {
+            const std::string ub = base + ".res_unit" + std::to_string(u + 1);
+            OmniResidualUnit unit;
+            unit.dilation = u == 0 ? 1 : (u == 1 ? 3 : 9);
+
+            RT_TRY(a1, load_gguf_alpha(gguf, ub + ".snake1.alpha"));
+            if (a1.size() != channels) {
+                return err("omnivoice codec: " + ub + ".snake1.alpha has " +
+                           std::to_string(a1.size()) + " channels, expected " +
+                           std::to_string(channels));
+            }
+            unit.alpha1 = std::move(a1);
+            RT_TRY(c1, load_gguf_conv_weight(gguf, ub + ".conv1.weight", channels));
+            unit.conv1_weight = std::move(c1);
+            RT_TRY(c1b, load_gguf_vector(gguf, ub + ".conv1.bias"));
+            unit.conv1_bias = std::move(c1b);
+
+            RT_TRY(a2, load_gguf_alpha(gguf, ub + ".snake2.alpha"));
+            unit.alpha2 = std::move(a2);
+            RT_TRY(c2, load_gguf_conv_weight(gguf, ub + ".conv2.weight", channels));
+            unit.conv2_weight = std::move(c2);
+            RT_TRY(c2b, load_gguf_vector(gguf, ub + ".conv2.bias"));
+            unit.conv2_bias = std::move(c2b);
+
+            block.units.push_back(std::move(unit));
+        }
+
+        RT_TRY(alpha, load_gguf_alpha(gguf, base + ".snake1.alpha"));
+        block.alpha = std::move(alpha);
+
+        // Kernel 2s with padding ceil(s/2) is what turns a multiple of s into
+        // exactly that multiple divided by s, for odd and even strides alike.
+        block.out_channels = channels * 2;
+        block.stride = stride;
+        block.kernel = 2 * stride;
+        block.padding = (stride + 1) / 2;
+        RT_TRY(dw, load_gguf_conv_weight(gguf, base + ".conv1.weight", block.out_channels));
+        if (dw.cols != channels * block.kernel) {
+            return err("omnivoice codec: " + base + ".conv1 is " + std::to_string(dw.rows) + "x" +
+                       std::to_string(dw.cols) + ", expected " +
+                       std::to_string(block.out_channels) + "x" +
+                       std::to_string(channels * block.kernel));
+        }
+        block.down_weight = std::move(dw);
+        RT_TRY(db, load_gguf_vector(gguf, base + ".conv1.bias"));
+        block.down_bias = std::move(db);
+
+        channels = block.out_channels;
+        e.acoustic.blocks.push_back(std::move(block));
+    }
+
+    RT_TRY(out_alpha, load_gguf_alpha(gguf, "acoustic_encoder.snake1.alpha"));
+    if (out_alpha.size() != channels) {
+        return err("omnivoice codec: acoustic_encoder.snake1.alpha has " +
+                   std::to_string(out_alpha.size()) + " channels, expected " +
+                   std::to_string(channels));
+    }
+    e.acoustic.out_alpha = std::move(out_alpha);
+    RT_TRY(out_w, load_gguf_conv_weight(gguf, "acoustic_encoder.conv2.weight", c.decoder_in_dim));
+    if (out_w.cols != channels * 3) {
+        return err("omnivoice codec: acoustic_encoder.conv2 is " + std::to_string(out_w.rows) +
+                   "x" + std::to_string(out_w.cols) + ", expected " +
+                   std::to_string(c.decoder_in_dim) + "x" + std::to_string(channels * 3));
+    }
+    e.acoustic.out_weight = std::move(out_w);
+    RT_TRY(out_b, load_gguf_vector(gguf, "acoustic_encoder.conv2.bias"));
+    e.acoustic.out_bias = std::move(out_b);
+
+    // ---- semantic model and its adapter ----
+    RT_TRY(hubert, HubertModel::load(gguf, HubertConfig::omnivoice_semantic(), "semantic_model"));
+    e.semantic = std::move(hubert);
+    if (e.semantic.config.hidden_size != c.semantic_dim()) {
+        return err("omnivoice codec: the semantic model is " +
+                   std::to_string(e.semantic.config.hidden_size) + " wide but the quantizer "
+                   "leaves " + std::to_string(c.semantic_dim()) + " for it");
+    }
+
+    const std::size_t sem = c.semantic_dim();
+    RT_TRY(sem_in, load_gguf_conv_weight(gguf, "encoder_semantic.conv.weight", sem));
+    if (sem_in.cols != sem * 3) {
+        return err("omnivoice codec: encoder_semantic.conv is " + std::to_string(sem_in.rows) +
+                   "x" + std::to_string(sem_in.cols));
+    }
+    e.semantic_adapter.in_weight = std::move(sem_in);
+
+    // Both blocks run at stride 1 and keep the width, which is what
+    // channel_ratios (1, 1) and strides (1, 1) mean.
+    for (std::size_t i = 0; i < 2; ++i) {
+        const std::string base = "encoder_semantic.conv_blocks." + std::to_string(i);
+        OmniSemanticBlock block;
+        block.out_channels = sem;
+
+        for (std::size_t u = 0; u < 2; ++u) {
+            const std::string ub = base + ".res_units." + std::to_string(u);
+            OmniSemanticResidualUnit unit;
+            unit.dilation = 1;
+            RT_TRY(w1, load_gguf_conv_weight(gguf, ub + ".conv1.weight", sem));
+            unit.conv1_weight = std::move(w1);
+            RT_TRY(w2, load_gguf_conv_weight(gguf, ub + ".conv2.weight", sem));
+            unit.conv2_weight = std::move(w2);
+            block.units.push_back(std::move(unit));
+        }
+
+        RT_TRY(cw, load_gguf_conv_weight(gguf, base + ".conv.weight", sem));
+        block.conv_weight = std::move(cw);
+        RT_TRY(cb, load_gguf_vector(gguf, base + ".conv.bias"));
+        block.conv_bias = std::move(cb);
+
+        e.semantic_adapter.blocks.push_back(std::move(block));
+    }
+
+    // ---- fc: mix the two paths ----
+    RT_TRY(fc, load_gguf_conv_weight(gguf, "fc.weight", c.latent_dim));
+    if (fc.cols != c.latent_dim) {
+        return err("omnivoice codec: fc is " + std::to_string(fc.rows) + "x" +
+                   std::to_string(fc.cols) + ", expected a square " +
+                   std::to_string(c.latent_dim));
+    }
+    e.fc_weight = std::move(fc);
+    RT_TRY(fc_b, load_gguf_vector(gguf, "fc.bias"));
+    e.fc_bias = std::move(fc_b);
+
+    return e;
+}
+
+// =============================================================================
+// Encoding
+// =============================================================================
+
+Result<std::vector<std::vector<std::uint32_t>>> OmniCodecEncoder::encode(
+    std::span<const float> samples) const {
+    const std::size_t hop = config.hop_length;
+    const std::size_t frames = samples.size() / hop;
+    if (frames == 0) {
+        return err("omnivoice codec: the clip is shorter than one " + std::to_string(hop) +
+                   "-sample frame");
+    }
+    // Drop the partial frame rather than pad it: a ragged tail would put the
+    // acoustic and semantic paths' lengths out of step.
+    const std::span<const float> trimmed = samples.subspan(0, frames * hop);
+
+    // ---- semantic path ----
+    const std::size_t semantic_rate = semantic.config.downsample_factor();
+    std::vector<float> resampled =
+        resample(trimmed, config.sample_rate, kSemanticSampleRate);
+
+    // The reference pads by half the semantic hop on each side. It is not a
+    // "same" padding of anything -- it is what makes the frame count come out
+    // at twice the codec's rate, which the assertion below is the real check on.
+    const std::size_t pad = semantic_rate / 2;
+    std::vector<float> padded;
+    padded.reserve(resampled.size() + 2 * pad);
+    padded.insert(padded.end(), pad, 0.0f);
+    padded.insert(padded.end(), resampled.begin(), resampled.end());
+    padded.insert(padded.end(), pad, 0.0f);
+    resampled.clear();
+    resampled.shrink_to_fit();
+
+    RT_TRY(hidden, semantic.mean_hidden_states(padded));
+    if (hidden.rows != frames * 2) {
+        return err("omnivoice codec: the semantic model produced " + std::to_string(hidden.rows) +
+                   " frames where " + std::to_string(frames * 2) + " were expected");
+    }
+
+    // 50 Hz down to the codec's 25 Hz by keeping every other frame -- a plain
+    // decimation, not an average.
+    Mat semantic_features = Mat::from_fn(frames, hidden.cols, [&](std::size_t r, std::size_t c) {
+        return hidden.at(r * 2, c);
+    });
+    const Mat sem = semantic_adapter.forward(semantic_features);
+    if (sem.rows != frames) {
+        return err("omnivoice codec: the semantic adapter changed the frame count");
+    }
+
+    // ---- acoustic path ----
+    RT_TRY(aco, acoustic.forward(trimmed, hop));
+
+    // ---- concatenate, mix, quantize ----
+    if (aco.cols + sem.cols != config.latent_dim) {
+        return err("omnivoice codec: the two paths are " + std::to_string(aco.cols) + " and " +
+                   std::to_string(sem.cols) + " wide, which do not fill " +
+                   std::to_string(config.latent_dim));
+    }
+    Mat joined = Mat::zeros(frames, config.latent_dim);
+    for (std::size_t t = 0; t < frames; ++t) {
+        float* row = joined.row_mut(t).data();
+        // Acoustic first, then semantic: the order fc was trained with.
+        for (std::size_t c = 0; c < aco.cols; ++c) {
+            row[c] = aco.at(t, c);
+        }
+        for (std::size_t c = 0; c < sem.cols; ++c) {
+            row[aco.cols + c] = sem.at(t, c);
+        }
+    }
+
+    const Mat latents = conv1d_pointwise(joined, fc_weight, fc_bias);
+    return quantizer.to_codes(latents);
+}
+
+std::size_t OmniCodecEncoder::parameter_count() const {
+    std::size_t n = semantic.parameter_count();
+    const auto add_mat = [&n](const Mat& m) { n += m.data.size(); };
+    const auto add_vec = [&n](const std::vector<float>& v) { n += v.size(); };
+
+    add_mat(acoustic.in_weight);
+    add_vec(acoustic.in_bias);
+    for (const OmniEncoderBlock& b : acoustic.blocks) {
+        add_vec(b.alpha);
+        add_mat(b.down_weight);
+        add_vec(b.down_bias);
+        for (const OmniResidualUnit& u : b.units) {
+            add_vec(u.alpha1);
+            add_vec(u.alpha2);
+            add_mat(u.conv1_weight);
+            add_mat(u.conv2_weight);
+            add_vec(u.conv1_bias);
+            add_vec(u.conv2_bias);
+        }
+    }
+    add_vec(acoustic.out_alpha);
+    add_mat(acoustic.out_weight);
+    add_vec(acoustic.out_bias);
+
+    add_mat(semantic_adapter.in_weight);
+    for (const OmniSemanticBlock& b : semantic_adapter.blocks) {
+        add_mat(b.conv_weight);
+        add_vec(b.conv_bias);
+        for (const OmniSemanticResidualUnit& u : b.units) {
+            add_mat(u.conv1_weight);
+            add_mat(u.conv2_weight);
+        }
+    }
+
+    add_mat(fc_weight);
+    add_vec(fc_bias);
+    for (const OmniQuantizer::Level& l : quantizer.levels) {
+        add_mat(l.codebook);
+        add_mat(l.project_in_weight);
+        add_vec(l.project_in_bias);
+        add_mat(l.project_out_weight);
+        add_vec(l.project_out_bias);
+    }
+    return n;
 }
 
 }  // namespace rt

@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "rt/conv1d.hpp"
 #include "rt/omnivoice_codec.hpp"
 #include "rt/wav.hpp"
 #include "test_helpers.hpp"
@@ -302,4 +303,314 @@ TEST_CASE("OmniCodecDecoder rejects ratios that disagree with hop_length", "[omn
     wrong.upsampling_ratios = {8, 5, 4, 2};  // 320, not 960
     const Result<OmniCodecDecoder> d = OmniCodecDecoder::load("models/does-not-exist.gguf", wrong);
     REQUIRE(!d.has_value());
+}
+
+// =============================================================================
+// Analysis -- the quantizer
+// =============================================================================
+
+namespace {
+
+/// A toy quantizer that can also encode: `project_in` is the identity onto the
+/// first two latent columns, so a latent is its own codebook coordinate.
+[[nodiscard]] OmniQuantizer toy_encoding_quantizer(std::size_t n_codebooks,
+                                                   std::size_t latent_dim) {
+    OmniQuantizer q = toy_quantizer(n_codebooks, latent_dim);
+    for (OmniQuantizer::Level& level : q.levels) {
+        level.project_in_weight = Mat::zeros(2, latent_dim);
+        level.project_in_weight.at_mut(0, 0) = 1.0f;
+        level.project_in_weight.at_mut(1, 1) = 1.0f;
+    }
+    return q;
+}
+
+}  // namespace
+
+TEST_CASE("to_codes picks the nearest codebook entry", "[omnicodec]") {
+    // One codebook of eight entries at (0,0), (1,0) ... (7,0). A latent at
+    // 2.4 has to land on entry 2 and one at 2.6 on entry 3.
+    OmniQuantizer q = toy_encoding_quantizer(1, 4);
+    Mat latents = Mat::zeros(4, 4);
+    latents.at_mut(0, 0) = 2.4f;
+    latents.at_mut(1, 0) = 2.6f;
+    latents.at_mut(2, 0) = -5.0f;   // below every entry
+    latents.at_mut(3, 0) = 100.0f;  // above every entry
+
+    const Result<std::vector<std::vector<std::uint32_t>>> codes = q.to_codes(latents);
+    REQUIRE(codes.has_value());
+    REQUIRE(codes->size() == 1);
+    REQUIRE((*codes)[0] == std::vector<std::uint32_t>{2, 3, 0, 7});
+}
+
+TEST_CASE("to_codes quantizes the residual, not the signal", "[omnicodec]") {
+    // Two codebooks over the same eight entries. The first takes the latent,
+    // the second takes what is left after the first has been subtracted -- so
+    // a latent of exactly 3 leaves nothing and the second codebook picks 0.
+    OmniQuantizer q = toy_encoding_quantizer(2, 4);
+    Mat latents = Mat::zeros(2, 4);
+    latents.at_mut(0, 0) = 3.0f;
+    latents.at_mut(1, 0) = 5.5f;
+
+    const Result<std::vector<std::vector<std::uint32_t>>> codes = q.to_codes(latents);
+    REQUIRE(codes.has_value());
+    REQUIRE(codes->size() == 2);
+    REQUIRE((*codes)[0][0] == 3);
+    REQUIRE((*codes)[1][0] == 0);
+    // 5.5 rounds to 5 or 6; whichever it takes, the leftover is half a step,
+    // which the second codebook can only round back to nothing.
+    REQUIRE((*codes)[1][1] == 0);
+}
+
+TEST_CASE("from_codes inverts to_codes on the codebook grid", "[omnicodec]") {
+    // Latents that sit exactly on an entry survive the round trip, which is
+    // the strongest statement a lossy quantizer can make.
+    OmniQuantizer q = toy_encoding_quantizer(1, 4);
+    Mat latents = Mat::zeros(5, 4);
+    for (std::size_t t = 0; t < 5; ++t) {
+        latents.at_mut(t, 0) = static_cast<float>(t + 1);
+    }
+    const Result<std::vector<std::vector<std::uint32_t>>> codes = q.to_codes(latents);
+    REQUIRE(codes.has_value());
+    const Result<Mat> back = q.from_codes(*codes);
+    REQUIRE(back.has_value());
+    for (std::size_t t = 0; t < 5; ++t) {
+        REQUIRE(approx(back->at(t, 0), static_cast<float>(t + 1)));
+    }
+}
+
+TEST_CASE("to_codes refuses a quantizer loaded for synthesis only", "[omnicodec]") {
+    // A decoder-only load leaves project_in empty, and guessing it would be
+    // worse than failing.
+    const OmniQuantizer q = toy_quantizer(2, 4);
+    REQUIRE_FALSE(q.to_codes(Mat::zeros(3, 4)).has_value());
+}
+
+TEST_CASE("to_codes checks the latent width", "[omnicodec]") {
+    const OmniQuantizer q = toy_encoding_quantizer(1, 4);
+    REQUIRE_FALSE(q.to_codes(Mat::zeros(3, 5)).has_value());
+}
+
+// =============================================================================
+// Analysis -- the convolution stacks
+// =============================================================================
+
+TEST_CASE("an encoder block divides the length by its stride", "[omnicodec]") {
+    // The mirror of the decoder's invariant, and the one that makes
+    // frames * 960 exact in the analysis direction too. Kernel 2s with padding
+    // ceil(s/2) is what makes it hold for odd strides as well as even ones.
+    for (const std::size_t stride : {8u, 5u, 4u, 2u, 3u}) {
+        const std::size_t channels = 4;
+        OmniEncoderBlock block;
+        block.alpha.assign(channels, 1.0f);
+        block.out_channels = channels * 2;
+        block.stride = stride;
+        block.kernel = 2 * stride;
+        block.padding = (stride + 1) / 2;
+        block.down_weight = Mat::from_fn(block.out_channels, channels * block.kernel,
+                                         [](std::size_t r, std::size_t c) {
+                                             return 0.01f * static_cast<float>((r + c) % 7);
+                                         });
+        block.down_bias.assign(block.out_channels, 0.0f);
+
+        for (const std::size_t frames : {1u, 3u, 20u}) {
+            const Mat x = Mat::from_fn(frames * stride, channels, [](std::size_t r, std::size_t c) {
+                return 0.001f * static_cast<float>((r * 3 + c) % 11);
+            });
+            const Mat y = block.forward(x);
+            REQUIRE(y.rows == frames);
+            REQUIRE(y.cols == block.out_channels);
+        }
+    }
+}
+
+TEST_CASE("the full downsampling chain divides by 960", "[omnicodec]") {
+    const OmniCodecConfig c = OmniCodecConfig::defaults();
+    std::size_t t = 960 * 7;
+    for (const std::size_t stride : c.upsampling_ratios) {
+        const std::size_t kernel = 2 * stride;
+        const std::size_t padding = (stride + 1) / 2;
+        t = conv1d_out_len(t, kernel, 1, padding, stride);
+    }
+    REQUIRE(t == 7);
+}
+
+TEST_CASE("a semantic residual unit preserves length", "[omnicodec]") {
+    // Kernel 3 at padding 1, unlike the acoustic units' 7 at 3.
+    const std::size_t channels = 6;
+    OmniSemanticResidualUnit unit;
+    unit.dilation = 1;
+    unit.conv1_weight = Mat::from_fn(channels, channels * 3, [](std::size_t r, std::size_t c) {
+        return 0.01f * static_cast<float>((r + 2 * c) % 5) - 0.02f;
+    });
+    unit.conv2_weight = Mat::from_fn(channels, channels, [](std::size_t r, std::size_t c) {
+        return r == c ? 0.5f : 0.0f;
+    });
+
+    const Mat x = Mat::from_fn(17, channels, [](std::size_t r, std::size_t c) {
+        return 0.05f * static_cast<float>((r + c) % 4);
+    });
+    const Mat y = unit.forward(x);
+    REQUIRE(y.rows == 17);
+    REQUIRE(y.cols == channels);
+    for (const float v : y.data) {
+        REQUIRE(std::isfinite(v));
+    }
+}
+
+TEST_CASE("the semantic width is whatever the acoustic path leaves", "[omnicodec]") {
+    const OmniCodecConfig c = OmniCodecConfig::defaults();
+    REQUIRE(c.semantic_dim() == 768);
+    REQUIRE(c.decoder_in_dim + c.semantic_dim() == c.latent_dim);
+    REQUIRE(c.encoder_dim == 64);
+    // The encoder doubles its width per block, ending at 2048 before the
+    // projection down to 256.
+    std::size_t ch = c.encoder_dim;
+    for (std::size_t i = 0; i < c.upsampling_ratios.size(); ++i) {
+        ch *= 2;
+    }
+    REQUIRE(ch == 2048);
+}
+
+// =============================================================================
+// Analysis -- the real checkpoint
+// =============================================================================
+
+TEST_CASE("OmniCodecEncoder loads the tokenizer GGUF", "[omnicodec][.integration]") {
+    if (!std::filesystem::exists(kCodecPath)) {
+        SKIP("no OmniVoice tokenizer checkpoint in models/");
+    }
+    const Result<OmniCodecEncoder> e =
+        OmniCodecEncoder::load(kCodecPath, OmniCodecConfig::defaults());
+    REQUIRE(e.has_value());
+    REQUIRE(e->acoustic.blocks.size() == 5);
+    REQUIRE(e->semantic_adapter.blocks.size() == 2);
+    REQUIRE(e->quantizer.levels.size() == 8);
+    for (const OmniQuantizer::Level& l : e->quantizer.levels) {
+        REQUIRE(l.project_in_weight.rows == 64);
+        REQUIRE(l.project_in_weight.cols == 1024);
+    }
+    // The analysis half is bigger than the synthesis half, almost all of it
+    // the 94 M-parameter semantic model.
+    REQUIRE(e->parameter_count() > 150'000'000);
+}
+
+TEST_CASE("OmniCodecEncoder emits one code per codebook per frame",
+          "[omnicodec][.integration]") {
+    if (!std::filesystem::exists(kCodecPath)) {
+        SKIP("no OmniVoice tokenizer checkpoint in models/");
+    }
+    const OmniCodecConfig cfg = OmniCodecConfig::defaults();
+    const Result<OmniCodecEncoder> e = OmniCodecEncoder::load(kCodecPath, cfg);
+    REQUIRE(e.has_value());
+
+    // 40 frames, plus a partial one that has to be dropped rather than padded.
+    constexpr std::size_t kFrames = 40;
+    std::vector<float> wav(kFrames * 960 + 137);
+    for (std::size_t i = 0; i < wav.size(); ++i) {
+        const float t = static_cast<float>(i) / 24000.0f;
+        wav[i] = 0.15f * (std::sin(2.0f * 3.14159265f * 150.0f * t) +
+                          0.4f * std::sin(2.0f * 3.14159265f * 900.0f * t));
+    }
+
+    const Result<std::vector<std::vector<std::uint32_t>>> codes = e->encode(wav);
+    REQUIRE(codes.has_value());
+    REQUIRE(codes->size() == cfg.n_codebooks);
+    for (const std::vector<std::uint32_t>& stream : *codes) {
+        REQUIRE(stream.size() == kFrames);
+        for (const std::uint32_t c : stream) {
+            REQUIRE(c < cfg.codebook_size);
+        }
+    }
+}
+
+TEST_CASE("OmniCodecEncoder is deterministic", "[omnicodec][.integration]") {
+    if (!std::filesystem::exists(kCodecPath)) {
+        SKIP("no OmniVoice tokenizer checkpoint in models/");
+    }
+    const Result<OmniCodecEncoder> e =
+        OmniCodecEncoder::load(kCodecPath, OmniCodecConfig::defaults());
+    REQUIRE(e.has_value());
+
+    std::vector<float> wav(20 * 960);
+    for (std::size_t i = 0; i < wav.size(); ++i) {
+        wav[i] = 0.2f * std::sin(2.0f * 3.14159265f * 220.0f * static_cast<float>(i) / 24000.0f);
+    }
+    const Result<std::vector<std::vector<std::uint32_t>>> a = e->encode(wav);
+    const Result<std::vector<std::vector<std::uint32_t>>> b = e->encode(wav);
+    REQUIRE(a.has_value());
+    REQUIRE(b.has_value());
+    REQUIRE(*a == *b);
+}
+
+TEST_CASE("OmniCodecEncoder rejects a clip shorter than a frame",
+          "[omnicodec][.integration]") {
+    if (!std::filesystem::exists(kCodecPath)) {
+        SKIP("no OmniVoice tokenizer checkpoint in models/");
+    }
+    const Result<OmniCodecEncoder> e =
+        OmniCodecEncoder::load(kCodecPath, OmniCodecConfig::defaults());
+    REQUIRE(e.has_value());
+    REQUIRE_FALSE(e->encode(std::vector<float>(500, 0.0f)).has_value());
+}
+
+TEST_CASE("the codec round-trips a waveform through its own codes",
+          "[omnicodec][.integration]") {
+    if (!std::filesystem::exists(kCodecPath)) {
+        SKIP("no OmniVoice tokenizer checkpoint in models/");
+    }
+    // The test that makes the analysis path checkable at all without a
+    // reference implementation. Decode a set of codes, encode the waveform
+    // back, and the indices have to come out close to what went in --
+    // exactly for the coarse codebooks and less so for the fine ones, since
+    // those code the residual that survives the first few.
+    //
+    // Chance agreement is one in 1024. Any real fault in the chain -- a
+    // normalisation on the wrong axis, the two paths concatenated in the wrong
+    // order, a padding off by one -- lands there.
+    const OmniCodecConfig cfg = OmniCodecConfig::defaults();
+    const Result<OmniCodecDecoder> d = OmniCodecDecoder::load(kCodecPath, cfg);
+    const Result<OmniCodecEncoder> e = OmniCodecEncoder::load(kCodecPath, cfg);
+    REQUIRE(d.has_value());
+    REQUIRE(e.has_value());
+
+    constexpr std::size_t kFrames = 30;
+    std::vector<std::vector<std::uint32_t>> codes(cfg.n_codebooks);
+    std::uint32_t state = 12345;
+    for (std::size_t i = 0; i < cfg.n_codebooks; ++i) {
+        codes[i].resize(kFrames);
+        for (std::size_t t = 0; t < kFrames; ++t) {
+            state = state * 1664525u + 1013904223u;
+            codes[i][t] = (state >> 16) % cfg.codebook_size;
+        }
+    }
+
+    const Result<std::vector<float>> wav = d->decode(codes);
+    REQUIRE(wav.has_value());
+    REQUIRE(wav->size() == kFrames * cfg.hop_length);
+
+    const Result<std::vector<std::vector<std::uint32_t>>> back = e->encode(*wav);
+    REQUIRE(back.has_value());
+    REQUIRE((*back)[0].size() == kFrames);
+
+    std::size_t agree = 0;
+    for (std::size_t t = 0; t < kFrames; ++t) {
+        agree += codes[0][t] == (*back)[0][t];
+    }
+    // Random codes make a waveform the codec was never fit on, so this is a
+    // weaker recovery than real audio gives; it is still two orders of
+    // magnitude above chance.
+    REQUIRE(agree * 4 >= kFrames);
+
+    // And the resynthesis of the recovered codes has to track the original.
+    const Result<std::vector<float>> again = d->decode(*back);
+    REQUIRE(again.has_value());
+    double num = 0.0;
+    double da = 0.0;
+    double db = 0.0;
+    for (std::size_t i = 0; i < wav->size(); ++i) {
+        num += static_cast<double>((*wav)[i]) * (*again)[i];
+        da += static_cast<double>((*wav)[i]) * (*wav)[i];
+        db += static_cast<double>((*again)[i]) * (*again)[i];
+    }
+    REQUIRE(num / std::sqrt(da * db) > 0.5);
 }

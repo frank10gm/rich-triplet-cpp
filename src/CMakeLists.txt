@@ -9,6 +9,7 @@ target_sources(rt_core PRIVATE
   wav.cpp
   duration.cpp
   resample.cpp
+  hubert.cpp
   ndarray.cpp
   tensor_node.cpp
   nn2.cpp
