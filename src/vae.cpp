@@ -78,41 +78,55 @@ Mat VaeAttentionBlock::forward(const Mat& x, const VaeConfig& cfg) const {
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(channels));
 
-    // One head over `n` positions. The score matrix is n x n, which at a 64x64
-    // latent is 4096 x 4096 -- 67 MB, and the only place in the decoder where
-    // attention is affordable at all. It sits at the coarsest resolution for
-    // exactly that reason.
+    // One head over every spatial position, and by far the most expensive
+    // thing in the decoder: `n` is 16384 at a 128x128 latent, so the score
+    // matrix alone is 268 M entries and the two products are 275 GFLOP.
+    //
+    // Both products are matmuls -- `Q K^T` and `P V` -- so they belong in
+    // BLAS. Written as the obvious triple loop this stage took 76.6 s of a
+    // 102 s decode; blocked into `sgemm` calls it is a fraction of that. It is
+    // the same lesson as `QLinear`: a scalar loop over a matrix product is
+    // never the right answer once the matrix stops being a vector.
+    //
+    // The blocking is over query rows, because the full score matrix would be
+    // 1 GB at 128x128. A block of 256 queries needs `256 * n` floats, which is
+    // 16 MB there and comfortably cache-resident.
     Mat out = Mat::zeros(n, channels);
-    std::vector<float> scores(n);
-    for (std::size_t i = 0; i < n; ++i) {
-        const float* qi = q.row(i).data();
-        float max_score = -std::numeric_limits<float>::infinity();
-        for (std::size_t j = 0; j < n; ++j) {
-            const float* kj = k.row(j).data();
-            float acc = 0.0f;
-            for (std::size_t c = 0; c < channels; ++c) {
-                acc += qi[c] * kj[c];
+    constexpr std::size_t kQueryBlock = 256;
+
+    for (std::size_t base = 0; base < n; base += kQueryBlock) {
+        const std::size_t rows = std::min(kQueryBlock, n - base);
+
+        // Q block against every key: [rows, C] @ [n, C]^T -> [rows, n].
+        Mat q_block = Mat::zeros(rows, channels);
+        std::copy(q.data.begin() + static_cast<std::ptrdiff_t>(base * channels),
+                  q.data.begin() + static_cast<std::ptrdiff_t>((base + rows) * channels),
+                  q_block.data.begin());
+        Mat scores = q_block.matmul_bt(k);
+
+        // Softmax each row in place, folding in the scale.
+        for (std::size_t i = 0; i < rows; ++i) {
+            float* row = scores.row_mut(i).data();
+            float max_score = -std::numeric_limits<float>::infinity();
+            for (std::size_t j = 0; j < n; ++j) {
+                row[j] *= scale;
+                max_score = std::max(max_score, row[j]);
             }
-            scores[j] = acc * scale;
-            max_score = std::max(max_score, scores[j]);
-        }
-        float denom = 0.0f;
-        for (std::size_t j = 0; j < n; ++j) {
-            scores[j] = std::exp(scores[j] - max_score);
-            denom += scores[j];
-        }
-        const float inv = 1.0f / denom;
-        float* orow = out.row_mut(i).data();
-        for (std::size_t j = 0; j < n; ++j) {
-            const float weight = scores[j] * inv;
-            if (weight == 0.0f) {
-                continue;
+            float denom = 0.0f;
+            for (std::size_t j = 0; j < n; ++j) {
+                row[j] = std::exp(row[j] - max_score);
+                denom += row[j];
             }
-            const float* vj = v.row(j).data();
-            for (std::size_t c = 0; c < channels; ++c) {
-                orow[c] += weight * vj[c];
+            const float inv = 1.0f / denom;
+            for (std::size_t j = 0; j < n; ++j) {
+                row[j] *= inv;
             }
         }
+
+        // Weighted sum of V: [rows, n] @ [n, C] -> [rows, C].
+        const Mat block_out = scores.matmul(v);
+        std::copy(block_out.data.begin(), block_out.data.end(),
+                  out.data.begin() + static_cast<std::ptrdiff_t>(base * channels));
     }
 
     Mat projected = conv2d_pointwise(out, out_weight, out_bias);

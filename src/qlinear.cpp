@@ -66,7 +66,13 @@ Mat QLinear::forward(const Mat& x) const {
     // turns a minute of work into an hour of it. `matmul_q4k_t_blas`
     // dequantizes a chunk of weight rows at a time and hands each chunk to
     // sgemm, for about 8 MB of scratch.
-    Mat out = q4k.has_value()    ? q4k->matmul_q4k_t_blas(x)
+    //
+    // `_exact` rather than `_blas` because of the other half of that trade: the
+    // batch-of-one shortcut quantizes the activation to int8, and the only
+    // batch-of-one matmuls in a diffusion transformer are the modulation
+    // projections, whose shift, scale and gate multiply every token and every
+    // channel of the block.
+    Mat out = q4k.has_value()    ? q4k->matmul_q4k_t_exact(x)
               : bf16.has_value() ? bf16->matmul_by_t(x)
                                  : x.matmul_bt(f32);
     add_bias_rows(out, bias);

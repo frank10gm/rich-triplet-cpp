@@ -624,16 +624,21 @@ Mat Q4KMat::matmul_q4k_t(const Mat& a) const {
 }
 
 Mat Q4KMat::matmul_q4k_t_blas(const Mat& a) const {
+    // GEMV fast path for decode (M=1): fused NEON dot + multi-threading. It
+    // quantizes the activation to int8; see `matmul_q4k_t_exact` for when that
+    // is not acceptable.
+    if (a.rows == 1) {
+        return gemv_mt(a);
+    }
+    return matmul_q4k_t_exact(a);
+}
+
+Mat Q4KMat::matmul_q4k_t_exact(const Mat& a) const {
 #if !RT_FEATURE_BLAS
     return matmul_q4k_t(a);
 #else
     const std::size_t m = a.rows, k = a.cols, n = rows;
-    assert(k == cols && "matmul_q4k_t_blas: a.cols != q4k.cols");
-
-    // GEMV fast path for decode (M=1): fused NEON dot + multi-threading.
-    if (m == 1) {
-        return gemv_mt(a);
-    }
+    assert(k == cols && "matmul_q4k_t_exact: a.cols != q4k.cols");
 
     // Chunked SGEMM for both prefill and decode: split output neurons across
     // threads, each with its own scratch buffer. Accelerate's sgemm is

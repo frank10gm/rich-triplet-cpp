@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
 #include <cstddef>
 #include <limits>
 #include <numbers>
@@ -152,12 +154,17 @@ void flux_apply_rope(Mat& x, const Mat& ids, std::size_t n_heads, std::size_t he
             const std::size_t dim = axes_dim[a];
             for (std::size_t i = 0; i < dim / 2; ++i, ++p) {
                 // theta^(-2i/dim), matching `rope()`'s `arange(0, dim, 2)/dim`.
-                const float exponent =
-                    static_cast<float>(2 * i) / static_cast<float>(dim);
-                const float omega = 1.0f / std::pow(theta, exponent);
-                const float angle = pos * omega;
-                cos_tab[t * pairs + p] = std::cos(angle);
-                sin_tab[t * pairs + p] = std::sin(angle);
+                //
+                // Computed in f64. The reference does the same, and it is not
+                // fussiness: `theta` is 10000 and the exponent is a ratio, so a
+                // single-precision `pow` puts a relative error into every
+                // frequency, which the position then multiplies up.
+                const double exponent =
+                    static_cast<double>(2 * i) / static_cast<double>(dim);
+                const double omega = 1.0 / std::pow(static_cast<double>(theta), exponent);
+                const double angle = static_cast<double>(pos) * omega;
+                cos_tab[t * pairs + p] = static_cast<float>(std::cos(angle));
+                sin_tab[t * pairs + p] = static_cast<float>(std::sin(angle));
             }
         }
     }
@@ -398,7 +405,21 @@ namespace {
             return QLinear::from_bf16(MatBf16(std::move(bits), out_features, in_features),
                                       std::move(bias));
         }
+        case GgufType::F32:
+        case GgufType::F16: {
+            // Kept at full precision. Widening f16 to f32 is exact, and folding
+            // it down to bfloat instead would throw away two mantissa bits for
+            // no saving worth having -- there are four such tensors in FLUX,
+            // 100 MB between them, and one of them is the final layer's
+            // modulation, which sets the scale of every output channel.
+            RT_TRY(f, gguf_tensor_to_f32(gguf, *idx));
+            return QLinear::from_f32(Mat(std::move(f), out_features, in_features),
+                                     std::move(bias));
+        }
         default: {
+            // Q6_K, Q8_0 and Q5_K land here: decode to f32 and fold to BF16,
+            // which halves the resident cost and throws away less than the
+            // source format already did.
             RT_TRY(f, gguf_tensor_to_f32(gguf, *idx));
             const Mat m(std::move(f), out_features, in_features);
             return QLinear::from_bf16(mat_to_bf16(m), std::move(bias));
@@ -597,9 +618,26 @@ Result<Mat> FluxModel::forward(const Mat& latent, std::size_t lat_h, std::size_t
     Mat mod_input = vec;
     silu_inplace(mod_input);
 
+    // Debug hook: dump intermediates for the parity harness. Off unless the
+    // environment asks, and compiled out of nothing -- the branch costs a
+    // getenv per forward pass, which is beneath measurement next to 12B
+    // parameters.
+    const char* dump_dir = std::getenv("RT_FLUX_DUMP");
+    const auto dump = [&](const char* tag, const Mat& m) {
+        if (dump_dir == nullptr) {
+            return;
+        }
+        std::ofstream f(std::string(dump_dir) + "/" + tag + ".bin", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(m.data.data()),
+                static_cast<std::streamsize>(m.data.size() * sizeof(float)));
+    };
+    dump("vec", vec);
+
     // --- Streams -------------------------------------------------------------
     Mat img = img_in.forward(flux_patchify(latent, lat_h, lat_w, patch));
     Mat txt = txt_in.forward(context);
+    dump("img_in", img);
+    dump("txt_in", txt);
 
     const Mat img_ids = flux_image_ids(lat_h, lat_w, patch);
     // Text positions are all zero, so their rotation is the identity. That is
@@ -651,6 +689,7 @@ Result<Mat> FluxModel::forward(const Mat& latent, std::size_t lat_h, std::size_t
         const Mat txt_attn = slice_rows(attn, 0, n_txt);
         const Mat img_attn = slice_rows(attn, n_txt, attn.rows);
 
+
         gated_add_inplace(img, b.img_proj.forward(img_attn), img_mod[0].gate);
         {
             Mat h = layer_norm_noaffine(img, cfg.layer_norm_eps);
@@ -668,6 +707,14 @@ Result<Mat> FluxModel::forward(const Mat& latent, std::size_t lat_h, std::size_t
             gelu_tanh_inplace(f);
             gated_add_inplace(txt, b.txt_mlp_out.forward(f), txt_mod[1].gate);
         }
+        if (dump_dir != nullptr && &b == &double_blocks.front()) {
+            dump("block0_img", img);
+            dump("block0_txt", txt);
+        }
+    }
+
+    if (dump_dir != nullptr) {
+        dump("after_double", concat_rows(txt, img));
     }
 
     // --- Single-stream blocks ------------------------------------------------

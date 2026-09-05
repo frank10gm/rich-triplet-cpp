@@ -162,6 +162,20 @@ struct Q4KMat {
     /// BLAS-accelerated matmul with chunked SGEMM (~8 MB scratch).
     [[nodiscard]] Mat matmul_q4k_t_blas(const Mat& a) const;
 
+    /// Same, but never takes the single-row GEMV shortcut.
+    ///
+    /// That shortcut quantizes the *activation* to int8 before the dot
+    /// product, which is a large NEON win and costs about 0.4% -- the right
+    /// trade for a language model, where every decode step is a batch of one
+    /// and the error lands on one token's logits.
+    ///
+    /// It is the wrong trade for a diffusion transformer. There the only
+    /// batch-of-one matmuls are the modulation projections, whose output is a
+    /// shift, a scale and a gate applied to *every* token and *every* channel
+    /// of the block. They are a negligible share of the arithmetic and they
+    /// set the magnitude of everything downstream, so they get the exact path.
+    [[nodiscard]] Mat matmul_q4k_t_exact(const Mat& a) const;
+
     /// Fused Q4_K dot product of weight row `row_idx` against `a`.
     ///
     /// Uses the integer-accumulation trick: accumulate `nibble * activation`

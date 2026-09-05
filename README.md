@@ -10,7 +10,7 @@ It also carries a text-to-image stack: **FLUX.1-schnell**, a 12B rectified-flow 
 
 ![a photograph of a harbour at dawn, long exposure](samples/flux_harbour_1024.png)
 
-*`--model flux-schnell`, 1024x1024, four steps, 11.5 minutes on an M3 Pro.*
+*`--model flux-schnell`, 1024x1024, four steps, 3.2 minutes on an M3 Pro.*
 
 ---
 
@@ -787,14 +787,37 @@ licence — but its weights are gated and have not been tested.
 
 | Resolution | Tokens | Per step | 4 steps | Total incl. VAE decode |
 |---|---|---|---|---|
-| 256x256 | 512 | 6.2 s | 25 s | 27 s |
-| 512x512 | 1280 | 20.2 s | 81 s | 92 s |
-| 1024x1024 | 4352 | 156 s | 624 s | 688 s |
+| 512x512 | 1280 | 10.2 s | 41 s | 45 s |
+| 1024x1024 | 4352 | 40.6 s | 162 s | 192 s |
 
-Eight and a half times the tokens costs twenty-five times the time, because
-attention is `O(T^2)` while everything else is `O(T)`; at 4352 tokens it stops
-being a rounding error. The process sits at 13% CPU throughout, so this is
-GPU-bound. The attention kernel is the obvious thing to optimise first.
+The attention kernel went through two rounds. Comparing the two sizes says how
+much of a step it is without needing a profiler — about half at 1024x1024 —
+and it started out reading the whole of K and V once per *query*, which is
+460 GB of traffic per call. Blocking it over 32 queries per threadgroup divides
+that by 32; putting `simdgroup_matrix` on both of its matmuls took the rest:
+
+| | 1024x1024 |
+|---|---|
+| one query per threadgroup, scalar | 156 s/step |
+| 32-query block, scalar | 105 s/step |
+| 32-query block, matrix units | **43.5 s/step** |
+
+3.6x on sampling, identical output. Two changes along the way that looked like
+obvious wins both made it *slower*; the
+[design note](docs/text-to-image.md#blocking-the-attention) records which and
+why.
+
+The autoencoder went the same way: its mid-block attention was 76 s of a 102 s
+decode as a triple loop, and 1.08 s once both of its products were `sgemm`
+calls. **1024x1024 end to end: 688 s → 192 s.**
+
+The arithmetic is checked against `diffusers` reading the same GGUF file —
+token ids identical, dequantization bit-exact, whole-transformer velocity
+agreeing to 4.4e-3. That comparison
+[found a real bug](docs/text-to-image.md#parity-against-diffusers): the
+batch-of-one GEMV shortcut quantizes activations to int8, and the only
+batch-of-one matmuls here are the modulation projections, whose scale and gate
+multiply every token in the block.
 
 T5 encoding is 6.7 s. The autoencoder decodes on the CPU.
 

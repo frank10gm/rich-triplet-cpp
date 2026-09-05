@@ -100,9 +100,12 @@ parameters, so `2 * 11.9e9 * 4352` ~ **104 TFLOP**. The estimate below that was
 
 | Resolution | Tokens (img + txt) | Per step | 4 steps | Total incl. VAE |
 |---|---|---|---|---|
-| 256x256 | 256 + 256 | 6.2 s | 25 s | 27 s |
 | 512x512 | 1024 + 256 | 20.2 s | 81 s | 92 s |
 | 1024x1024 | 4096 + 256 | 156 s | 624 s | 688 s |
+
+Since reworked; 1024x1024 now runs in 192 s end to end. See
+[Blocking the attention](#blocking-the-attention) and
+[The autoencoder](#the-autoencoder).
 
 So the estimate was low by 3.5x at full resolution, and the scaling is worse
 than the parameter count predicts: from 256x256 to 1024x1024 the token count
@@ -111,9 +114,11 @@ everything else is `O(T)` -- at 4352 tokens it stops being a rounding error and
 starts being the bill.
 
 The process sits at 13% CPU throughout, so this is GPU-bound, which is the
-right place for it to be. What it is *not* is optimised: the attention kernel
-streams keys in tiles of 64 with a single thread doing each tile's softmax
-bookkeeping, and that is the obvious thing to fix first.
+right place for it to be.
+
+Those numbers are from the first working version. The attention kernel has
+since been reworked -- see [Blocking the attention](#blocking-the-attention) --
+which brought 1024x1024 to 43.5 s/step and 237 s end to end.
 
 T5 encoding is 6.7 s. VAE decode at 1024x1024 is ~60 s tiled, on the CPU.
 
@@ -662,25 +667,210 @@ past the point where the synthetic weights never went.
 
 ---
 
+## Blocking the attention
+
+Comparing 512x512 against 1024x1024 says how much of a step is attention
+without needing a profiler. The token counts are 1280 and 4352, a factor of
+3.4; if everything scaled linearly the step would too. It did not -- 15.9 s
+against 156 s -- and the excess is the `O(T^2)` term. At 1024x1024 attention
+was about half the step.
+
+### The bug was the grid, not the arithmetic
+
+The first kernel put one threadgroup on each (head, query) pair. That reads
+well and is a trap: each threadgroup then streams the whole of K and V for its
+head, which at 4352 keys of 128 floats is 4.4 MB, and there are 24 x 4352 of
+them. **460 GB of traffic per attention call**, 57 blocks per step, four steps
+per image. No amount of arithmetic tuning reaches a kernel in that state.
+
+Giving each threadgroup a *block* of 32 queries divides the traffic by 32
+directly -- every query in the block wants the same K and V tile at the same
+moment -- and leaves the accumulators in threadgroup memory where the
+online-softmax rescale can still reach them. 460 GB becomes 14 GB.
+
+| | 512x512 | 1024x1024 |
+|---|---|---|
+| one query per threadgroup | 20.2 s/step | 156 s/step |
+| 32 queries per threadgroup | **15.9 s/step** | **105 s/step** |
+
+1.48x at full resolution, and the image is unchanged to the digit -- same mean,
+same RMS, same neighbour delta.
+
+### Two obvious improvements that made it slower
+
+Both are worth recording, because both look like clear wins on paper.
+
+**Staging the Q block in threadgroup memory.** The score loop re-reads each
+query row once per key in the tile, a 32x redundancy over 136 tiles. Staging Q
+as half costs 8 KB and removes all of it. Result: 63.5 s to **68.5 s** at
+512x512, slower.
+
+**Halving the query block to 16.** Half the threadgroup memory, so more
+threadgroups resident. Result: **68.5 s**, slower again.
+
+Threadgroup memory is the occupancy currency on this GPU. At 20 KB per
+threadgroup enough of them stay resident to hide device-memory latency; at
+28 KB they do not, and the reads being saved were hitting cache anyway. The
+smaller block loses more to K/V traffic than it wins back in occupancy.
+
+A wider key tile (64 instead of 32) also lost, at 65.6 s -- fewer barriers, but
+8 KB more of scores.
+
+So the shipped configuration is 32 queries, 32 keys, 256 threads, nothing
+staged. It is the best of the four measured, and it is the *structure* that
+bought the 1.48x, not the tuning.
+
+### Putting the matrix units on it
+
+Blocking fixed the traffic; the arithmetic was still scalar fused-multiply-add
+while the GEMM next door ran `simdgroup_matrix`. Both of attention's matmuls
+are the right shape for it -- a 32x32 score tile is exactly sixteen 8x8
+fragments, and `P @ V` at head_dim 128 is sixty-four more.
+
+The obstacle is the rescale. `alpha` is per query *row*, and an 8x8 fragment
+held in registers cannot be scaled by a row vector. The obvious way round is a
+separate `[32, head_dim]` product buffer and a scalar `acc = acc * alpha +
+tile` afterwards -- and that needs 36 KB of threadgroup memory, which does not
+fit, and 28 KB with a half buffer, which fits and is *slower* for the occupancy
+reason above.
+
+The way through is to notice that a fragment cannot be scaled but can be
+**initialised**: rescale `acc` in place with scalar threads first, then
+`simdgroup_load` the rescaled accumulator as the starting value of the matmul
+and store the result back over it. No scratch tile, no extra memory, and the
+kernel stays at 20 KB.
+
+| | 512x512 | 1024x1024 |
+|---|---|---|
+| one query per threadgroup, scalar | 20.2 s/step | 156 s/step |
+| 32-query block, scalar | 15.9 s/step | 105 s/step |
+| 32-query block, `simdgroup_matrix` | **10.2 s/step** | **43.5 s/step** |
+
+**3.6x on sampling at full resolution, 2.9x end to end** -- 688 s to 237 s --
+and the image is unchanged: same mean, same neighbour delta, RMS differing in
+the last digit where bfloat rounding lands differently.
+
+## The autoencoder
+
+With the transformer three times faster, the decode became the second-largest
+cost -- and profiling it stage by stage found the same shape of mistake a third
+time:
+
+```
+conv_in       0.01 s      up1 resnets    3.13 s
+mid_resnet1   0.25 s      up1 upsample   1.63 s
+mid_attn     76.62 s   <- up2 resnets    5.36 s
+mid_resnet2   0.25 s      up2 upsample   2.04 s
+up0 resnets   0.76 s      up3 resnets   10.73 s
+up0 upsample  0.40 s      conv_out       1.48 s
+```
+
+The mid-block attention was 76.6 s of a 102 s decode. It is one head over every
+spatial position, which at a 128x128 latent is 16384 of them: a 268 M-entry
+score matrix and 275 GFLOP across the two products. Written as the obvious
+triple loop it dominates everything else in the decoder by a factor of thirty.
+
+Both products are matmuls. Blocked into `sgemm` calls over 256 query rows at a
+time -- the full score matrix would be 1 GB, a block of 256 is 16 MB and
+cache-resident -- it goes to **1.08 s**, a factor of 71, and the whole-image
+decode from 102 s to 27 s.
+
+That also inverted the tiling decision. Tiling exists to cap the memory of the
+last upsampling level, but it decodes the overlaps twice, and once the
+attention stopped being the bottleneck the whole-image path became the faster
+of the two at 1024x1024 -- 27 s against 33 s. The threshold now sits above
+1024x1024, and the transformer's GPU buffers are released before the decode so
+the memory is there to use.
+
+### What is left
+
+The decoder's convolutions, at about 25 s, are what remains. They are
+`conv2d.cpp`'s im2col plus a gemm, which is the shape `flux_gemm_bt` already
+handles, so a Metal port is mostly plumbing.
+
+After that the transformer's own GEMMs are what is left, and those are already
+running on the matrix units.
+
+---
+
+## Parity against diffusers
+
+The output being a photograph of the right subject rules out every bug that
+produces noise or the wrong thing. It does not prove the arithmetic is right,
+so this checks it directly: same prompt, same weights, same inputs, compared
+stage by stage against `diffusers` reading the *same GGUF file*.
+
+| Stage | Agreement |
+|---|---|
+| CLIP-L token ids | identical |
+| CLIP-L pooled vector | `rel_rms` 3.6e-4 |
+| T5-XXL token ids | identical |
+| Q4_K dequantization | **bit-exact** |
+| Q4_K matmul vs numpy | `rel_rms` 2e-7 |
+| conditioning vector, `img_in`, `txt_in` | bit-exact |
+| velocity, whole transformer | `rel_rms` 4.4e-3 |
+
+### What it caught
+
+The first end-to-end number was **4.6%**, which is too large for f32
+accumulation and too small to break an image -- exactly the band where a bug
+hides. Bisecting stage by stage: entry embeddings bit-exact, weights bit-exact,
+matmuls exact to 2e-7, and yet 0.3% appearing inside the first block, before
+any norm or rotation. That localised it to a projection, and the only
+projection in a block with a batch of *one* is the modulation.
+
+`Q4KMat::matmul_q4k_t_blas` takes a GEMV shortcut at `M == 1` which quantizes
+the **activation** to int8 before the dot product. It is a large NEON win and
+costs about 0.4%, and for a language model it is plainly the right trade: every
+decode step is a batch of one, and the error lands on one token's logits.
+
+For a diffusion transformer it is the wrong trade twice over. The batch-of-one
+matmuls are the modulation projections, which are a negligible share of the
+arithmetic -- and their output is a shift, a scale and a gate applied to
+*every* token and *every* channel of the block. So the cheapest matmuls in the
+model were setting the magnitude of everything downstream at 8-bit precision.
+
+Routing `QLinear` through a path that never takes that shortcut:
+
+| | before | after |
+|---|---|---|
+| Q projection, block 0 | 3.9e-3 | **2.9e-4** |
+| block 0 output | 3.2e-3 | **3.4e-4** |
+| final velocity | 4.6e-2 | **4.4e-3** |
+
+Ten times closer, for no measurable time: those matmuls are 3072-wide against
+the 4096-token ones beside them.
+
+The remaining 4.4e-3 accumulates over 57 blocks from a per-block 3e-4, which is
+f32 reordering and Q4_K rounding doing what they do.
+
+Two smaller things fell out of the same hunt and were fixed on the way: F16
+tensors were being rounded down to BF16 on load, throwing away two mantissa
+bits to save 100 MB, and the RoPE frequencies were computed in f32 where the
+reference uses f64. Neither turned out to be the culprit -- both are now right
+anyway.
+
+---
+
 ## What is not verified
 
 Shorter than it was, but not empty:
 
-1. **Numerical parity with diffusers.** The output is a photograph of what was
-   asked for, which rules out the whole class of bugs that produce noise or the
-   wrong subject. It does not prove that a given seed produces the *same*
-   photograph the reference implementation would. Checking that needs a
-   step-by-step latent comparison against a diffusers run.
-2. **`--model flux-dev`.** The config, the guidance embedding and the shifted
+1. **`--model flux-dev`.** The config, the guidance embedding and the shifted
    schedule are implemented and tested against the CPU path, but dev's weights
    are behind a gated repository and have never been loaded.
-3. **Prompts with combining marks.** CLIP's normalizer includes NFC
+2. **Prompts with combining marks.** CLIP's normalizer includes NFC
    composition, which `normalize` does not do -- it lowercases and collapses
    whitespace only. It costs a token boundary on text carrying combining
    characters, and nothing at all on the Latin text prompts are usually in.
-4. **Resolutions other than the three that were run.** 256x256, 512x512 and
-   1024x1024 all work. Non-square sizes are handled in the code and covered by
-   the shape tests, but no non-square image has been generated.
+3. **Whether the T5 padding should be masked.** The prompt is padded to 256
+   with id 0 and every position participates in attention, because there is no
+   attention mask here. The reference pipeline does not pass one either, so the
+   two should agree -- but "should" is doing work in that sentence, and it has
+   not been checked against a diffusers run.
+
+Resolutions are no longer on this list: 256x256, 512x512, 1024x1024 and a
+non-square 384x256 have all been generated.
 
 ---
 

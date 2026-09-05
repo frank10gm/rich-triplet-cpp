@@ -262,8 +262,12 @@ struct MetalFluxContext::Impl {
         set_u32(enc, static_cast<std::uint32_t>(cfg.n_heads), 5);
         set_u32(enc, static_cast<std::uint32_t>(head_dim), 6);
         set_f32(enc, 1.0f / std::sqrt(static_cast<float>(head_dim)), 7);
-        [enc dispatchThreadgroups:MTLSizeMake(cfg.n_heads, rows, 1)
-            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        // One threadgroup per (head, block of 32 queries). Blocking the
+        // queries is what keeps K and V from being re-streamed once per query.
+        constexpr std::size_t kQueryBlock = 32;
+        const std::size_t blocks = (rows + kQueryBlock - 1) / kQueryBlock;
+        [enc dispatchThreadgroups:MTLSizeMake(cfg.n_heads, blocks, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
 
     void run_slice(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> src, id<MTLBuffer> dst,
@@ -439,6 +443,12 @@ Result<std::unique_ptr<MetalFluxContext>> MetalFluxContext::create(FluxModel& mo
     if (cfg.head_dim() > kMaxHeadDim) {
         return err("metal flux: head_dim " + std::to_string(cfg.head_dim()) +
                    " exceeds the attention kernel's " + std::to_string(kMaxHeadDim));
+    }
+    // The attention kernel tiles both of its matmuls into 8x8 simdgroup
+    // fragments along the head dimension.
+    if (cfg.head_dim() % 8 != 0) {
+        return err("metal flux: head_dim " + std::to_string(cfg.head_dim()) +
+                   " is not a multiple of 8");
     }
     if (cfg.hidden_size % kTile != 0) {
         return err("metal flux: hidden_size must be a multiple of " + std::to_string(kTile));

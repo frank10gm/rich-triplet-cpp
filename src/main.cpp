@@ -201,6 +201,8 @@ struct CliArgs {
     std::size_t vae_tile = 0;
     /// --cpu : run the diffusion transformer on the CPU even when Metal is on
     bool force_cpu = false;
+    /// --batch N : generate N images from consecutive seeds in one run
+    std::size_t batch = 1;
 };
 
 void print_help();
@@ -324,6 +326,8 @@ template <typename T>
             a.height = parse_or<std::size_t>(take(i).value_or(""), a.height);
         } else if (arg == "--tile") {
             a.vae_tile = parse_or<std::size_t>(take(i).value_or(""), a.vae_tile);
+        } else if (arg == "--batch") {
+            a.batch = std::max<std::size_t>(1, parse_or<std::size_t>(take(i).value_or(""), 1));
         } else if (arg == "--cpu") {
             a.force_cpu = true;
         } else if (arg == "--rope-interleaved") {
@@ -399,6 +403,7 @@ void print_help() {
     std::printf("  --steps N                Denoising steps (schnell 4, dev 28)\n");
     std::printf("  --seed N                 Noise seed\n");
     std::printf("  --tile N                 VAE tile in latent pixels; 0 decodes whole\n");
+    std::printf("  --batch N                Generate N images from consecutive seeds\n");
     std::printf("  --cpu                    Run the transformer on the CPU\n");
     std::printf("  --out PATH               Where to write the PNG (default out.png)\n");
     std::printf("\nOmniVoice (--model omnivoice):\n");
@@ -884,41 +889,69 @@ void run_flux(const CliArgs& args, const std::string& prompt) {
     params.width = args.width;
     params.height = args.height;
     params.steps = steps;
-    params.seed = args.seed;
     params.guidance = args.guidance;
     // schnell's scheduler does not shift; dev's does, as a function of the
     // sequence length. 1.0 is the identity either way for the four-step path.
     params.shift = is_dev ? 1.15f : 1.0f;
 
-    std::fprintf(stderr, "[ FLUX ] Sampling %zux%zu in %zu steps (seed %llu)...\n", args.width,
-                 args.height, steps, static_cast<unsigned long long>(args.seed));
     const auto started = std::chrono::steady_clock::now();
 
-    Result<Mat> latent = err("unreachable");
+    // Sample every seed before decoding any of them. The transformer is 7 GB
+    // and the autoencoder wants the memory, so the two cannot be interleaved
+    // without reloading one of them per image -- and a latent is 1 MB, so
+    // holding the whole batch costs nothing.
+    std::vector<Mat> latents;
+    latents.reserve(args.batch);
+    {
 #if RT_FEATURE_METAL
-    if (!args.force_cpu) {
-        Result<std::unique_ptr<MetalFluxContext>> engine = MetalFluxContext::create(
-            *model, args.height / kVaeFactor, args.width / kVaeFactor, context->rows);
-        if (!engine) {
-            die("failed to build the Metal engine: " + engine.error());
+        std::unique_ptr<MetalFluxContext> engine;
+        if (!args.force_cpu) {
+            Result<std::unique_ptr<MetalFluxContext>> built = MetalFluxContext::create(
+                *model, args.height / kVaeFactor, args.width / kVaeFactor, context->rows);
+            if (!built) {
+                die("failed to build the Metal engine: " + built.error());
+            }
+            engine = std::move(*built);
+            std::fprintf(stderr, "[ FLUX ] Metal: %.2f GB on the GPU\n",
+                         static_cast<double>(engine->device_bytes()) / 1e9);
         }
-        std::fprintf(stderr, "[ FLUX ] Metal: %.2f GB on the GPU\n",
-                     static_cast<double>((*engine)->device_bytes()) / 1e9);
-        latent = flux_sample_metal(**engine, cfg, *context, *pooled, params);
-    } else {
-        latent = flux_sample(*model, *context, *pooled, params);
-    }
-#else
-    latent = flux_sample(*model, *context, *pooled, params);
 #endif
-    if (!latent) {
-        die("sampling failed: " + latent.error());
+        for (std::size_t i = 0; i < args.batch; ++i) {
+            params.seed = args.seed + i;
+            std::fprintf(stderr, "[ FLUX ] Sampling %zux%zu in %zu steps (seed %llu)%s...\n",
+                         args.width, args.height, steps,
+                         static_cast<unsigned long long>(params.seed),
+                         args.batch > 1
+                             ? (" [" + std::to_string(i + 1) + "/" + std::to_string(args.batch) +
+                                "]").c_str()
+                             : "");
+            const auto one = std::chrono::steady_clock::now();
+            Result<Mat> latent = err("unreachable");
+#if RT_FEATURE_METAL
+            if (engine) {
+                latent = flux_sample_metal(*engine, cfg, *context, *pooled, params);
+            } else {
+                latent = flux_sample(*model, *context, *pooled, params);
+            }
+#else
+            latent = flux_sample(*model, *context, *pooled, params);
+#endif
+            if (!latent) {
+                die("sampling failed: " + latent.error());
+            }
+            std::fprintf(stderr, "[ FLUX ] Sampled in %.1f s\n",
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - one)
+                             .count());
+            latents.push_back(std::move(*latent));
+        }
     }
-    const auto sampled = std::chrono::steady_clock::now();
-    std::fprintf(stderr, "[ FLUX ] Sampled in %.1f s\n",
-                 std::chrono::duration<double>(sampled - started).count());
 
-    std::fprintf(stderr, "[ FLUX ] Decoding the latent...\n");
+    // The transformer is finished, and it is holding 7 GB the autoencoder would
+    // rather have. Releasing it here is what lets the decode run whole-image.
+    model->free_weights();
+
+    std::fprintf(stderr, "[ FLUX ] Decoding %zu latent%s...\n", latents.size(),
+                 latents.size() == 1 ? "" : "s");
     Result<VaeDecoder> vae = VaeDecoder::load(vae_path, VaeConfig::flux());
     if (!vae) {
         die("failed to load the autoencoder: " + vae.error());
@@ -927,22 +960,43 @@ void run_flux(const CliArgs& args, const std::string& prompt) {
     const std::size_t lat_h = args.height / kVaeFactor;
     const std::size_t lat_w = args.width / kVaeFactor;
     // The last decoder level runs 128 channels at full resolution, which is
-    // half a gigabyte per activation at 1024x1024. Tiling caps that.
+    // half a gigabyte per activation at 1024x1024, and a residual unit holds
+    // three. Tiling caps that -- but it also decodes the overlaps twice, and
+    // now that the mid-block attention is a pair of gemms rather than a triple
+    // loop the whole-image path is the faster of the two at 1024x1024 (27 s
+    // against 33 s). So the threshold sits above it: tile only when the latent
+    // is larger than 128x128, where whole-image would want ~10 GB.
     const std::size_t tile = args.vae_tile != 0 ? args.vae_tile
-                             : (lat_h * lat_w > 64 * 64 ? 64 : 0);
-    const Result<Mat> pixels = tile != 0 ? vae->decode_tiled(*latent, lat_h, lat_w, tile, tile / 4)
-                                         : vae->decode(*latent, lat_h, lat_w);
-    if (!pixels) {
-        die("decoding failed: " + pixels.error());
-    }
+                             : (lat_h * lat_w > 128 * 128 ? 64 : 0);
+    for (std::size_t i = 0; i < latents.size(); ++i) {
+        const Result<Mat> pixels =
+            tile != 0 ? vae->decode_tiled(latents[i], lat_h, lat_w, tile, tile / 4)
+                      : vae->decode(latents[i], lat_h, lat_w);
+        if (!pixels) {
+            die("decoding failed: " + pixels.error());
+        }
 
-    const ImageStats stats = image_stats(*pixels, args.width, args.height);
-    std::fprintf(stderr, "[ FLUX ] %s\n", stats.describe().c_str());
+        const ImageStats stats = image_stats(*pixels, args.width, args.height);
+        std::fprintf(stderr, "[ FLUX ] %s\n", stats.describe().c_str());
 
-    if (const Result<void> ok = write_png(out_path, *pixels, args.width, args.height); !ok) {
-        die("failed to write the image: " + ok.error());
+        // A single image keeps the name it was given; a batch gets the seed
+        // spliced in before the extension, so the files stay distinguishable
+        // and say which seed produced them.
+        std::string path = out_path;
+        if (latents.size() > 1) {
+            const std::string seed = "_s" + std::to_string(args.seed + i);
+            const std::size_t dot = out_path.find_last_of('.');
+            path = dot == std::string::npos ? out_path + seed
+                                            : out_path.substr(0, dot) + seed +
+                                                  out_path.substr(dot);
+        }
+        if (const Result<void> ok = write_png(path, *pixels, args.width, args.height); !ok) {
+            die("failed to write the image: " + ok.error());
+        }
+        std::fprintf(stderr, "[ FLUX ] Wrote %s\n", path.c_str());
     }
-    std::fprintf(stderr, "[ FLUX ] Wrote %s in %.1f s total\n", out_path.c_str(),
+    std::fprintf(stderr, "[ FLUX ] %zu image%s in %.1f s total\n", latents.size(),
+                 latents.size() == 1 ? "" : "s",
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
                      .count());
 }

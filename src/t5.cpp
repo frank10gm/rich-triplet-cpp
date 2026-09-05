@@ -230,10 +230,18 @@ namespace {
             RT_TRY(bits, gguf.decode_bf16(*idx));
             return QLinear::from_bf16(MatBf16(std::move(bits), out_features, in_features));
         }
+        case GgufType::F32:
+        case GgufType::F16: {
+            // Kept at full precision. Widening f16 to f32 is exact, and
+            // folding it down to bfloat instead would throw away two mantissa
+            // bits for no saving worth having.
+            RT_TRY(f, gguf_tensor_to_f32(gguf, *idx));
+            return QLinear::from_f32(Mat(std::move(f), out_features, in_features));
+        }
         default: {
-            // Q6_K, Q8_0, Q5_K, F16 and F32 all land here: decode to f32 and
-            // fold to BF16, which halves the resident cost and throws away
-            // less than the source format already did.
+            // Q6_K, Q8_0 and Q5_K land here: decode to f32 and fold to BF16,
+            // which halves the resident cost and throws away less than the
+            // source format already did.
             RT_TRY(f, gguf_tensor_to_f32(gguf, *idx));
             const Mat m(std::move(f), out_features, in_features);
             return QLinear::from_bf16(mat_to_bf16(m));

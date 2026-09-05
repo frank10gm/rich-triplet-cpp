@@ -146,20 +146,46 @@ kernel void flux_add_bias(
 // Attention
 // =============================================================================
 //
-// The OmniVoice attention kernel keeps a whole row of scores in threadgroup
-// memory, which caps it at 2048 keys. FLUX runs 4352 at 1024x1024 and 16640 at
-// 2048x2048, so this one streams instead: it walks the keys in tiles, keeping
-// only a running maximum, a running denominator and the output accumulator.
+// The OmniVoice attention kernel keeps a full row of scores in threadgroup
+// memory, which caps it at 2048 keys. FLUX runs 4352 at 1024x1024, so this one
+// streams instead: it walks the keys in tiles, keeping only a running maximum,
+// a running denominator and the output accumulator. That is the online-softmax
+// recurrence -- on seeing a tile whose maximum exceeds the running one, the
+// accumulator and the denominator are rescaled by `exp(old_max - new_max)`
+// before the tile is folded in, which bounds every exponential without ever
+// materialising the score row.
 //
-// That is the online-softmax recurrence. On seeing a tile whose maximum
-// exceeds the running one, the accumulator and the denominator are rescaled by
-// `exp(old_max - new_max)` before the tile is folded in, which keeps every
-// exponential bounded without ever materialising the score row.
+// ## Why a block of queries, and not one
 //
-// One threadgroup per (head, query). 128 threads: enough for one output
-// dimension each at head_dim 128, and twice the key tile.
+// The obvious shape is one threadgroup per (head, query), and it is a trap.
+// Each threadgroup then streams the whole of K and V for its head -- 4352 keys
+// of 128 floats, twice, is 4.4 MB -- and there are 24 x 4352 threadgroups.
+// That is 460 GB of traffic per attention call, 57 blocks per step, four steps
+// per image. The kernel is not ALU-bound at that point and no amount of
+// arithmetic tuning helps it.
+//
+// So a threadgroup owns a *block* of `FLUX_ATTN_BQ` queries and streams K and V
+// once for all of them. The tile every query needs at a given moment is the
+// same tile, so the traffic divides by the block size directly: 460 GB becomes
+// 14 GB, and the accumulators stay in threadgroup memory where the rescale can
+// reach them.
+//
+// 32 queries of 128 dimensions is 16 KB of accumulator and 4 KB of scores,
+// inside the 32 KB a threadgroup may address.
+//
+// Neither Q nor V is staged in threadgroup memory, and that is measured rather
+// than assumed. Staging Q as half removes a 32x redundancy in the score loop --
+// each query row is otherwise re-read once per key in the tile -- and it made
+// the whole image *slower*, 63.5 s to 68.5 s at 512x512. Threadgroup memory is
+// the occupancy currency on this GPU: 20 KB per threadgroup keeps enough of
+// them resident to hide the device-memory latency, 28 KB does not, and the
+// reads being saved were hitting cache anyway.
 
-#define FLUX_ATTN_TILE 64u
+#define FLUX_ATTN_BQ 32u
+#define FLUX_ATTN_BK 32u
+#define FLUX_ATTN_THREADS 256u
+#define FLUX_ATTN_MAX_HEAD_DIM 128u
+#define FLUX_ATTN_SIMDGROUPS 8u
 
 kernel void flux_attention(
     device const float* q   [[buffer(0)]],
@@ -171,68 +197,136 @@ kernel void flux_attention(
     constant uint&  head_dim [[buffer(6)]],
     constant float& scale    [[buffer(7)]],
     uint2 gid   [[threadgroup_position_in_grid]],
-    uint2 tid_v [[thread_position_in_threadgroup]])
+    uint2 tid_v [[thread_position_in_threadgroup]],
+    uint  sgid  [[simdgroup_index_in_threadgroup]])
 {
     const uint tid = tid_v.x;
     const uint head = gid.x;
-    const uint row  = gid.y;
-    if (row >= T) return;
+    const uint q0 = gid.y * FLUX_ATTN_BQ;
+    // Every thread here shares `gid`, so the whole threadgroup leaves together
+    // and no barrier below is reached by only part of it.
+    if (q0 >= T) return;
+    const uint nq = min(FLUX_ATTN_BQ, T - q0);
 
     const uint stride = n_heads * head_dim;
-    device const float* qv = q + row * stride + head * head_dim;
+    device const float* qb = q + head * head_dim;
     device const float* kb = k + head * head_dim;
     device const float* vb = v + head * head_dim;
 
-    threadgroup float sc[FLUX_ATTN_TILE];
-    threadgroup float acc[128];
-    threadgroup float state[2];  // running max, running denominator
-    threadgroup float alpha;     // this tile's rescale of the accumulator
+    threadgroup float acc[FLUX_ATTN_BQ * FLUX_ATTN_MAX_HEAD_DIM];
+    threadgroup float sc[FLUX_ATTN_BQ * FLUX_ATTN_BK];
+    threadgroup float m_state[FLUX_ATTN_BQ];   // running maximum
+    threadgroup float l_state[FLUX_ATTN_BQ];   // running denominator
+    threadgroup float alpha[FLUX_ATTN_BQ];     // this tile's rescale
 
-    if (tid < head_dim) acc[tid] = 0.0f;
-    if (tid == 0) { state[0] = -INFINITY; state[1] = 0.0f; }
+    const uint dq = head_dim / 8u;
+    const uint s_tiles = (FLUX_ATTN_BQ / 8u) * (FLUX_ATTN_BK / 8u);
+    const uint o_tiles = (FLUX_ATTN_BQ / 8u) * dq;
+
+    for (uint i = tid; i < FLUX_ATTN_BQ * head_dim; i += FLUX_ATTN_THREADS) {
+        acc[i] = 0.0f;
+    }
+    if (tid < FLUX_ATTN_BQ) {
+        m_state[tid] = -INFINITY;
+        l_state[tid] = 0.0f;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint base = 0u; base < T; base += FLUX_ATTN_TILE) {
-        const uint n = min(FLUX_ATTN_TILE, T - base);
+    for (uint base = 0u; base < T; base += FLUX_ATTN_BK) {
+        const uint nk = min(FLUX_ATTN_BK, T - base);
 
-        if (tid < n) {
-            device const float* kv = kb + (base + tid) * stride;
-            float dot = 0.0f;
-            for (uint d = 0; d < head_dim; ++d) dot += qv[d] * kv[d];
-            sc[tid] = dot * scale;
+        // --- S = Q K^T, as sixteen 8x8 fragments over eight simdgroups -------
+        for (uint t = sgid; t < s_tiles; t += FLUX_ATTN_SIMDGROUPS) {
+            const uint ti = t / (FLUX_ATTN_BK / 8u);
+            const uint tj = t % (FLUX_ATTN_BK / 8u);
+            simdgroup_float8x8 sacc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_float8x8 a, b;
+            for (uint d0 = 0u; d0 < head_dim; d0 += 8u) {
+                simdgroup_load(a, qb + (q0 + ti * 8u) * stride + d0, stride);
+                // transpose=true reads K[key, d] as the [d, key] operand.
+                simdgroup_load(b, kb + (base + tj * 8u) * stride + d0, stride, ulong2(0, 0),
+                               true);
+                simdgroup_multiply_accumulate(sacc, a, b, sacc);
+            }
+            simdgroup_store(sacc, sc + (ti * 8u) * FLUX_ATTN_BK + tj * 8u, FLUX_ATTN_BK);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // The rescale is decided once per tile by a single thread. A parallel
-        // reduction over 64 values would cost more in barriers than it saves.
-        if (tid == 0) {
-            float tile_max = -INFINITY;
-            for (uint j = 0; j < n; ++j) tile_max = max(tile_max, sc[j]);
-            const float new_max = max(state[0], tile_max);
-            alpha = (state[0] == -INFINITY) ? 0.0f : exp(state[0] - new_max);
+        // --- online softmax, one thread per query row ------------------------
+        //
+        // The scale is folded in here rather than in the matmul: the fragments
+        // come back unscaled and this pass already touches every score.
+        //
+        // Rows past `nq` and columns past `nk` are zeroed rather than left
+        // alone. The matmul below contracts over all 32 keys whatever the tail
+        // holds, so a stale value in the masked region would leak into every
+        // output element of the block.
+        if (tid < FLUX_ATTN_BQ) {
+            const uint row = tid * FLUX_ATTN_BK;
+            if (tid >= nq) {
+                for (uint j = 0u; j < FLUX_ATTN_BK; ++j) {
+                    sc[row + j] = 0.0f;
+                }
+                alpha[tid] = 0.0f;
+            } else {
+                float tile_max = -INFINITY;
+                for (uint j = 0u; j < nk; ++j) {
+                    tile_max = max(tile_max, sc[row + j] * scale);
+                }
+                const float new_max = max(m_state[tid], tile_max);
+                const float a = (m_state[tid] == -INFINITY) ? 0.0f : exp(m_state[tid] - new_max);
 
-            float tile_sum = 0.0f;
-            for (uint j = 0; j < n; ++j) {
-                sc[j] = exp(sc[j] - new_max);
-                tile_sum += sc[j];
+                float tile_sum = 0.0f;
+                for (uint j = 0u; j < nk; ++j) {
+                    const float e = exp(sc[row + j] * scale - new_max);
+                    sc[row + j] = e;
+                    tile_sum += e;
+                }
+                for (uint j = nk; j < FLUX_ATTN_BK; ++j) {
+                    sc[row + j] = 0.0f;
+                }
+                m_state[tid] = new_max;
+                l_state[tid] = l_state[tid] * a + tile_sum;
+                alpha[tid] = a;
             }
-            state[0] = new_max;
-            state[1] = state[1] * alpha + tile_sum;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (tid < head_dim) {
-            float a = acc[tid] * alpha;
-            for (uint j = 0; j < n; ++j) {
-                a += sc[j] * vb[(base + j) * stride + tid];
+        // --- rescale the accumulator, then O += P V --------------------------
+        //
+        // The rescale has to happen before the matmul and separately from it.
+        // `alpha` is per query *row*, and an 8x8 fragment held in registers
+        // cannot be scaled by a row vector -- but it can be *initialised* from
+        // the rescaled accumulator, which is the same thing and costs no
+        // scratch tile. That is what keeps this kernel at 20 KB of threadgroup
+        // memory: the obvious formulation, with a separate [32, head_dim]
+        // product buffer, needs 36 KB and does not fit, and even at 28 KB the
+        // occupancy loss outweighs everything the matrix units win.
+        for (uint p = tid; p < FLUX_ATTN_BQ * head_dim; p += FLUX_ATTN_THREADS) {
+            acc[p] *= alpha[p / head_dim];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint t = sgid; t < o_tiles; t += FLUX_ATTN_SIMDGROUPS) {
+            const uint ti = t / dq;
+            const uint td = t % dq;
+            simdgroup_float8x8 oacc;
+            simdgroup_load(oacc, acc + (ti * 8u) * head_dim + td * 8u, head_dim);
+            simdgroup_float8x8 pm, vm;
+            for (uint kk = 0u; kk < FLUX_ATTN_BK; kk += 8u) {
+                simdgroup_load(pm, sc + (ti * 8u) * FLUX_ATTN_BK + kk, FLUX_ATTN_BK);
+                simdgroup_load(vm, vb + (base + kk) * stride + td * 8u, stride);
+                simdgroup_multiply_accumulate(oacc, pm, vm, oacc);
             }
-            acc[tid] = a;
+            simdgroup_store(oacc, acc + (ti * 8u) * head_dim + td * 8u, head_dim);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    if (tid < head_dim) {
-        out[row * stride + head * head_dim + tid] = acc[tid] / state[1];
+    for (uint p = tid; p < nq * head_dim; p += FLUX_ATTN_THREADS) {
+        const uint qi = p / head_dim;
+        const uint d = p % head_dim;
+        out[(q0 + qi) * stride + head * head_dim + d] = acc[p] / l_state[qi];
     }
 }
 
