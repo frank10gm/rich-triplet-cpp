@@ -168,6 +168,10 @@ struct CliArgs {
     std::size_t steps = 12;
     /// --guidance G : classifier-free guidance scale; 0 disables it
     float guidance = 2.0f;
+    /// --chunk-seconds S : audio per chunk when splitting long text; 0 never splits
+    float chunk_seconds = 15.0f;
+    /// --chunk-threshold S : split only when the estimate exceeds this
+    float chunk_threshold = 30.0f;
     /// --rope-interleaved : pair 2i with 2i+1 instead of i with i+head_dim/2
     bool rope_interleaved = false;
 };
@@ -258,6 +262,10 @@ template <typename T>
             a.language = take(i);
         } else if (arg == "--instruct") {
             a.instruct = take(i);
+        } else if (arg == "--chunk-seconds") {
+            if (const auto v = take(i)) a.chunk_seconds = parse_or<float>(*v, 15.0f);
+        } else if (arg == "--chunk-threshold") {
+            if (const auto v = take(i)) a.chunk_threshold = parse_or<float>(*v, 30.0f);
         } else if (arg == "--ref-audio") {
             if (const auto v = take(i)) a.ref_audio = *v;
         } else if (arg == "--ref-text") {
@@ -333,6 +341,8 @@ void print_help() {
     std::printf("\nOmniVoice (--model omnivoice):\n");
     std::printf("  --language NAME          Language hint, e.g. Italian    [default: None]\n");
     std::printf("  --instruct TEXT          Voice description              [default: None]\n");
+    std::printf("  --chunk-seconds S        Audio per chunk for long text  [default: 15]\n");
+    std::printf("  --chunk-threshold S      Split above this many seconds   [default: 30]\n");
     std::printf("  --ref-audio PATH         WAV of a voice to clone\n");
     std::printf("  --ref-text TEXT          What that WAV says (required with it)\n");
     std::printf("  --duration S             Audio seconds (0 = estimate)   [default: 0]\n");
@@ -601,6 +611,8 @@ void run_omnivoice(const CliArgs& args, const std::string& prompt) {
     request.gen.num_step = args.steps;
     request.gen.guidance_scale = args.guidance;
     request.gen.seed = args.seed;
+    request.gen.chunk_seconds = args.chunk_seconds;
+    request.gen.chunk_threshold_seconds = args.chunk_threshold;
 
     char duration_field[32];
     if (request.duration_seconds > 0.0f) {
@@ -648,6 +660,12 @@ void run_omnivoice(const CliArgs& args, const std::string& prompt) {
     }
 
     const WaveStats stats = wave_stats(result->samples);
+    if (result->chunks > 1) {
+        std::fprintf(stderr,
+                     "[ OmniVoice ] Split into %zu chunks; each after the first takes the "
+                     "first as its reference\n",
+                     result->chunks);
+    }
     std::fprintf(stderr,
                  "[ OmniVoice ] %zu frames, %zu prompt tokens, %zu forward passes -> %zu samples\n",
                  result->frames, result->prompt_tokens, result->forward_passes,

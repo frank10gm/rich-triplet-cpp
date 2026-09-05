@@ -61,9 +61,11 @@ namespace rt {
 class MetalOmniContext final : public OmniForward {
    public:
     /// The longest sequence the attention kernel can hold -- it keeps one
-    /// query's scores in threadgroup memory. Forty seconds of audio plus its
-    /// prompt, so not a limit generation reaches.
-    static constexpr std::size_t kMaxTokens = 1024;
+    /// query's scores in threadgroup memory, 8 KB of the 32 KB a threadgroup
+    /// may use. Long text is split into chunks well below this, so what the
+    /// headroom buys is room for a generous `--chunk-seconds` and for the
+    /// reference clip every chunk after the first carries.
+    static constexpr std::size_t kMaxTokens = 2048;
 
     /// Upload `lm`'s weights and allocate scratch for sequences up to
     /// `max_tokens`.

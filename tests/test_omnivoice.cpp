@@ -669,3 +669,151 @@ TEST_CASE("OmniVoice clones a voice end to end", "[omnivoice][.e2e]") {
     }
     REQUIRE(std::fabs(num / std::sqrt(da * db)) < 0.5);
 }
+
+// =============================================================================
+// Chunking long text
+// =============================================================================
+
+TEST_CASE("omni_chunk_text breaks at punctuation", "[omnivoice]") {
+    const std::vector<std::string> got =
+        omni_chunk_text("Uno due tre. Quattro cinque sei. Sette otto nove.", 20);
+    REQUIRE(got.size() == 3);
+    REQUIRE(got[0] == "Uno due tre.");
+    REQUIRE(got[1] == "Quattro cinque sei.");
+    REQUIRE(got[2] == "Sette otto nove.");
+}
+
+TEST_CASE("omni_chunk_text merges sentences up to the target", "[omnivoice]") {
+    // Greedy: a chunk takes whole sentences until the next would overrun.
+    const std::vector<std::string> got =
+        omni_chunk_text("Uno due tre. Quattro cinque sei. Sette otto nove.", 40);
+    REQUIRE(got.size() == 2);
+    REQUIRE(got[0] == "Uno due tre. Quattro cinque sei.");
+    REQUIRE(got[1] == "Sette otto nove.");
+}
+
+TEST_CASE("omni_chunk_text keeps a whole sentence that overruns", "[omnivoice]") {
+    // Breaking mid-sentence would put a seam where the prosody is still
+    // rising, so an over-long sentence is left alone.
+    const std::vector<std::string> got =
+        omni_chunk_text("Questa e una frase molto lunga che non finisce mai.", 10);
+    REQUIRE(got.size() == 1);
+}
+
+TEST_CASE("omni_chunk_text does not split abbreviations", "[omnivoice]") {
+    // "Dr." is not the end of a sentence, and splitting there would strand a
+    // title from its name.
+    const std::vector<std::string> got = omni_chunk_text("Dr. Rossi arrived. He waited.", 18);
+    REQUIRE(got.size() == 2);
+    REQUIRE(got[0] == "Dr. Rossi arrived.");
+    REQUIRE(got[1] == "He waited.");
+
+    const std::vector<std::string> eg = omni_chunk_text("Fruit, e.g. apples, is good.", 100);
+    REQUIRE(eg.size() == 1);
+}
+
+TEST_CASE("omni_chunk_text keeps closing marks with what they close", "[omnivoice]") {
+    // The quote belongs to the sentence that just ended, not the next one.
+    const std::vector<std::string> got = omni_chunk_text("\"Uno due.\" Tre quattro.", 12);
+    REQUIRE(got.size() == 2);
+    REQUIRE(got[0] == "\"Uno due.\"");
+    REQUIRE(got[1] == "Tre quattro.");
+}
+
+TEST_CASE("omni_chunk_text splits on fullwidth punctuation", "[omnivoice]") {
+    // A CJK clause ends on the wide comma, not the ASCII one.
+    const std::vector<std::string> got = omni_chunk_text("你好世界。今天天气很好。", 6);
+    REQUIRE(got.size() == 2);
+    REQUIRE(got[0] == "你好世界。");
+    REQUIRE(got[1] == "今天天气很好。");
+}
+
+TEST_CASE("omni_chunk_text folds away pieces too short to stand alone", "[omnivoice]") {
+    // A two-character chunk would be given its own speaker and sound like one.
+    const std::vector<std::string> got = omni_chunk_text("Uno due tre quattro. Si.", 20, 5);
+    REQUIRE(got.size() == 1);
+    REQUIRE(got[0] == "Uno due tre quattro. Si.");
+}
+
+TEST_CASE("omni_chunk_text handles the degenerate inputs", "[omnivoice]") {
+    REQUIRE(omni_chunk_text("", 20).empty());
+    REQUIRE(omni_chunk_text("   ", 20).empty());
+    // A zero target means "do not split".
+    const std::vector<std::string> whole = omni_chunk_text("Uno. Due. Tre.", 0);
+    REQUIRE(whole.size() == 1);
+    REQUIRE(whole[0] == "Uno. Due. Tre.");
+}
+
+TEST_CASE("omni_chunk_text loses no text", "[omnivoice]") {
+    // Whatever the split, every character has to come out the other side.
+    const std::string text =
+        "Oggi e una bella giornata. Domani andro al mercato, poi a Roma! Va bene?";
+    for (const std::size_t target : {5u, 12u, 30u, 200u}) {
+        const std::vector<std::string> got = omni_chunk_text(text, target);
+        std::string joined;
+        for (const std::string& piece : got) {
+            if (!joined.empty()) {
+                joined += " ";
+            }
+            joined += piece;
+        }
+        REQUIRE(joined == text);
+    }
+}
+
+// =============================================================================
+// Joining the pieces
+// =============================================================================
+
+TEST_CASE("omni_cross_fade passes a single chunk through", "[omnivoice]") {
+    const std::vector<std::vector<float>> one{{0.1f, 0.2f, 0.3f}};
+    const std::vector<float> got = omni_cross_fade(one, 24000, 0.3f);
+    REQUIRE(got == one[0]);
+    REQUIRE(omni_cross_fade({}, 24000, 0.3f).empty());
+}
+
+TEST_CASE("omni_cross_fade inserts a gap and fades both edges", "[omnivoice]") {
+    // A third of the gap fades out, a third is silence, a third fades in.
+    constexpr std::size_t kRate = 3000;   // 0.3 s -> 900 samples, fade 300
+    constexpr std::size_t kFade = 300;
+    const std::vector<std::vector<float>> chunks{std::vector<float>(1000, 1.0f),
+                                                 std::vector<float>(1000, 1.0f)};
+    const std::vector<float> got = omni_cross_fade(chunks, kRate, 0.3f);
+    REQUIRE(got.size() == 1000 + kFade + 1000);
+
+    // Untouched in the middle of the first chunk.
+    REQUIRE(approx(got[500], 1.0f));
+    // Fading out towards the gap.
+    REQUIRE(got[1000 - kFade] > got[999]);
+    REQUIRE(approx(got[999], 0.0f));
+    // The gap itself.
+    for (std::size_t i = 1000; i < 1000 + kFade; ++i) {
+        REQUIRE(got[i] == 0.0f);
+    }
+    // Fading back in.
+    REQUIRE(approx(got[1000 + kFade], 0.0f));
+    REQUIRE(got[1000 + kFade + kFade] > 0.9f);
+    REQUIRE(approx(got[1000 + kFade + 500], 1.0f));
+}
+
+TEST_CASE("omni_cross_fade handles chunks shorter than the fade", "[omnivoice]") {
+    // A very short piece cannot give the fade all the samples it wants, and
+    // must not read past its own end.
+    const std::vector<std::vector<float>> chunks{std::vector<float>(4, 1.0f),
+                                                 std::vector<float>(4, 1.0f)};
+    const std::vector<float> got = omni_cross_fade(chunks, 3000, 0.3f);
+    REQUIRE(got.size() == 4 + 300 + 4);
+    for (const float v : got) {
+        REQUIRE(std::isfinite(v));
+        REQUIRE(std::fabs(v) <= 1.0f);
+    }
+}
+
+TEST_CASE("omni_cross_fade joins three pieces", "[omnivoice]") {
+    const std::vector<std::vector<float>> chunks{std::vector<float>(500, 0.5f),
+                                                 std::vector<float>(600, 0.5f),
+                                                 std::vector<float>(700, 0.5f)};
+    const std::vector<float> got = omni_cross_fade(chunks, 3000, 0.3f);
+    // Two gaps of 300 between three pieces.
+    REQUIRE(got.size() == 500 + 600 + 700 + 2 * 300);
+}

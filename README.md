@@ -465,6 +465,56 @@ running it needs Python's `unicodedata`, which is the thing being replaced.
 
 `--duration S` overrides the whole thing.
 
+### Text longer than a breath
+
+A diffusion model decides its length up front, and OmniVoice was not trained to
+hold a voice across a monologue. Past roughly half a minute a single pass stops
+sounding like speech at all — the frames are there and the model runs out of
+things to put in them. Measured on 40 s of Italian asked for in one pass: RMS
+0.023 against the 0.03–0.2 speech band, and a zero-crossing rate of 0.012.
+Rumble, not voice.
+
+So above `--chunk-threshold` seconds (30 by default) the text is split into
+pieces of about `--chunk-seconds` (15), generated one at a time, and joined.
+The same 40 s comes back at RMS 0.102 and a zero-crossing rate of 0.051 —
+indistinguishable from a four-second clip.
+
+**Splitting happens at punctuation**, never mid-sentence, because a seam in the
+middle of a rising phrase is audible where a seam at a full stop is not.
+Sentences merge greedily up to the target, so a chunk overruns only when a
+single sentence already does. A full stop that ends a known abbreviation —
+`Dr.`, `e.g.`, `No.` — is not a break, and a closing quote or bracket stays
+with the sentence it closes rather than opening the next.
+
+**The voice is held by the first chunk.** Every piece after it takes chunk one
+as a reference clip, through exactly the machinery voice cloning uses — its
+codes go into the prompt as decided frames and its text joins the prompt. Take
+that away and each piece invents its own speaker, which is the thing that makes
+naive chunking sound like a relay race. With `--ref-audio` the user's clip is
+the reference for every chunk instead, and chunk one is no longer special.
+
+**The pieces are joined with a gap, not an overlap.** They are separate
+utterances rather than one signal cut in two, so cross-fading them onto each
+other would sound like two people talking over one another. A third of
+`chunk_gap_seconds` fades the previous piece out, a third is silence, a third
+fades the next one in — a breath, with no click at either edge.
+
+Measured on an M3 Pro, Metal build:
+
+| text | chunks | audio | wall clock | RMS |
+|---|---|---|---|---|
+| 683 chars | 3 | 40.6 s | 47 s | 0.102 |
+| 1024 chars | 5 | 61.8 s | 64 s | 0.108 |
+
+Roughly linear, and roughly realtime. Nothing caps the total length: 40 000
+characters is about 190 chunks and 47 minutes of audio, at 47 minutes of work.
+
+What *is* capped is a single chunk. The GPU engine holds one query's attention
+scores in threadgroup memory, which limits a sequence to 2048 positions — and
+each chunk after the first carries the reference's frames on top of its own, so
+`--chunk-seconds` much past 25 will exceed it. The error says so and names the
+number.
+
 ### Voice cloning
 
 ```bash
@@ -632,6 +682,8 @@ Apache 2.0.
 | `--instruct TEXT` | `None` | OmniVoice voice description, e.g. `a calm young woman` |
 | `--duration S` | 0 | OmniVoice audio seconds; 0 estimates from the text |
 | `--steps N` | 12 | OmniVoice unmasking steps — the quality/speed dial |
+| `--chunk-seconds S` | 15 | Audio per chunk when splitting long text; 0 never splits |
+| `--chunk-threshold S` | 30 | Split only when the estimate exceeds this |
 | `--guidance G` | 2.0 | OmniVoice classifier-free guidance; 0 halves the work |
 | `--ref-audio PATH` | — | WAV of a voice for OmniVoice to clone |
 | `--ref-text TEXT` | — | What that WAV says; required alongside it |
@@ -642,8 +694,8 @@ Apache 2.0.
 ## Running tests
 
 ```bash
-./build/tests/rt_tests          # 498 cases
-./build-metal/tests/rt_tests    # 510 cases, including the GPU kernels
+./build/tests/rt_tests          # 511 cases
+./build-metal/tests/rt_tests    # 523 cases, including the GPU kernels
 ```
 
 Covers matrix ops, gradient correctness against finite differences, attention
@@ -971,8 +1023,8 @@ world's scripts.
 
 ## Stats
 
-- ~33,000 lines of C++, Objective-C++ and MSL, plus ~12,400 of tests
-- 510 test cases with Metal, 498 without, plus 32 that need downloaded weights
+- ~33,500 lines of C++, Objective-C++ and MSL, plus ~12,500 of tests
+- 523 test cases with Metal, 511 without, plus 32 that need downloaded weights
   (36 with Metal)
 - Zero ML dependencies (Accelerate and Metal are system frameworks)
 - Every published weight format read from scratch: GGUF, safetensors, and

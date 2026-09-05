@@ -96,6 +96,20 @@ struct OmniGenConfig {
     float t_shift = 0.1f;
     std::uint64_t seed = 0;
 
+    // -- long text -----------------------------------------------------------
+    //
+    // The model was not trained to hold a voice across a monologue, and past
+    // roughly half a minute a single pass stops sounding like speech at all --
+    // the frames are there and the model runs out of things to put in them.
+    // So long text is split, generated piece by piece, and joined.
+
+    /// Split when the estimate exceeds this many seconds. Zero never splits.
+    float chunk_threshold_seconds = 30.0f;
+    /// Roughly how much audio one chunk should carry.
+    float chunk_seconds = 15.0f;
+    /// Silence between chunks, a third of it spent fading each side.
+    float chunk_gap_seconds = 0.3f;
+
     [[nodiscard]] static OmniGenConfig defaults();
 };
 
@@ -163,6 +177,8 @@ struct OmniResult {
     std::size_t frames = 0;
     std::size_t prompt_tokens = 0;
     std::size_t forward_passes = 0;
+    /// Pieces the text was split into; 1 when it was short enough to run whole.
+    std::size_t chunks = 1;
     double generate_seconds = 0.0;
     double decode_seconds = 0.0;
 
@@ -226,6 +242,36 @@ struct OmniReference {
 [[nodiscard]] Result<OmniReference> omni_prepare_reference(std::span<const float> samples,
                                                            std::size_t sample_rate,
                                                            const OmniCodecConfig& codec);
+
+// =============================================================================
+// Long text
+// =============================================================================
+
+/// Split text into pieces of about `chunk_chars` characters, breaking at
+/// punctuation.
+///
+/// Breaking mid-sentence would put a seam where the prosody is still rising,
+/// so splits only happen after `.,;:!?` and their fullwidth counterparts. A
+/// full stop that ends a known abbreviation -- "Dr.", "e.g.", "No." -- is not a
+/// break, since splitting there would strand a title from its name.
+///
+/// Sentences are then merged greedily up to `chunk_chars`, so a chunk overruns
+/// only when a single sentence already does. Pieces shorter than
+/// `min_chunk_chars` are folded into a neighbour: a two-character chunk would
+/// be given its own speaker and sound like one.
+[[nodiscard]] std::vector<std::string> omni_chunk_text(std::string_view text,
+                                                       std::size_t chunk_chars,
+                                                       std::size_t min_chunk_chars = 3);
+
+/// Join chunk waveforms with a fade-out, a silence, and a fade-in.
+///
+/// Not an overlap-add: the pieces are separate utterances, not a continuous
+/// signal cut in two, so crossfading them onto each other would sound like two
+/// people talking over one another. The gap is a breath, and the fades keep
+/// its edges from clicking.
+[[nodiscard]] std::vector<float> omni_cross_fade(const std::vector<std::vector<float>>& chunks,
+                                                 std::size_t sample_rate,
+                                                 float silence_seconds = 0.3f);
 
 /// Build the conditional sequence: style markers, text, reference codes if any,
 /// then masked frames.

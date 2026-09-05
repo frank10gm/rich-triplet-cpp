@@ -325,6 +325,204 @@ std::vector<OmniToken> omni_build_unconditional(const Config6& cfg, std::size_t 
     return seq;
 }
 
+
+// =============================================================================
+// Long text
+// =============================================================================
+
+namespace {
+
+/// Punctuation a sentence may end on. Fullwidth forms included, since a CJK
+/// clause ends on the wide comma rather than the ASCII one.
+[[nodiscard]] bool is_split_punctuation(char32_t cp) {
+    switch (cp) {
+        case U'.': case U',': case U';': case U':': case U'!': case U'?':
+        case 0x3002:  // 。
+        case 0xFF0C:  // ，
+        case 0xFF1B:  // ；
+        case 0xFF1A:  // ：
+        case 0xFF01:  // ！
+        case 0xFF1F:  // ？
+            return true;
+        default:
+            return false;
+    }
+}
+
+/// Quotes and brackets that close a sentence *after* its full stop, and so
+/// belong to the piece that just ended rather than starting the next one.
+[[nodiscard]] bool is_closing_mark(char32_t cp) {
+    switch (cp) {
+        case U'"': case U'\'':
+        case 0x201C: case 0x201D:  // “ ”
+        case 0x2018: case 0x2019:  // ‘ ’
+        case 0xFF09:              // ）
+        case U']': case U'>':
+        case 0x300B:              // 》
+        case 0x300D:              // 」
+        case 0x3011:              // 】
+            return true;
+        default:
+            return false;
+    }
+}
+
+/// Words whose trailing full stop is not the end of a sentence.
+[[nodiscard]] bool is_abbreviation(std::string_view word) {
+    static const std::vector<std::string_view> kAbbreviations{
+        "Mr.", "Mrs.", "Ms.", "Dr.", "Prof.", "Sr.", "Jr.", "Rev.", "Fr.", "Hon.",
+        "Pres.", "Gov.", "Capt.", "Gen.", "Sen.", "Rep.", "Col.", "Maj.", "Lt.",
+        "Cmdr.", "Sgt.", "Cpl.", "Co.", "Corp.", "Inc.", "Ltd.", "Est.", "Dept.",
+        "St.", "Ave.", "Blvd.", "Rd.", "Mt.", "Ft.", "No.", "Jan.", "Feb.", "Mar.",
+        "Apr.", "Aug.", "Sep.", "Sept.", "Oct.", "Nov.", "Dec.", "i.e.", "e.g.",
+        "vs.", "Vs.", "Etc.", "approx.", "fig.", "def.",
+    };
+    return std::find(kAbbreviations.begin(), kAbbreviations.end(), word) !=
+           kAbbreviations.end();
+}
+
+/// The last whitespace-separated word of a run of code points.
+[[nodiscard]] std::string last_word(const std::vector<char32_t>& cps) {
+    std::size_t end = cps.size();
+    while (end > 0 && utf8::is_whitespace(cps[end - 1])) {
+        --end;
+    }
+    std::size_t begin = end;
+    while (begin > 0 && !utf8::is_whitespace(cps[begin - 1])) {
+        --begin;
+    }
+    std::string out;
+    for (std::size_t i = begin; i < end; ++i) {
+        utf8::encode_into(out, cps[i]);
+    }
+    return out;
+}
+
+[[nodiscard]] std::string to_string(const std::vector<char32_t>& cps) {
+    std::string out;
+    for (const char32_t cp : cps) {
+        utf8::encode_into(out, cp);
+    }
+    return out;
+}
+
+}  // namespace
+
+std::vector<std::string> omni_chunk_text(std::string_view text, std::size_t chunk_chars,
+                                         std::size_t min_chunk_chars) {
+    const std::vector<char32_t> cps = utf8::decode(text);
+    if (cps.empty()) {
+        return {};
+    }
+    if (chunk_chars == 0) {
+        return {std::string(text)};
+    }
+
+    // 1. Break into sentences at punctuation, keeping the mark with what it
+    //    ends.
+    std::vector<std::vector<char32_t>> sentences;
+    std::vector<char32_t> current;
+    for (const char32_t cp : cps) {
+        if (current.empty() && !sentences.empty() &&
+            (is_split_punctuation(cp) || is_closing_mark(cp))) {
+            // A mark that opens a new sentence closes the previous one.
+            sentences.back().push_back(cp);
+            continue;
+        }
+        current.push_back(cp);
+        if (is_split_punctuation(cp)) {
+            if (cp == U'.' && is_abbreviation(last_word(current))) {
+                continue;
+            }
+            sentences.push_back(std::move(current));
+            current.clear();
+        }
+    }
+    if (!current.empty()) {
+        sentences.push_back(std::move(current));
+    }
+
+    // 2. Merge greedily up to the target size.
+    std::vector<std::vector<char32_t>> merged;
+    std::vector<char32_t> chunk;
+    for (std::vector<char32_t>& sentence : sentences) {
+        if (chunk.size() + sentence.size() <= chunk_chars) {
+            chunk.insert(chunk.end(), sentence.begin(), sentence.end());
+        } else {
+            if (!chunk.empty()) {
+                merged.push_back(std::move(chunk));
+            }
+            chunk = std::move(sentence);
+        }
+    }
+    if (!chunk.empty()) {
+        merged.push_back(std::move(chunk));
+    }
+
+    // 3. Fold away anything too short to be worth its own generation.
+    std::vector<std::vector<char32_t>> final_chunks;
+    const bool first_is_short = !merged.empty() && merged[0].size() < min_chunk_chars;
+    for (std::size_t i = 0; i < merged.size(); ++i) {
+        if (i == 1 && first_is_short) {
+            // A short opener keeps the piece after it rather than the reverse.
+            final_chunks.back().insert(final_chunks.back().end(), merged[i].begin(),
+                                       merged[i].end());
+        } else if (merged[i].size() >= min_chunk_chars || final_chunks.empty()) {
+            final_chunks.push_back(std::move(merged[i]));
+        } else {
+            final_chunks.back().insert(final_chunks.back().end(), merged[i].begin(),
+                                       merged[i].end());
+        }
+    }
+
+    std::vector<std::string> out;
+    for (const std::vector<char32_t>& c : final_chunks) {
+        std::string s = trim(to_string(c));
+        if (!s.empty()) {
+            out.push_back(std::move(s));
+        }
+    }
+    return out;
+}
+
+std::vector<float> omni_cross_fade(const std::vector<std::vector<float>>& chunks,
+                                   std::size_t sample_rate, float silence_seconds) {
+    if (chunks.empty()) {
+        return {};
+    }
+    if (chunks.size() == 1) {
+        return chunks.front();
+    }
+
+    // A third of the gap fades out, a third is silence, a third fades in.
+    const auto total = static_cast<std::size_t>(silence_seconds *
+                                                static_cast<float>(sample_rate));
+    const std::size_t fade = total / 3;
+
+    std::vector<float> out = chunks.front();
+    for (std::size_t i = 1; i < chunks.size(); ++i) {
+        const std::size_t fade_out = std::min(fade, out.size());
+        for (std::size_t j = 0; j < fade_out; ++j) {
+            const float w = 1.0f - static_cast<float>(j) /
+                                       static_cast<float>(std::max<std::size_t>(fade_out - 1, 1));
+            out[out.size() - fade_out + j] *= w;
+        }
+
+        out.insert(out.end(), fade, 0.0f);
+
+        const std::vector<float>& next = chunks[i];
+        const std::size_t fade_in = std::min(fade, next.size());
+        const std::size_t before = out.size();
+        out.insert(out.end(), next.begin(), next.end());
+        for (std::size_t j = 0; j < fade_in; ++j) {
+            const float w = static_cast<float>(j) /
+                            static_cast<float>(std::max<std::size_t>(fade_in - 1, 1));
+            out[before + j] *= w;
+        }
+    }
+    return out;
+}
+
 // =============================================================================
 // Sampling
 // =============================================================================
@@ -355,13 +553,23 @@ void log_softmax(std::span<float> row) {
 
 }  // namespace
 
-Result<OmniResult> omni_synthesize(const OmniLm& lm, const OmniCodecDecoder& codec,
-                                   const HfBpeTokenizer& tok, const OmniRequest& request,
-                                   const OmniForward* accel) {
+namespace {
+
+/// One piece of text, start to finish: estimate its length, run the unmasking
+/// loop, and hand back the codes. Chunked generation calls this once per piece
+/// and every caller calls it at least once.
+struct OmniChunkResult {
+    std::vector<std::vector<std::uint32_t>> codes;
+    std::size_t prompt_tokens = 0;
+    std::size_t forward_passes = 0;
+};
+
+[[nodiscard]] Result<OmniChunkResult> omni_generate_chunk(const OmniLm& lm,
+                                                          const OmniCodecDecoder& codec,
+                                                          const HfBpeTokenizer& tok,
+                                                          const OmniRequest& request,
+                                                          const OmniForward& fwd) {
     const Config6& cfg = lm.config;
-    // The model still owns the config and the prompt layout; only the forward
-    // pass moves.
-    const OmniForward& fwd = accel != nullptr ? *accel : static_cast<const OmniForward&>(lm);
     const std::size_t codebooks = cfg.num_audio_codebook;
     const std::size_t vocab = cfg.audio_vocab_size;
 
@@ -406,7 +614,6 @@ Result<OmniResult> omni_synthesize(const OmniLm& lm, const OmniCodecDecoder& cod
     std::vector<std::size_t> order(codebooks * frames);
 
     std::size_t passes = 0;
-    const auto start = std::chrono::steady_clock::now();
 
     for (std::size_t step = 0; step < schedule.size(); ++step) {
         const std::size_t k = schedule[step];
@@ -525,8 +732,6 @@ Result<OmniResult> omni_synthesize(const OmniLm& lm, const OmniCodecDecoder& cod
         }
     }
 
-    const auto mid = std::chrono::steady_clock::now();
-
     // Anything still masked would be an out-of-range code downstream; the
     // schedule guarantees this cannot happen, so treat it as a bug rather than
     // clamping quietly.
@@ -544,28 +749,119 @@ Result<OmniResult> omni_synthesize(const OmniLm& lm, const OmniCodecDecoder& cod
         }
     }
 
-    RT_TRY(samples, codec.decode(codes));
+    OmniChunkResult out;
+    out.codes = std::move(codes);
+    out.prompt_tokens = cond.size();
+    out.forward_passes = passes;
+    return out;
+}
 
-    // Put the reference's own loudness back. Without this a quiet recording
-    // clones into a voice that is the right voice at the wrong level, because
-    // the clip was brought up to 0.1 RMS before it was encoded.
-    constexpr float kTargetRms = 0.1f;
-    if (request.ref_rms > 0.0f && request.ref_rms < kTargetRms) {
-        const float gain = request.ref_rms / kTargetRms;
-        for (float& v : samples) {
-            v *= gain;
-        }
+}  // namespace
+
+Result<OmniResult> omni_synthesize(const OmniLm& lm, const OmniCodecDecoder& codec,
+                                   const HfBpeTokenizer& tok, const OmniRequest& request,
+                                   const OmniForward* accel) {
+    // The model still owns the config and the prompt layout; only the forward
+    // pass moves.
+    const OmniForward& fwd = accel != nullptr ? *accel : static_cast<const OmniForward&>(lm);
+    const OmniCodecConfig& codec_cfg = codec.config;
+    const double rate = static_cast<double>(codec_cfg.sample_rate) /
+                        static_cast<double>(codec_cfg.hop_length);
+
+    const auto start = std::chrono::steady_clock::now();
+
+    // How long is this, and is it too long to say in one breath? An explicit
+    // --duration is an instruction about the whole output, so it turns
+    // splitting off rather than being divided among the pieces.
+    const std::size_t estimate =
+        omni_estimate_frames_from_reference(omni_combine_text(request.text, {}),
+                                            request.ref_text, request.ref_frames(), codec_cfg);
+    const auto threshold =
+        static_cast<std::size_t>(request.gen.chunk_threshold_seconds * rate);
+    const bool split = request.duration_seconds <= 0.0f && threshold > 0 &&
+                       request.gen.chunk_seconds > 0.0f && estimate > threshold;
+
+    std::vector<std::string> pieces;
+    if (split) {
+        // Characters per chunk, from this text's own measured density rather
+        // than an average one: a line of digits is worth far more audio per
+        // character than a line of Latin letters.
+        const std::size_t chars = utf8::decode(request.text).size();
+        const double per_chunk = static_cast<double>(request.gen.chunk_seconds) * rate *
+                                 static_cast<double>(chars) / static_cast<double>(estimate);
+        pieces = omni_chunk_text(request.text,
+                                 std::max<std::size_t>(1, static_cast<std::size_t>(per_chunk)));
     }
-    const auto end = std::chrono::steady_clock::now();
+    if (pieces.size() < 2) {
+        pieces = {request.text};
+    }
 
+    std::vector<std::vector<float>> waves;
+    waves.reserve(pieces.size());
     OmniResult result;
-    result.samples = std::move(samples);
-    result.sample_rate = codec.config.sample_rate;
-    result.frames = frames;
-    result.prompt_tokens = cond.size();
-    result.forward_passes = passes;
-    result.generate_seconds = std::chrono::duration<double>(mid - start).count();
-    result.decode_seconds = std::chrono::duration<double>(end - mid).count();
+    result.sample_rate = codec_cfg.sample_rate;
+    result.chunks = pieces.size();
+
+    // What holds the voice across a split. With a reference clip every piece
+    // uses it. Without one, the first piece invents a speaker and every piece
+    // after it takes that piece as its reference -- so the seam is a breath
+    // rather than a new person.
+    std::vector<std::vector<std::uint32_t>> anchor_codes;
+    std::string anchor_text;
+
+    double decode_seconds = 0.0;
+    for (std::size_t i = 0; i < pieces.size(); ++i) {
+        OmniRequest piece = request;
+        piece.text = pieces[i];
+        if (pieces.size() > 1) {
+            // Each piece is measured on its own; the whole-text estimate was
+            // only ever used to decide how to cut it.
+            piece.duration_seconds = 0.0f;
+            if (request.ref_codes.empty() && i > 0) {
+                piece.ref_codes = anchor_codes;
+                piece.ref_text = anchor_text;
+            }
+            if (request.debug) {
+                std::fprintf(stderr, "[ omnivoice ] chunk %zu/%zu: \"%s\"\n", i + 1,
+                             pieces.size(), pieces[i].c_str());
+            }
+        }
+
+        RT_TRY(chunk, omni_generate_chunk(lm, codec, tok, piece, fwd));
+        if (i == 0 && request.ref_codes.empty()) {
+            anchor_codes = chunk.codes;
+            anchor_text = pieces[0];
+        }
+
+        const auto decode_start = std::chrono::steady_clock::now();
+        RT_TRY(samples, codec.decode(chunk.codes));
+        decode_seconds +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start)
+                .count();
+
+        // Put the reference's own loudness back. Without this a quiet recording
+        // clones into a voice that is the right voice at the wrong level,
+        // because the clip was brought up to 0.1 RMS before it was encoded.
+        constexpr float kTargetRms = 0.1f;
+        if (request.ref_rms > 0.0f && request.ref_rms < kTargetRms) {
+            const float gain = request.ref_rms / kTargetRms;
+            for (float& v : samples) {
+                v *= gain;
+            }
+        }
+
+        result.frames += chunk.codes.empty() ? 0 : chunk.codes.front().size();
+        result.prompt_tokens += chunk.prompt_tokens;
+        result.forward_passes += chunk.forward_passes;
+        waves.push_back(std::move(samples));
+    }
+
+    result.samples = omni_cross_fade(waves, codec_cfg.sample_rate,
+                                     request.gen.chunk_gap_seconds);
+    const auto end = std::chrono::steady_clock::now();
+    result.decode_seconds = decode_seconds;
+    result.generate_seconds =
+        std::chrono::duration<double>(end - start).count() - decode_seconds;
     return result;
 }
 

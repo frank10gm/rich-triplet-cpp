@@ -23,7 +23,7 @@ namespace {
 constexpr std::size_t kTile = 64;
 
 // The attention kernel keeps one query's scores in threadgroup memory.
-constexpr std::size_t kMaxAttentionLength = 1024;
+constexpr std::size_t kMaxAttentionLength = 2048;
 
 [[nodiscard]] std::size_t round_up(std::size_t v, std::size_t to) {
     return (v + to - 1) / to * to;

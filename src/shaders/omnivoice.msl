@@ -169,7 +169,9 @@ kernel void omni_rope(
 // No mask of any kind: a masked diffusion model conditions each position on
 // both sides, so every query attends to every key. The scores for one query
 // live in threadgroup memory, which caps the sequence length this kernel
-// accepts -- the host checks it before dispatching.
+// accepts -- the host checks it before dispatching. 2048 floats is 8 KB of the
+// 32 KB a threadgroup may hold, so the cap is a choice about scratch buffers
+// rather than a hardware limit.
 kernel void omni_attention(
     device const float* q   [[buffer(0)]],
     device const float* k   [[buffer(1)]],
@@ -188,7 +190,7 @@ kernel void omni_attention(
 {
     const uint tid = tid_v.x;
     const uint nth = nth_v.x;
-    threadgroup float scores[1024];
+    threadgroup float scores[2048];
     threadgroup float reduce[256];
 
     const uint qh = gid.x;
