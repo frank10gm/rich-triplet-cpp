@@ -12,3 +12,5 @@ models/
 # Synthesised audio. `--out` defaults to out.wav in the working directory.
 *.wav
 fox*.png
+
+refs
